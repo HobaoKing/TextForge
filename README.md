@@ -11,11 +11,37 @@ TextForge 支持 iOS 15+，使用 UIKit / Foundation，实现由 Swift 和 Objec
 
 在主线程创建和更新控件。输入内容、字数规则、键盘避让和提交动作由宿主负责。
 
-[YYLabel 与 YYTextView 调用盘点](docs/yytext-usage-audit.md) 记录了主 App 和 NIMKit 的属性、预排版、附件、代理和通知映射。
+## Swift Package Manager (SPM)
 
-## 接入
+### Xcode 工程
 
-把 `https://github.com/HobaoKing/TextForge.git` 添加为 iOS target 的 Swift Package 依赖，选择 `TextForge` 产品。依赖版本按 Git 标签选择，开发期可以直接引用本地检出。详见[版本与发布规则](AGENTS.md#版本与发布)。
+1. 打开消费项目的 workspace 或工程，在 Xcode 选择 **File → Add Package Dependency**。
+2. 输入仓库地址 `https://github.com/HobaoKing/TextForge.git`。
+3. 将依赖规则设为 **Exact Version**，输入 `1.0.0`。
+4. 选择 `TextForge` 产品，添加到实际使用它的 iOS target。团队协作时提交工程配置和共享的 `Package.resolved`。
+
+### `Package.swift`
+
+已有 Swift Package 可将 `TextForge` 加入包依赖和使用它的 target。以下是完整清单示例。
+
+```swift
+// swift-tools-version: 5.9
+import PackageDescription
+
+let package = Package(
+    name: "MyFeature",
+    platforms: [.iOS(.v15)],
+    products: [.library(name: "MyFeature", targets: ["MyFeature"])],
+    dependencies: [
+        .package(url: "https://github.com/HobaoKing/TextForge.git", exact: "1.0.0")
+    ],
+    targets: [
+        .target(name: "MyFeature", dependencies: [.product(name: "TextForge", package: "TextForge")])
+    ]
+)
+```
+
+版本填写 Git 标签上的号码。GitHub Release 标题的补零写法见[版本与发布规则](AGENTS.md#版本与发布)。
 
 ### Swift
 
@@ -37,6 +63,8 @@ input.onTextChange = { text in print(text) }
 ```
 
 ### Objective-C
+
+在 `.m` 或 `.mm` 文件中导入模块。目标的 **Enable Modules (C and Objective-C)** 需开启。
 
 ```objc
 @import UIKit;
