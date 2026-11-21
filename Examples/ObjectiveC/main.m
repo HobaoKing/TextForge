@@ -123,6 +123,7 @@
         || badge.superview != renderedLabel) {
         [failures addObject:@"Objective-C typography or precomputed layout unavailable"];
     }
+    [self verifyContainerFeatures:failures];
     TextForgeLayoutTask *obsolete = [renderedLabel setAttributedTextAsynchronously:styledText
                                                                              size:CGSizeMake(100, 40)
                                                             rendersAsynchronously:YES
@@ -148,6 +149,68 @@
         [reusedLabel removeFromSuperview];
         [self writeVerificationResult:failures];
     }];
+}
+
+// 从 ObjC 验证容器配置、截断标记、逐行查询、圆角背景和标签上的同名能力，确认这些接口都已导出。
+- (void)verifyContainerFeatures:(NSMutableArray<NSString *> *)failures {
+    TextForgeContainer *container = [[TextForgeContainer alloc] initWithSize:CGSizeMake(120, CGFLOAT_MAX)
+                                                                      insets:UIEdgeInsetsMake(2, 4, 2, 4)];
+    container.maximumNumberOfRows = 2;
+    container.lineBreakMode = NSLineBreakByTruncatingTail;
+    container.linkTextAttributes = @{};
+    NSMutableAttributedString *token = [[NSMutableAttributedString alloc] initWithString:@"…展开"];
+    TextForgeHighlight *tokenHighlight = [[TextForgeHighlight alloc] initWithBackgroundColor:UIColor.lightGrayColor];
+    tokenHighlight.cornerRadius = 3;
+    [tokenHighlight applyTo:token range:NSMakeRange(1, 2)];
+    container.truncationToken = token;
+    NSMutableAttributedString *longText = [[NSMutableAttributedString alloc]
+        initWithString:@"这是一段会被截断成两行并显示自定义标记的评论内容，后面还有很多字"
+            attributes:@{NSFontAttributeName: [UIFont systemFontOfSize:14]}];
+    TextForgeBackground *background = [[TextForgeBackground alloc] initWithFillColor:UIColor.yellowColor cornerRadius:3];
+    [background applyTo:longText range:NSMakeRange(0, 2)];
+    TextForgeLayout *layout = [[TextForgeLayout alloc] initWithContainer:container attributedText:longText];
+    NSArray<TextForgeLine *> *lines = layout.lines;
+    if (layout.rowCount != 2 || !layout.isTruncated || lines.count != 2
+        || NSMaxRange(layout.visibleRange) >= longText.length
+        || [layout rectsForRange:NSMakeRange(0, lines.firstObject.range.length + 1)].count != 2
+        || [layout characterIndexAtPoint:CGPointMake(6, 8)] != 0
+        || CGRectIsNull([layout rectForRange:NSMakeRange(0, 1)])
+        || lines.lastObject.row != 1 || lines.lastObject.baseline <= CGRectGetMinY(lines.lastObject.rect)
+        || [longText attribute:TextForgeBackground.attributeName atIndex:0 effectiveRange:NULL] != background
+        || [token attribute:TextForgeHighlight.attributeName atIndex:1 effectiveRange:NULL] != tokenHighlight) {
+        [failures addObject:[NSString stringWithFormat:@"Objective-C container layout: rows=%ld lines=%lu visible=%@",
+                             (long)layout.rowCount, (unsigned long)lines.count, NSStringFromRange(layout.visibleRange)]];
+    }
+
+    TextForgeLabel *label = [[TextForgeLabel alloc] initWithFrame:CGRectMake(0, 0, 120, 60)];
+    label.numberOfLines = 2;
+    label.text = longText.string;
+    label.truncationToken = token;
+    label.highlightTouchExtensionRadius = 8;
+    label.linkTextAttributes = @{NSForegroundColorAttributeName: UIColor.systemGreenColor};
+    label.exclusionPaths = @[];
+    label.allowsCopy = YES;
+    label.copyMenuVisibilityHandler = ^(BOOL visible) {};
+    if (!label.isTruncated || label.displayedTextLayout.rowCount != 2
+        || [label characterIndexAtPoint:CGPointMake(3, 30)] == NSNotFound
+        || CGRectIsNull([label rectForRange:NSMakeRange(0, 1)])
+        || ![label canPerformAction:@selector(copy:) withSender:nil]) {
+        [failures addObject:@"Objective-C label queries or copy support unavailable"];
+    }
+    UIImage *swatch = [[[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(8, 8)]
+        imageWithActions:^(UIGraphicsImageRendererContext *context) {
+            [UIColor.redColor setFill];
+            [context fillRect:CGRectMake(0, 0, 8, 8)];
+        }];
+    NSAttributedString *scaled = [TextForgeAttachment image:swatch
+                                                contentMode:UIViewContentModeScaleAspectFit
+                                                       size:CGSizeMake(20, 16)
+                                                       font:[UIFont systemFontOfSize:14]
+                                                  alignment:TextForgeVerticalAlignmentCenter];
+    TextForgeLayout *imageLayout = [[TextForgeLayout alloc] initWithAttributedText:scaled size:CGSizeMake(100, 100)];
+    if (imageLayout.textBoundingSize.width < 20) {
+        [failures addObject:@"Objective-C scaled image attachment did not reserve its slot"];
+    }
 }
 
 // 将 ObjC 侧布局、输入和异步断言一起交给验证脚本。

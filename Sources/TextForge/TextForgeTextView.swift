@@ -1,8 +1,9 @@
 import UIKit
 
 /// 在原生 UITextView 上补齐占位文案和已提交文本的变化回调。
+/// 子类覆盖文本、布局或组字方法时应调用 super，以同步占位状态和编辑回调的比较基线。
 @objc(TextForgeTextView)
-public final class TextForgeTextView: UITextView {
+open class TextForgeTextView: UITextView {
     /// 文本为空时显示的占位文案，nil 或空串表示隐藏。
     @objc public var placeholder: String? {
         didSet { updatePlaceholderVisibility() }
@@ -56,7 +57,7 @@ public final class TextForgeTextView: UITextView {
     }
 
     /// 直接设置文本时同步占位状态和比较基线，由调用端自行处理业务通知。
-    public override var text: String! {
+    open override var text: String! {
         didSet {
             lastCommittedText = text ?? ""
             updatePlaceholderVisibility()
@@ -64,7 +65,7 @@ public final class TextForgeTextView: UITextView {
     }
 
     /// 直接设置富文本时同步占位状态，以其纯文本作为下一次编辑的比较基线。
-    public override var attributedText: NSAttributedString! {
+    open override var attributedText: NSAttributedString! {
         didSet {
             lastCommittedText = text ?? ""
             updatePlaceholderVisibility()
@@ -72,7 +73,7 @@ public final class TextForgeTextView: UITextView {
     }
 
     /// 按 UITextView 的内容区摆放占位标签，保持字体、对齐和内边距一致。
-    public override func layoutSubviews() {
+    open override func layoutSubviews() {
         super.layoutSubviews()
         guard !placeholderLabel.isHidden else { return }
         placeholderLabel.font = placeholderFont ?? font ?? UIFont.preferredFont(forTextStyle: .body)
@@ -92,7 +93,7 @@ public final class TextForgeTextView: UITextView {
     }
 
     /// 组字结束后读取最终文本，兼容提交时未单独发送文本变化通知的输入路径。
-    public override func unmarkText() {
+    open override func unmarkText() {
         let wasComposing = markedTextRange != nil
         super.unmarkText()
         if wasComposing { textDidChange() }

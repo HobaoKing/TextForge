@@ -1,19 +1,25 @@
 import UIKit
 
 /// 可在主线程复用的度量和绘制结果。输入宽高及内边距均使用点。
+/// 公开查询的坐标以布局外部边界的左上角为原点，范围使用原文的 UTF-16 下标。
 @MainActor
 @objc(TextForgeLayout)
 public final class TextForgeLayout: NSObject {
     @objc public let attributedText: NSAttributedString
+    /// 包含内边距的尺寸。宽度从外部边界左缘量到文字右缘，把标签设成这个尺寸可以完整显示布局。
     @objc public let textBoundingSize: CGSize
+    /// 创建布局时指定的外部边界。
+    @objc public let size: CGSize
+    @objc public let insets: UIEdgeInsets
+    /// 最多显示的行数，0 表示不限行。
+    @objc public let maximumNumberOfRows: Int
+    @objc public let lineBreakMode: NSLineBreakMode
 
-    let size: CGSize
-    let insets: UIEdgeInsets
-    let maximumNumberOfRows: Int
-    let lineBreakMode: NSLineBreakMode
+    let container: TextForgeContainer
     private let engine: TextForgeLayoutEngine
     private let preparedImage: UIImage?
     private let preparedTraits: UITraitCollection?
+    private var cachedLines: [TextForgeLine]?
 
     /// 按给定边界同步排版，行数为 0 表示不限行。返回的尺寸包含内边距。
     @objc public convenience init(
@@ -23,28 +29,41 @@ public final class TextForgeLayout: NSObject {
         maximumNumberOfRows: Int,
         lineBreakMode: NSLineBreakMode
     ) {
-        let engine = TextForgeLayoutEngine(
-            attributedText: attributedText, size: size, insets: insets,
-            maximumNumberOfRows: maximumNumberOfRows, lineBreakMode: lineBreakMode
-        )
-        self.init(
-            attributedText: attributedText, size: size, insets: insets,
-            maximumNumberOfRows: maximumNumberOfRows, lineBreakMode: lineBreakMode,
-            engine: engine, preparedImage: nil, preparedTraits: nil
-        )
+        let container = TextForgeContainer(size: size, insets: insets)
+        container.maximumNumberOfRows = maximumNumberOfRows
+        container.lineBreakMode = lineBreakMode
+        self.init(container: container, attributedText: attributedText)
     }
 
-    /// 接管已排好的引擎，关联原始交互文本；可选位图仅用于常态绘制。
+    /// 按给定边界同步排版：无内边距、不限行、正常折行。
+    @objc public convenience init(attributedText: NSAttributedString, size: CGSize) {
+        self.init(container: TextForgeContainer(size: size), attributedText: attributedText)
+    }
+
+    /// 按容器配置同步排版。容器会被复制，之后修改不影响本布局。
+    @objc public convenience init(container: TextForgeContainer, attributedText: NSAttributedString) {
+        let container = container.copy() as? TextForgeContainer ?? container
+        let engine = TextForgeLayoutEngine(
+            text: Self.renderingText(attributedText, linkTextAttributes: container.linkTextAttributes),
+            truncationToken: container.truncationToken.map {
+                Self.renderingText($0, linkTextAttributes: container.linkTextAttributes)
+            },
+            parameters: Self.parameters(for: container)
+        )
+        self.init(attributedText: attributedText, container: container, engine: engine, preparedImage: nil, preparedTraits: nil)
+    }
+
+    /// 接管已排好的引擎，关联原始交互文本；可选位图仅用于常态绘制。container 须为本布局独占的副本。
     init(
-        attributedText: NSAttributedString, size: CGSize, insets: UIEdgeInsets,
-        maximumNumberOfRows: Int, lineBreakMode: NSLineBreakMode,
+        attributedText: NSAttributedString, container: TextForgeContainer,
         engine: TextForgeLayoutEngine, preparedImage: UIImage?, preparedTraits: UITraitCollection?
     ) {
         self.attributedText = NSAttributedString(attributedString: attributedText)
-        self.size = size
-        self.insets = insets
-        self.maximumNumberOfRows = max(0, maximumNumberOfRows)
-        self.lineBreakMode = lineBreakMode
+        self.container = container
+        size = container.size
+        insets = container.insets
+        maximumNumberOfRows = max(0, container.maximumNumberOfRows)
+        lineBreakMode = container.lineBreakMode
         self.engine = engine
         self.preparedImage = preparedImage
         self.preparedTraits = preparedTraits
@@ -52,235 +71,172 @@ public final class TextForgeLayout: NSObject {
         super.init()
     }
 
+    // MARK: 公开查询
+
+    /// 创建布局时配置的截断标记，未配置时为 nil。是否真的显示见 `isTruncated`。
+    @objc public var truncationToken: NSAttributedString? { container.truncationToken }
+
+    /// 内容超出行数或高度限制，末行显示了省略号或截断标记，或有内容被裁掉。
+    @objc public var isTruncated: Bool { engine.isTruncated }
+
+    /// 实际显示的视觉行数。
+    @objc public var rowCount: Int { (lines.last?.row ?? -1) + 1 }
+
+    /// 逐行的原文范围、占用矩形和基线。排除路径把一行切成多段时每段各占一项。
+    @objc public var lines: [TextForgeLine] {
+        if let cachedLines { return cachedLines }
+        let result = engine.lines().map {
+            TextForgeLine(range: $0.range, rect: outer($0.rect), baseline: $0.baseline + insets.top, row: $0.row)
+        }
+        cachedLines = result
+        return result
+    }
+
+    /// 覆盖可见原文的最小 UTF-16 范围。头部和中部截断时范围内可能包含隐藏字形，几何查询会排除它们。
+    /// 没有可见原文时 location 为 NSNotFound。
+    @objc public var visibleRange: NSRange {
+        engine.visibleCharacterRange ?? NSRange(location: NSNotFound, length: 0)
+    }
+
+    /// 文字实际占用的矩形，不含内边距。
+    @objc public var textBoundingRect: CGRect { outer(engine.usedRect) }
+
+    /// 返回该点所在字形对应的原文下标。落在空白、截断标记或被截断的内容上时返回 NSNotFound。
+    @objc(characterIndexAtPoint:) public func characterIndex(at point: CGPoint) -> Int {
+        if case .text(let index)? = engine.hit(at: CGPoint(x: point.x - insets.left, y: point.y - insets.top)) {
+            return index
+        }
+        return NSNotFound
+    }
+
+    /// 原文范围内可见字形的外接矩形，高度取所在行的行片段。范围不可见时返回 `CGRect.null`。
+    @objc(rectForRange:) public func rect(forRange range: NSRange) -> CGRect {
+        outer(containerRect(for: range, inToken: false))
+    }
+
+    /// 原文范围在每一行上的排版矩形，纵向只覆盖字体的升部到降部，适合画底色或选区。
+    @nonobjc public func rects(forRange range: NSRange) -> [CGRect] {
+        runRects(for: range, inToken: false).map(outer)
+    }
+
+    /// `rects(forRange:)` 的 Objective-C 形式，元素为包装 CGRect 的 NSValue。
+    @objc(rectsForRange:) public func rectValues(forRange range: NSRange) -> [NSValue] {
+        rects(forRange: range).map { NSValue(cgRect: $0) }
+    }
+
+    // MARK: 供标签使用，坐标以排版区左上角为原点
+
+    /// 文字自身宽度加内边距，标签按内容自适应时使用。
+    var fittingSize: CGSize { engine.fittingSize }
+
+    /// 截断标记实际显示出来了。
+    var showsTruncationToken: Bool { engine.tokenRange != nil }
+
     /// 后台结果中的动态色已解析，换外观时需要从原始富文本重新生成。
     func matchesAppearance(_ traits: UITraitCollection) -> Bool {
         guard let preparedTraits else { return true }
         return !traits.hasDifferentColorAppearance(comparedTo: preparedTraits)
     }
 
-    /// 常态可直接贴用已准备的位图，高亮时用同一字形布局绘制状态样式。
-    func draw(at origin: CGPoint, activeRange: NSRange?, activeBackground: UIColor?, activeForeground: UIColor?) {
+    /// 常态可直接贴用已准备的位图，按压时用同一字形布局绘制状态样式。
+    /// activeRange 为原文或截断标记内部的范围，由 activeInToken 区分。
+    func draw(
+        at origin: CGPoint, activeRange: NSRange?, activeInToken: Bool,
+        activeBackground: TextForgeBackground?, activeForeground: UIColor?
+    ) {
         if activeRange == nil, let preparedImage {
             preparedImage.draw(at: CGPoint(x: origin.x - insets.left, y: origin.y - insets.top))
-        } else {
-            engine.draw(at: origin, activeRange: activeRange, activeBackground: activeBackground, activeForeground: activeForeground)
+            return
+        }
+        engine.draw(at: origin, active: activeRange.map {
+            TextForgeActiveStyle(
+                range: engine.storageRange(for: $0, inToken: activeInToken),
+                background: activeBackground, foreground: activeForeground
+            )
+        })
+    }
+
+    /// 命中的字符下标及其是否位于截断标记内。
+    func hit(at point: CGPoint) -> (index: Int, inToken: Bool)? {
+        switch engine.hit(at: point) {
+        case .text(let index): return (index, false)
+        case .token(let index): return (index, true)
+        case nil: return nil
         }
     }
 
-    func character(at point: CGPoint) -> Int? { engine.character(at: point) }
+    /// 获取范围内可见字形的外接矩形，坐标相对排版区。inToken 为 true 时用标记内部的下标。
+    func containerRect(for range: NSRange, inToken: Bool) -> CGRect {
+        engine.boundingRect(for: engine.storageRange(for: range, inToken: inToken))
+    }
 
-    func rect(for range: NSRange) -> CGRect { engine.rect(for: range) }
+    /// 返回范围内各段可见文字的矩形，坐标相对排版区，用于热区和装饰绘制。
+    func runRects(for range: NSRange, inToken: Bool) -> [CGRect] {
+        engine.runRects(for: engine.storageRange(for: range, inToken: inToken))
+    }
 
     var visibleCharacterRange: NSRange? { engine.visibleCharacterRange }
 
-    func visibleCharacter(atOrAfter index: Int, in range: NSRange) -> Int? {
-        engine.visibleCharacter(atOrAfter: index, in: range)
+    /// 确认正文或标记中的链接至少有一个可见字符，再创建辅助操作或触摸热区。
+    func firstVisibleCharacter(in range: NSRange, inToken: Bool) -> Int? {
+        engine.firstVisibleCharacter(in: range, inToken: inToken)
     }
 
-    /// 将当前字形的基线与原始 UIKit 附件配对，仅在主线程读取和挂载视图。
+    /// 将正文和截断标记的可见字形基线与原始 UIView 配对。标记下标先换算到排版串，只在主线程读取视图。
     func viewAttachments() -> [(UIView, CGRect)] {
-        guard let range = engine.visibleCharacterRange else { return [] }
+        var scopes: [(text: NSAttributedString, range: NSRange, offset: Int)] = []
+        if let range = engine.visibleCharacterRange { scopes.append((attributedText, range, 0)) }
+        if let token = truncationToken, let tokenRange = engine.tokenRange {
+            scopes.append((token, NSRange(location: 0, length: token.length), tokenRange.location))
+        }
         var result: [(UIView, CGRect)] = []
-        attributedText.enumerateAttribute(.attachment, in: range) { value, segment, _ in
-            guard let attachment = value as? TextForgeViewAttachment,
-                  let baseline = engine.baselineForAttachment(at: segment.location) else { return }
-            let bounds = attachment.bounds
-            let nativeSize = attachment.viewSize
-            let contentSize = nativeSize.width > 0 && nativeSize.height > 0 ? nativeSize : bounds.size
-            result.append((attachment.view, CGRect(
-                x: baseline.x + bounds.midX - contentSize.width / 2,
-                y: baseline.y - bounds.midY - contentSize.height / 2,
-                width: contentSize.width,
-                height: contentSize.height
-            )))
+        for scope in scopes {
+            scope.text.enumerateAttribute(.attachment, in: scope.range) { value, segment, _ in
+                guard let attachment = value as? TextForgeViewAttachment,
+                      let baseline = engine.baselineForAttachment(at: scope.offset + segment.location) else { return }
+                let bounds = attachment.bounds
+                let nativeSize = attachment.viewSize
+                let contentSize = nativeSize.width > 0 && nativeSize.height > 0 ? nativeSize : bounds.size
+                result.append((attachment.view, CGRect(
+                    x: baseline.x + bounds.midX - contentSize.width / 2,
+                    y: baseline.y - bounds.midY - contentSize.height / 2,
+                    width: contentSize.width,
+                    height: contentSize.height
+                )))
+            }
         }
         return result
     }
-}
 
-/// 独占一套 TextKit 对象。调用方在所属线程使用，后台任务完成后可一次性交给主线程。
-final class TextForgeLayoutEngine {
-    let textBoundingSize: CGSize
-    private let attributedText: NSAttributedString
-    private let storage: NSTextStorage
-    private let manager = NSLayoutManager()
-    private let container: NSTextContainer
-    private let glyphs: NSRange
+    // MARK: 排版输入
 
-    /// 创建独立的排版栈并计算实际字形区域，零尺寸保留空结果。
-    init(
-        attributedText: NSAttributedString,
-        size: CGSize,
-        insets: UIEdgeInsets,
-        maximumNumberOfRows: Int,
-        lineBreakMode: NSLineBreakMode
-    ) {
-        self.attributedText = NSAttributedString(attributedString: attributedText)
-        let layoutText = Self.wrappingText(attributedText, maximumNumberOfRows: maximumNumberOfRows)
-        storage = NSTextStorage(attributedString: layoutText)
-        let width = Self.containerDimension(size.width, minus: insets.left + insets.right)
-        let height = Self.containerDimension(size.height, minus: insets.top + insets.bottom)
-        container = NSTextContainer(size: CGSize(width: width, height: height))
-        container.lineFragmentPadding = 0
-        container.maximumNumberOfLines = max(0, maximumNumberOfRows)
-        // UILabel 的不限行模式仍需折行。截断交给有行数或高度限制的容器处理。
-        if maximumNumberOfRows == 0, size.height >= 1_000_000, Self.truncates(lineBreakMode) {
-            container.lineBreakMode = .byWordWrapping
-        } else {
-            container.lineBreakMode = lineBreakMode
-        }
-        manager.addTextContainer(container)
-        storage.addLayoutManager(manager)
-        if width > 0, height > 0, attributedText.length > 0 {
-            manager.ensureLayout(for: container)
-            glyphs = manager.glyphRange(for: container)
-            let usedRect = manager.usedRect(for: container)
-            textBoundingSize = CGSize(
-                width: ceil(usedRect.width) + insets.left + insets.right,
-                height: ceil(usedRect.height) + insets.top + insets.bottom
-            )
-        } else {
-            glyphs = NSRange(location: 0, length: 0)
-            textBoundingSize = .zero
-        }
-    }
-
-    /// 使用同一份排版对象绘制背景和字形，临时按压前景色在绘制后恢复。
-    func draw(at origin: CGPoint, activeRange: NSRange?, activeBackground: UIColor?, activeForeground: UIColor?) {
-        guard glyphs.length > 0 else { return }
-        manager.drawBackground(forGlyphRange: glyphs, at: origin)
-        if let activeRange, let activeBackground {
-            activeBackground.setFill()
-            let selectedGlyphs = manager.glyphRange(forCharacterRange: activeRange, actualCharacterRange: nil)
-            let visibleSelection = NSIntersectionRange(selectedGlyphs, glyphs)
-            if visibleSelection.length > 0 {
-                manager.enumerateEnclosingRects(
-                    forGlyphRange: visibleSelection,
-                    withinSelectedGlyphRange: NSRange(location: NSNotFound, length: 0),
-                    in: container
-                ) { rect, _ in
-                    UIBezierPath(rect: rect.offsetBy(dx: origin.x, dy: origin.y)).fill()
-                }
-            }
-        }
-        if let activeRange, let activeForeground {
-            storage.addAttribute(.foregroundColor, value: activeForeground, range: activeRange)
-        }
-        manager.drawGlyphs(forGlyphRange: glyphs, at: origin)
-        if let activeRange, activeForeground != nil {
-            storage.beginEditing()
-            attributedText.enumerateAttribute(.foregroundColor, in: activeRange) { value, range, _ in
-                if let value {
-                    storage.addAttribute(.foregroundColor, value: value, range: range)
-                } else {
-                    storage.removeAttribute(.foregroundColor, range: range)
-                }
-            }
-            storage.endEditing()
-        }
-    }
-
-    /// 将 TextKit 的最近字形查找约束在实际字形中，排除行尾空白与被截断的原文字形。
-    func character(at point: CGPoint) -> Int? {
-        guard glyphs.length > 0 else { return nil }
-        let glyph = manager.glyphIndex(for: point, in: container)
-        guard isVisible(glyph),
-              manager.boundingRect(forGlyphRange: NSRange(location: glyph, length: 1), in: container).contains(point) else {
-            return nil
-        }
-        let index = manager.characterIndexForGlyph(at: glyph)
-        return index < attributedText.length ? index : nil
-    }
-
-    /// 将 UTF-16 范围的字形边界换算成文本容器中的矩形。
-    func rect(for range: NSRange) -> CGRect {
-        let selected = manager.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
-        return manager.boundingRect(forGlyphRange: NSIntersectionRange(selected, glyphs), in: container)
-    }
-
-    /// 字形覆盖的 UTF-16 范围，生成附件和可访问动作时仍须排除末行截断。
-    var visibleCharacterRange: NSRange? {
-        guard glyphs.length > 0 else { return nil }
-        return manager.characterRange(forGlyphRange: glyphs, actualGlyphRange: nil)
-    }
-
-    /// 查找某段语义范围内第一个实际可见的字符，截断隐藏的链接不会获得辅助动作。
-    func visibleCharacter(atOrAfter index: Int, in range: NSRange) -> Int? {
-        guard let visibleCharacterRange else { return nil }
-        let visible = NSIntersectionRange(visibleCharacterRange, range)
-        guard max(index, visible.location) < NSMaxRange(visible) else { return nil }
-        return (max(index, visible.location)..<NSMaxRange(visible)).first {
-            isVisible(manager.glyphIndexForCharacter(at: $0))
-        }
-    }
-
-    /// 返回可见附件对应的行基线坐标，不读取 UIKit 视图。
-    func baselineForAttachment(at index: Int) -> CGPoint? {
-        let glyph = manager.glyphIndexForCharacter(at: index)
-        guard isVisible(glyph) else { return nil }
-        let location = manager.location(forGlyphAt: glyph)
-        let fragment = manager.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
-        return CGPoint(x: fragment.minX + location.x, y: fragment.minY + location.y)
-    }
-
-    /// 按内容尺寸生成透明位图，像素超出单条文本预算时保留排版结果供同步绘制。
-    func rasterize(scale: CGFloat, traits: UITraitCollection, viewport: CGSize, insets: UIEdgeInsets) -> UIImage? {
-        guard glyphs.length > 0, scale.isFinite, scale > 0 else { return nil }
-        let used = manager.usedRect(for: container)
-        let naturalWidth = ceil(used.maxX) + insets.left + insets.right
-        let naturalHeight = ceil(used.maxY) + insets.top + insets.bottom
-        let size = CGSize(
-            width: viewport.width < 1_000_000 ? viewport.width : naturalWidth,
-            height: viewport.height < 1_000_000 ? viewport.height : naturalHeight
+    /// 复制排除路径并取出排版用的值参数，之后可交给后台线程。
+    static func parameters(for container: TextForgeContainer) -> TextForgeLayoutParameters {
+        TextForgeLayoutParameters(
+            size: container.size, insets: container.insets,
+            maximumNumberOfRows: container.maximumNumberOfRows, lineBreakMode: container.lineBreakMode,
+            exclusionPaths: container.exclusionPaths.map { $0.copy() as? UIBezierPath ?? $0 }
         )
-        guard size.width > 0, size.height > 0 else { return nil }
-        let pixels = ceil(size.width * scale) * ceil(size.height * scale)
-        guard pixels <= 1_000_000 else { return nil }
-        let format = UIGraphicsImageRendererFormat()
-        format.scale = scale
-        let renderer = UIGraphicsImageRenderer(size: size, format: format)
-        var image: UIImage?
-        traits.performAsCurrent {
-            image = renderer.image { _ in
-                draw(
-                    at: CGPoint(x: insets.left, y: insets.top),
-                    activeRange: nil, activeBackground: nil, activeForeground: nil
-                )
-            }
+    }
+
+    /// 生成只用于排版和绘制的文本：去掉 `.link` 并叠加链接显示属性。
+    /// TextKit 会给 `.link` 强制套用系统链接色，保留它就无法自定义外观；交互仍读取原文里的链接。
+    static func renderingText(
+        _ text: NSAttributedString, linkTextAttributes: [NSAttributedString.Key: Any]
+    ) -> NSAttributedString {
+        var result: NSMutableAttributedString?
+        text.enumerateAttribute(.link, in: NSRange(location: 0, length: text.length)) { value, range, _ in
+            guard value != nil else { return }
+            let target = result ?? NSMutableAttributedString(attributedString: text)
+            result = target
+            target.removeAttribute(.link, range: range)
+            target.addAttributes(linkTextAttributes, range: range)
         }
-        return image
+        return result ?? text
     }
 
-    /// 排除容器外或末行截断替换掉的字形。
-    private func isVisible(_ glyph: Int) -> Bool {
-        guard NSLocationInRange(glyph, glyphs) else { return false }
-        let truncated = manager.truncatedGlyphRange(inLineFragmentForGlyphAt: glyph)
-        return truncated.location == NSNotFound || !NSLocationInRange(glyph, truncated)
-    }
-
-    /// 避免将无界尺寸直接交给 TextKit，零尺寸时也保持有效容器。
-    private static func containerDimension(_ value: CGFloat, minus inset: CGFloat) -> CGFloat {
-        if value.isNaN { return 0 }
-        return max(0, min(value - inset, 1_000_000))
-    }
-
-    /// 富文本段落先正常折行，再由容器决定最后一行如何截断。
-    private static func wrappingText(_ text: NSAttributedString, maximumNumberOfRows: Int) -> NSAttributedString {
-        guard maximumNumberOfRows != 1 else { return text }
-        let result = NSMutableAttributedString(attributedString: text)
-        let fullRange = NSRange(location: 0, length: text.length)
-        text.enumerateAttribute(.paragraphStyle, in: fullRange) { value, range, _ in
-            guard let style = value as? NSParagraphStyle,
-                  truncates(style.lineBreakMode),
-                  let wrapping = style.mutableCopy() as? NSMutableParagraphStyle else { return }
-            wrapping.lineBreakMode = .byWordWrapping
-            result.addAttribute(.paragraphStyle, value: wrapping, range: range)
-        }
-        return result
-    }
-
-    /// 识别 Unicode 省略号策略，普通折行和裁切保留原行为。
-    private static func truncates(_ mode: NSLineBreakMode) -> Bool {
-        mode == .byTruncatingHead || mode == .byTruncatingMiddle || mode == .byTruncatingTail
+    /// 把排版区坐标换成以外部边界左上角为原点的坐标，null 保持不变。
+    private func outer(_ rect: CGRect) -> CGRect {
+        rect.isNull ? rect : rect.offsetBy(dx: insets.left, dy: insets.top)
     }
 }

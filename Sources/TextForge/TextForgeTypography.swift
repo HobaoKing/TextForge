@@ -7,7 +7,8 @@ import UIKit
     case bottom
 }
 
-/// 以 UTF-16 范围和控件坐标回传交互对应的原始富文本。
+/// 以 UTF-16 范围和控件坐标回传交互对应的富文本。
+/// 命中截断标记时，富文本为截断标记，范围是标记内部的下标。
 public typealias TextForgeTextAction = (UIView, NSAttributedString, NSRange, CGRect) -> Void
 
 @objc(TextForgeTypography)
@@ -39,32 +40,52 @@ public final class TextForgeTypography: NSObject {
 
 @objc(TextForgeHighlight)
 public final class TextForgeHighlight: NSObject {
+    /// 富文本属性名，值为 TextForgeHighlight。可用它在富文本中枚举已有的高亮。
+    @objc public static let attributeName = NSAttributedString.Key("TextForge.Highlight")
+
     @objc public var userInfo: [String: Any]?
     @objc public var highlightedTextColor: UIColor?
     @objc public var tapAction: TextForgeTextAction?
     @objc public var longPressAction: TextForgeTextAction?
-
-    let backgroundColor: UIColor?
-    private let foregroundColor: UIColor?
-    static let attribute = NSAttributedString.Key("TextForge.Highlight")
+    /// 写入文本时使用的常态前景色，nil 保留文本原色。
+    @objc public let color: UIColor?
+    /// 按住时画在文字下方的底色，nil 表示没有按压底色。
+    @objc public let backgroundColor: UIColor?
+    /// 按压底色的圆角半径，单位为点。
+    @objc public var cornerRadius: CGFloat = 0
+    /// 按压底色相对文字排版矩形的边距，负值外扩。
+    @objc public var backgroundInsets: UIEdgeInsets = .zero
 
     @objc public init(color: UIColor?, backgroundColor: UIColor?) {
-        foregroundColor = color
+        self.color = color
         self.backgroundColor = backgroundColor
+    }
+
+    /// 只设置按压底色，文字保留原色。
+    @objc public convenience init(backgroundColor: UIColor?) {
+        self.init(color: nil, backgroundColor: backgroundColor)
     }
 
     /// 在合法的 UTF-16 范围内写入颜色和高亮对象，越界或空范围保持原文本。
     @objc public func apply(to text: NSMutableAttributedString, range: NSRange) {
         guard range.location >= 0, range.location <= text.length,
               range.length > 0, range.length <= text.length - range.location else { return }
-        if let foregroundColor { text.addAttribute(.foregroundColor, value: foregroundColor, range: range) }
-        text.addAttribute(Self.attribute, value: self, range: range)
+        if let color { text.addAttribute(.foregroundColor, value: color, range: range) }
+        text.addAttribute(Self.attributeName, value: self, range: range)
     }
 
     /// 读取相应 UTF-16 位置的高亮信息，越界时返回 nil。
     @objc public static func highlight(in text: NSAttributedString, at index: Int) -> TextForgeHighlight? {
         guard index >= 0, index < text.length else { return nil }
-        return text.attribute(attribute, at: index, effectiveRange: nil) as? TextForgeHighlight
+        return text.attribute(attributeName, at: index, effectiveRange: nil) as? TextForgeHighlight
+    }
+
+    /// 按压时使用的底色描述，没有底色时为 nil。
+    var pressedBackground: TextForgeBackground? {
+        guard let backgroundColor else { return nil }
+        let background = TextForgeBackground(fillColor: backgroundColor, cornerRadius: cornerRadius)
+        background.insets = backgroundInsets
+        return background
     }
 }
 
@@ -78,18 +99,49 @@ public final class TextForgeAttachment: NSObject {
         font: UIFont,
         alignment: TextForgeVerticalAlignment
     ) -> NSAttributedString {
+        self.image(image, contentMode: .center, size: size, font: font, alignment: alignment)
+    }
+
+    /// 图片按内容模式放入指定尺寸的附件槽，超出槽的部分被裁掉。
+    /// 支持 scaleToFill、scaleAspectFit、scaleAspectFill 和 center，其余模式按 center 处理。
+    @objc public static func image(
+        _ image: UIImage,
+        contentMode: UIView.ContentMode,
+        size: CGSize,
+        font: UIFont,
+        alignment: TextForgeVerticalAlignment
+    ) -> NSAttributedString {
         let attachment = NSTextAttachment()
         let bounds = attachmentBounds(size: size, font: font, alignment: alignment)
         attachment.bounds = bounds
-        if bounds.size == image.size {
+        let slot = bounds.size
+        var drawSize = image.size
+        if image.size.width > 0, image.size.height > 0 {
+            let horizontal = slot.width / image.size.width
+            let vertical = slot.height / image.size.height
+            switch contentMode {
+            case .scaleToFill:
+                drawSize = slot
+            case .scaleAspectFit:
+                drawSize = CGSize(width: image.size.width * min(horizontal, vertical), height: image.size.height * min(horizontal, vertical))
+            case .scaleAspectFill:
+                drawSize = CGSize(width: image.size.width * max(horizontal, vertical), height: image.size.height * max(horizontal, vertical))
+            default:
+                break
+            }
+        }
+        if drawSize == slot, slot == image.size {
             attachment.image = image
         } else if !bounds.isEmpty {
             let format = UIGraphicsImageRendererFormat()
             format.scale = image.scale
-            let renderer = UIGraphicsImageRenderer(size: bounds.size, format: format)
+            let renderer = UIGraphicsImageRenderer(size: slot, format: format)
             attachment.image = renderer.image { _ in
-                image.draw(at: CGPoint(x: (bounds.width - image.size.width) / 2, y: (bounds.height - image.size.height) / 2))
-            }
+                image.draw(in: CGRect(
+                    x: (slot.width - drawSize.width) / 2, y: (slot.height - drawSize.height) / 2,
+                    width: drawSize.width, height: drawSize.height
+                ))
+            }.withRenderingMode(image.renderingMode)
         }
         return NSAttributedString(attachment: attachment)
     }

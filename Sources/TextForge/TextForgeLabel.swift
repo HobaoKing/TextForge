@@ -39,6 +39,32 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         }
     }
 
+    /// 末行放不下时替代系统省略号的标记，例如"…全文"。仅在 `lineBreakMode` 为 `.byTruncatingTail` 时生效。
+    /// 标记缺少的字体和颜色沿用截断处的正文，可携带 TextForgeHighlight 或链接响应点击。
+    @objc public var truncationToken: NSAttributedString? {
+        didSet {
+            truncationToken = truncationToken.map { NSAttributedString(attributedString: $0) }
+            invalidateTextLayout()
+        }
+    }
+
+    /// 文本需要绕开的区域，坐标以扣除内边距后的内容区左上角为原点。
+    @objc public var exclusionPaths: [UIBezierPath] = [] { didSet { invalidateTextLayout() } }
+
+    /// 叠加在 `.link` 范围上的显示属性，会覆盖该范围原有的同名属性。传空字典则保留文本自身样式。
+    @objc public var linkTextAttributes: [NSAttributedString.Key: Any] = TextForgeContainer.defaultLinkTextAttributes {
+        didSet { invalidateTextLayout() }
+    }
+
+    /// 高亮和链接的触摸热区向外扩展的半径，单位为点。手指落在多个热区内时取最近的一个。
+    @objc public var highlightTouchExtensionRadius: CGFloat = 0
+
+    /// 开启后长按弹出系统的拷贝菜单，复制当前文本的全文，附件占位字符不会进入剪贴板。
+    @objc public var allowsCopy = false
+
+    /// 拷贝菜单出现和消失时在主线程回调，参数为是否可见。可用来切换选中底色。
+    @objc public var copyMenuVisibilityHandler: ((Bool) -> Void)?
+
     @objc public var textTapAction: TextForgeTextAction? { didSet { invalidateTextLayout() } }
     @objc public var textLongPressAction: TextForgeTextAction? { didSet { invalidateTextLayout() } }
     @objc public var highlightTapAction: TextForgeTextAction? { didSet { invalidateTextLayout() } }
@@ -51,7 +77,7 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
     private var pendingLayoutWidth: CGFloat?
     private var requiresAttributedLayout = false
     private var attachedViews: [UIView] = []
-    private var activeHighlight: (TextForgeHighlight, NSRange)?
+    private var activeHighlight: (highlight: TextForgeHighlight, range: NSRange, inToken: Bool)?
     private weak var actionTapGesture: UITapGestureRecognizer?
     private weak var actionPressGesture: UILongPressGestureRecognizer?
     private var customAccessibilityLabel: String?
@@ -108,35 +134,80 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         }
     }
 
-    /// 将可见且可点击的高亮附加为 VoiceOver 操作，保留宿主原有自定义操作。
+    /// 将可见且可点击的高亮附加为 VoiceOver 操作，保留宿主原有自定义操作。显示出来的截断标记同样参与。
     open override var accessibilityCustomActions: [UIAccessibilityCustomAction]? {
         get {
             let inherited = super.accessibilityCustomActions ?? []
-            guard requiresAttributedLayout || textLayout != nil, !bounds.isEmpty else {
+            guard usesCustomLayout, !bounds.isEmpty else {
                 return inherited.isEmpty ? nil : inherited
             }
             let result = layout(for: bounds.size)
             var actions = inherited
-            var seen = Set<NSRange>()
-            let visible = result.visibleCharacterRange
-            if let visible {
-                result.attributedText.enumerateAttributes(in: visible) { attributes, range, _ in
-                    guard (attributes[TextForgeHighlight.attribute] != nil || attributes[.link] != nil),
-                          let index = result.visibleCharacter(atOrAfter: range.location, in: range) else { return }
-                    let hit = interaction(atCharacter: index, in: result)
+            var scopes: [(text: NSAttributedString, range: NSRange, inToken: Bool)] = []
+            if let visible = result.visibleCharacterRange { scopes.append((result.attributedText, visible, false)) }
+            if result.showsTruncationToken, let token = result.truncationToken {
+                scopes.append((token, NSRange(location: 0, length: token.length), true))
+            }
+            for scope in scopes {
+                var seen = Set<NSRange>()
+                scope.text.enumerateAttributes(in: scope.range) { attributes, range, _ in
+                    guard attributes[TextForgeHighlight.attributeName] != nil || attributes[.link] != nil else { return }
+                    guard let index = result.firstVisibleCharacter(in: range, inToken: scope.inToken) else { return }
+                    let hit = interaction(atCharacter: index, inToken: scope.inToken, in: result)
                     guard hit.highlight?.tapAction != nil || highlightTapAction != nil || textTapAction != nil,
                           seen.insert(hit.highlightRange).inserted else { return }
                     let name = (hit.text.string as NSString).substring(with: hit.highlightRange)
                     actions.append(UIAccessibilityCustomAction(name: name) { [weak self, weak result] _ in
                         guard let self, let result, !self.bounds.isEmpty,
                               self.layout(for: self.bounds.size) === result else { return false }
-                        return self.dispatchTap(self.interaction(atCharacter: index, in: result))
+                        return self.dispatchTap(self.interaction(atCharacter: index, inToken: scope.inToken, in: result))
                     })
                 }
             }
             return actions.isEmpty ? nil : actions
         }
         set { super.accessibilityCustomActions = newValue }
+    }
+
+    /// 当前边界下实际用于绘制的布局，可查询行数、逐行信息和是否截断。控件尚无尺寸时为 nil。
+    /// 布局的坐标以文本外部边界左上角为原点，换算到控件坐标请用本类的 `characterIndex(at:)` 和 `rect(forRange:)`。
+    /// 普通文本走系统 UILabel 绘制时，这里返回的是按相同参数用 TextKit 排出的近似结果。
+    @objc public var displayedTextLayout: TextForgeLayout? {
+        bounds.isEmpty ? nil : layout(for: bounds.size)
+    }
+
+    /// 当前边界下内容是否放不下。控件尚无尺寸时为 false。
+    @objc public var isTruncated: Bool { displayedTextLayout?.isTruncated ?? false }
+
+    /// 返回控件坐标下该点所在字形对应的原文 UTF-16 下标，落在空白或截断标记上时返回 NSNotFound。
+    @objc(characterIndexAtPoint:) public func characterIndex(at point: CGPoint) -> Int {
+        guard let result = displayedTextLayout else { return NSNotFound }
+        let origin = drawingOrigin(for: result)
+        return result.characterIndex(at: CGPoint(
+            x: point.x - origin.x + result.insets.left, y: point.y - origin.y + result.insets.top
+        ))
+    }
+
+    /// 返回原文范围在控件坐标下的外接矩形，范围不可见或控件尚无尺寸时为 `CGRect.null`。
+    @objc(rectForRange:) public func rect(forRange range: NSRange) -> CGRect {
+        guard let result = displayedTextLayout else { return .null }
+        let origin = drawingOrigin(for: result)
+        return result.containerRect(for: range, inToken: false).offsetBy(dx: origin.x, dy: origin.y)
+    }
+
+    /// 允许拷贝时可成为第一响应者，系统菜单据此找到拷贝操作。
+    open override var canBecomeFirstResponder: Bool { allowsCopy || super.canBecomeFirstResponder }
+
+    /// 只在允许拷贝且有文本时提供拷贝操作，其余编辑操作沿用系统判断。
+    open override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        if action == #selector(copy(_:)) { return allowsCopy && !copyableText.isEmpty }
+        return super.canPerformAction(action, withSender: sender)
+    }
+
+    /// 把当前原文的纯文本写入系统剪贴板，未开启拷贝或文本为空时不改动剪贴板。
+    open override func copy(_ sender: Any?) {
+        guard allowsCopy, !copyableText.isEmpty else { return }
+        UIPasteboard.general.string = copyableText
     }
 
     /// 清除旧内容并按指定的点尺寸准备新布局。更换内容、样式或设置不匹配的宽度会取消等待中的请求。
@@ -151,8 +222,7 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         explicitTextLayout = nil
         storeAttributedText(nil)
         let task = TextForgeLayout.prepare(
-            attributedText: styledText(source), size: size, insets: contentInsets,
-            maximumNumberOfRows: numberOfLines, lineBreakMode: lineBreakMode,
+            attributedText: styledText(source), container: makeContainer(size: size, rows: numberOfLines),
             renderScale: rendersAsynchronously ? max(1, traitCollection.displayScale) : 0,
             traitCollection: traitCollection
         ) { [weak self] result in
@@ -205,12 +275,12 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
 
     /// 为富文本使用当前可用宽度测量，普通标签保持系统固有尺寸算法。
     open override var intrinsicContentSize: CGSize {
-        if let textLayout { return textLayout.textBoundingSize }
+        if let textLayout { return measuredSize(of: textLayout) }
         guard usesCustomLayout else { return super.intrinsicContentSize }
         let width = preferredMaxLayoutWidth > 0 ? preferredMaxLayoutWidth : (
             numberOfLines != 1 && bounds.width > 0 ? bounds.width : .greatestFiniteMagnitude
         )
-        return layout(for: CGSize(width: width, height: .greatestFiniteMagnitude)).textBoundingSize
+        return measuredSize(of: layout(for: CGSize(width: width, height: .greatestFiniteMagnitude)))
     }
 
     /// 显式绘制预排版文本，即使 UILabel 自己没有设置 text 或 attributedText。
@@ -225,17 +295,22 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
     /// 按调用方的边界测量富文本，显式布局直接返回其尺寸，内部结果仅在约束兼容时复用。
     open override func sizeThatFits(_ size: CGSize) -> CGSize {
         guard usesCustomLayout else { return super.sizeThatFits(size) }
-        return layout(for: CGSize(
+        return measuredSize(of: layout(for: CGSize(
             width: size.width > 0 ? size.width : .greatestFiniteMagnitude,
             height: size.height > 0 ? size.height : .greatestFiniteMagnitude
-        )).textBoundingSize
+        )))
+    }
+
+    /// 显式布局按完整尺寸占位，切换外观触发重排后也保持此规则。控件自身排版按文字宽度自适应。
+    private func measuredSize(of result: TextForgeLayout) -> CGSize {
+        explicitTextLayout != nil ? result.textBoundingSize : result.fittingSize
     }
 
     /// 在扣除内边距后的可用宽度测量文本，并把内边距计入返回的文本区域。
     open override func textRect(forBounds bounds: CGRect, limitedToNumberOfLines numberOfLines: Int) -> CGRect {
         if usesCustomLayout {
             let result = layout(for: bounds.size, maximumNumberOfRows: numberOfLines)
-            return CGRect(origin: bounds.origin, size: result.textBoundingSize)
+            return CGRect(origin: bounds.origin, size: measuredSize(of: result))
         }
         let contentRect = insetTextRect(bounds)
         let textRect = super.textRect(forBounds: contentRect, limitedToNumberOfLines: numberOfLines)
@@ -254,9 +329,10 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
             let result = layout(for: bounds.size)
             result.draw(
                 at: drawingOrigin(for: result),
-                activeRange: activeHighlight?.1,
-                activeBackground: activeHighlight?.0.backgroundColor,
-                activeForeground: activeHighlight?.0.highlightedTextColor
+                activeRange: activeHighlight?.range,
+                activeInToken: activeHighlight?.inToken ?? false,
+                activeBackground: activeHighlight?.highlight.pressedBackground,
+                activeForeground: activeHighlight?.highlight.highlightedTextColor
             )
             return
         }
@@ -286,11 +362,11 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
     /// 在按住高亮文字时显示背景，移动到其他范围或松开时结束高亮。
     open override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesBegan(touches, with: event)
-        guard textLayout != nil || requiresAttributedLayout,
+        guard usesCustomLayout, !bounds.isEmpty,
               let point = touches.first?.location(in: self) else { return }
         let hit = interaction(at: point)
         if let highlight = hit.highlight, highlight.backgroundColor != nil || highlight.highlightedTextColor != nil {
-            activeHighlight = (highlight, hit.highlightRange)
+            activeHighlight = (highlight, hit.highlightRange, hit.inToken)
             setNeedsDisplay()
         }
     }
@@ -299,7 +375,8 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
     open override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesMoved(touches, with: event)
         guard let activeHighlight, let point = touches.first?.location(in: self) else { return }
-        if interaction(at: point).highlightRange != activeHighlight.1 { clearHighlight() }
+        let hit = interaction(at: point)
+        if hit.highlightRange != activeHighlight.range || hit.inToken != activeHighlight.inToken { clearHighlight() }
     }
 
     /// 完成触摸后清除按压反馈，独立的手势负责派发事件。
@@ -319,7 +396,8 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         guard gestureRecognizer === actionTapGesture || gestureRecognizer === actionPressGesture else {
             return super.gestureRecognizerShouldBegin(gestureRecognizer)
         }
-        guard usesCustomLayout else { return false }
+        if gestureRecognizer is UILongPressGestureRecognizer, allowsCopy, !copyableText.isEmpty { return true }
+        guard usesCustomLayout, !bounds.isEmpty else { return false }
         let hit = interaction(at: gestureRecognizer.location(in: self))
         if gestureRecognizer is UILongPressGestureRecognizer {
             return hit.highlight?.longPressAction != nil
@@ -334,6 +412,7 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
     /// 判断当前内容是否需要同一份可查询、可复用的布局。
     private var usesCustomLayout: Bool {
         textLayout != nil || requiresAttributedLayout || textVerticalAlignment != .center
+            || truncationToken != nil || !exclusionPaths.isEmpty
             || characterSpacing != 0 || lineSpacing != 0 || paragraphSpacing != 0
             || textTapAction != nil || textLongPressAction != nil || highlightTapAction != nil || highlightLongPressAction != nil
     }
@@ -343,10 +422,7 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         if let textLayout = explicitTextLayout {
             if textLayout.matchesAppearance(traitCollection) { return textLayout }
             if let rebuilt = cachedLayouts.first { return rebuilt }
-            let rebuilt = TextForgeLayout(
-                attributedText: textLayout.attributedText, size: textLayout.size, insets: textLayout.insets,
-                maximumNumberOfRows: textLayout.maximumNumberOfRows, lineBreakMode: textLayout.lineBreakMode
-            )
+            let rebuilt = TextForgeLayout(container: textLayout.container, attributedText: textLayout.attributedText)
             cachedLayouts = [rebuilt]
             return rebuilt
         }
@@ -361,13 +437,21 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         }
         if let cached = cachedLayouts.first(where: fits) { return cached }
         let original = super.attributedText ?? NSAttributedString(string: super.text ?? "")
-        let result = TextForgeLayout(
-            attributedText: styledText(original), size: size, insets: contentInsets,
-            maximumNumberOfRows: rows, lineBreakMode: lineBreakMode
-        )
+        let result = TextForgeLayout(container: makeContainer(size: size, rows: rows), attributedText: styledText(original))
         if cachedLayouts.count == 2 { cachedLayouts.removeLast() }
         cachedLayouts.insert(result, at: 0)
         return result
+    }
+
+    /// 用控件当前的内边距、换行、截断标记、排除路径和链接外观组装一次排版的容器。
+    private func makeContainer(size: CGSize, rows: Int) -> TextForgeContainer {
+        let container = TextForgeContainer(size: size, insets: contentInsets)
+        container.maximumNumberOfRows = rows
+        container.lineBreakMode = lineBreakMode
+        container.truncationToken = truncationToken
+        container.exclusionPaths = exclusionPaths
+        container.linkTextAttributes = linkTextAttributes
+        return container
     }
 
     /// 保留输入的局部样式，补齐控件默认值，并应用控件级间距。
@@ -406,32 +490,71 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
     }
 
     /// 分别计算整标签操作的字素范围和高亮操作的链接范围。未命中时范围为 NSNotFound。
+    /// 没有直接点中高亮时，在触摸热区扩展半径内改用最近的高亮。
     private func interaction(at point: CGPoint) -> TextForgeInteraction {
         let result = layout(for: bounds.size)
         let origin = drawingOrigin(for: result)
         let local = CGPoint(x: point.x - origin.x, y: point.y - origin.y)
-        guard let index = result.character(at: local) else {
-            return TextForgeInteraction(text: result.attributedText)
+        var found = TextForgeInteraction(text: result.attributedText)
+        if let hit = result.hit(at: local) {
+            found = interaction(atCharacter: hit.index, inToken: hit.inToken, in: result)
         }
-        return interaction(atCharacter: index, in: result)
+        guard found.highlightRange.location == NSNotFound, highlightTouchExtensionRadius > 0,
+              let nearest = nearestHighlight(to: local, in: result) else { return found }
+        // 整标签回调仍按手指实际落点报告字符，只有两者同属正文或同属截断标记时才能合并。
+        if found.characterRange.location != NSNotFound, found.inToken != nearest.inToken { return found }
+        found.text = nearest.text
+        found.inToken = nearest.inToken
+        found.highlight = nearest.highlight
+        found.highlightRange = nearest.highlightRange
+        found.highlightRect = nearest.highlightRect
+        return found
+    }
+
+    /// 在可见的高亮和链接中找出与触摸点距离不超过扩展半径且最近的一个，坐标以排版区左上角为原点。
+    private func nearestHighlight(to point: CGPoint, in result: TextForgeLayout) -> TextForgeInteraction? {
+        var best: (distance: CGFloat, index: Int, inToken: Bool)?
+        var scopes: [(text: NSAttributedString, range: NSRange, inToken: Bool)] = []
+        if let visible = result.visibleCharacterRange { scopes.append((result.attributedText, visible, false)) }
+        if result.showsTruncationToken, let token = result.truncationToken {
+            scopes.append((token, NSRange(location: 0, length: token.length), true))
+        }
+        for scope in scopes {
+            scope.text.enumerateAttributes(in: scope.range) { attributes, range, _ in
+                guard attributes[TextForgeHighlight.attributeName] != nil || attributes[.link] != nil,
+                      let index = result.firstVisibleCharacter(in: range, inToken: scope.inToken) else { return }
+                for rect in result.runRects(for: range, inToken: scope.inToken) {
+                    let distance = hypot(
+                        max(rect.minX - point.x, 0, point.x - rect.maxX),
+                        max(rect.minY - point.y, 0, point.y - rect.maxY)
+                    )
+                    if distance <= highlightTouchExtensionRadius, distance < best?.distance ?? .greatestFiniteMagnitude {
+                        best = (distance, index, scope.inToken)
+                    }
+                }
+            }
+        }
+        return best.map { interaction(atCharacter: $0.index, inToken: $0.inToken, in: result) }
     }
 
     /// 将定位到的 UTF-16 字符映射到字素和完整高亮区间，供触摸及辅助操作使用。
-    private func interaction(atCharacter index: Int, in result: TextForgeLayout) -> TextForgeInteraction {
-        let text = result.attributedText
+    /// inToken 为 true 时下标和返回的范围都相对截断标记，回调收到的富文本也是截断标记。
+    private func interaction(atCharacter index: Int, inToken: Bool, in result: TextForgeLayout) -> TextForgeInteraction {
+        let text = inToken ? (result.truncationToken ?? NSAttributedString()) : result.attributedText
+        guard index >= 0, index < text.length else { return TextForgeInteraction(text: text, inToken: inToken) }
         let origin = drawingOrigin(for: result)
         let characterRange = (text.string as NSString).rangeOfComposedCharacterSequence(at: index)
         var resultHit = TextForgeInteraction(
-            text: text, characterRange: characterRange,
-            characterRect: result.rect(for: characterRange).offsetBy(dx: origin.x, dy: origin.y)
+            text: text, inToken: inToken, characterRange: characterRange,
+            characterRect: result.containerRect(for: characterRange, inToken: inToken).offsetBy(dx: origin.x, dy: origin.y)
         )
         let full = NSRange(location: 0, length: text.length)
         var range = NSRange(location: index, length: 0)
-        let highlight = text.attribute(TextForgeHighlight.attribute, at: index, longestEffectiveRange: &range, in: full) as? TextForgeHighlight
+        let highlight = text.attribute(TextForgeHighlight.attributeName, at: index, longestEffectiveRange: &range, in: full) as? TextForgeHighlight
         if highlight != nil || text.attribute(.link, at: index, longestEffectiveRange: &range, in: full) != nil {
             resultHit.highlight = highlight
             resultHit.highlightRange = range
-            resultHit.highlightRect = result.rect(for: range).offsetBy(dx: origin.x, dy: origin.y)
+            resultHit.highlightRect = result.containerRect(for: range, inToken: inToken).offsetBy(dx: origin.x, dy: origin.y)
         }
         return resultHit
     }
@@ -468,23 +591,59 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         return genericAction != nil
     }
 
-    /// 只在长按进入识别状态时派发一次，避免移动和结束重复回调。
+    /// 只在长按进入识别状态时派发一次，避免移动和结束重复回调。回调之后按需弹出拷贝菜单。
     @objc private func handleLongPress(_ gesture: UILongPressGestureRecognizer) {
         guard gesture.state == .began else { return }
-        let hit = interaction(at: gesture.location(in: self))
-        let highlightAction = hit.highlight?.longPressAction ?? highlightLongPressAction
-        textLongPressAction?(self, hit.text, hit.characterRange, hit.characterRect)
-        if hit.highlightRange.location != NSNotFound {
-            highlightAction?(self, hit.text, hit.highlightRange, hit.highlightRect)
+        let point = gesture.location(in: self)
+        if usesCustomLayout, !bounds.isEmpty {
+            let hit = interaction(at: point)
+            let highlightAction = hit.highlight?.longPressAction ?? highlightLongPressAction
+            textLongPressAction?(self, hit.text, hit.characterRange, hit.characterRect)
+            if hit.highlightRange.location != NSNotFound {
+                highlightAction?(self, hit.text, hit.highlightRange, hit.highlightRect)
+            }
+        }
+        if allowsCopy { presentCopyMenu(at: point) }
+    }
+
+    /// 旧系统的菜单收起后只通知一次，随即停止监听，避免响应其他控件的菜单。
+    @objc private func copyMenuDidHide() {
+        NotificationCenter.default.removeObserver(self, name: UIMenuController.didHideMenuNotification, object: nil)
+        copyMenuVisibilityHandler?(false)
+    }
+
+    /// 取得当前原文全文，过滤附件占位符和展示时临时加入的截断标记。
+    private var copyableText: String {
+        (text ?? "").replacingOccurrences(of: "\u{FFFC}", with: "")
+    }
+
+    /// 在触摸点弹出系统拷贝菜单。只有控件在窗口内、有原文且拿到第一响应者时才尝试呈现。
+    /// iOS 16 及以上使用 UIEditMenuInteraction，更早的系统使用 UIMenuController。
+    private func presentCopyMenu(at point: CGPoint) {
+        guard window != nil, !copyableText.isEmpty, becomeFirstResponder() else { return }
+        if #available(iOS 16.0, *) {
+            let existing = interactions.compactMap { $0 as? UIEditMenuInteraction }.first
+            let menu = existing ?? UIEditMenuInteraction(delegate: self)
+            if existing == nil { addInteraction(menu) }
+            menu.presentEditMenu(with: UIEditMenuConfiguration(identifier: nil, sourcePoint: point))
+        } else {
+            let center = NotificationCenter.default
+            center.removeObserver(self, name: UIMenuController.didHideMenuNotification, object: nil)
+            center.addObserver(
+                self, selector: #selector(copyMenuDidHide), name: UIMenuController.didHideMenuNotification, object: nil
+            )
+            copyMenuVisibilityHandler?(true)
+            UIMenuController.shared.showMenu(from: self, rect: bounds)
         }
     }
 
-    /// 扫描富文本中的自有高亮和视图附件，普通样式仍沿用原生 UILabel。
+    /// 扫描富文本中的自有高亮、圆角背景、链接和视图附件，普通样式仍沿用原生 UILabel。
     private func refreshAttributeUsage() {
         requiresAttributedLayout = false
         if let attributedText = super.attributedText {
             attributedText.enumerateAttributes(in: NSRange(location: 0, length: attributedText.length)) { attributes, _, stop in
-                if attributes[TextForgeHighlight.attribute] != nil || attributes[.link] != nil
+                if attributes[TextForgeHighlight.attributeName] != nil || attributes[.link] != nil
+                    || attributes[TextForgeBackground.attributeName] != nil
                     || attributes[.attachment] is TextForgeViewAttachment {
                     requiresAttributedLayout = true
                     stop.pointee = true
@@ -540,10 +699,44 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
 }
 
 private struct TextForgeInteraction {
-    let text: NSAttributedString
+    /// 回调收到的富文本：正文，或命中截断标记时的截断标记。
+    var text: NSAttributedString
+    var inToken = false
     var characterRange = NSRange(location: NSNotFound, length: 0)
     var characterRect = CGRect.null
     var highlight: TextForgeHighlight?
     var highlightRange = NSRange(location: NSNotFound, length: 0)
     var highlightRect = CGRect.null
+}
+
+@available(iOS 16.0, *)
+extension TextForgeLabel: UIEditMenuInteractionDelegate {
+    /// UIKit 在主线程询问菜单位置。协议签名未声明隔离，此处显式在主执行器读取文字区域。
+    nonisolated public func editMenuInteraction(
+        _ interaction: UIEditMenuInteraction, targetRectFor configuration: UIEditMenuConfiguration
+    ) -> CGRect {
+        MainActor.assumeIsolated {
+            guard let result = displayedTextLayout else { return bounds }
+            let origin = drawingOrigin(for: result)
+            return result.textBoundingRect.offsetBy(dx: origin.x - result.insets.left, dy: origin.y - result.insets.top)
+        }
+    }
+
+    /// UIKit 开始在主线程呈现拷贝菜单时，回调宿主更新选中样式。
+    nonisolated public func editMenuInteraction(
+        _ interaction: UIEditMenuInteraction, willPresentMenuFor configuration: UIEditMenuConfiguration,
+        animator: UIEditMenuInteractionAnimating
+    ) {
+        MainActor.assumeIsolated { copyMenuVisibilityHandler?(true) }
+    }
+
+    /// UIKit 在主线程结束收起动画后再通知宿主恢复底色。
+    nonisolated public func editMenuInteraction(
+        _ interaction: UIEditMenuInteraction, willDismissMenuFor configuration: UIEditMenuConfiguration,
+        animator: UIEditMenuInteractionAnimating
+    ) {
+        MainActor.assumeIsolated {
+            animator.addCompletion { [weak self] in self?.copyMenuVisibilityHandler?(false) }
+        }
+    }
 }
