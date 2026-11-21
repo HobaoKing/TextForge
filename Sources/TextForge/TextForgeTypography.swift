@@ -119,7 +119,7 @@ public final class TextForgeAttachment: NSObject {
         replacingAttachments(in: text, forSpeech: true)
     }
 
-    /// 按原串的 UTF-16 索引替换每个对象字符，保留相邻附件、表情和普通文字的原有顺序。
+    /// 按 UTF-16 下标替换附件。显式文案（含空串）优先，未指定时沿用系统 HTML 图片的 alt。
     private static func replacingAttachments(in text: NSAttributedString, forSpeech: Bool) -> String {
         let source = text.string as NSString
         let marker = "\u{FFFC}"
@@ -131,7 +131,8 @@ public final class TextForgeAttachment: NSObject {
             result.append(source.substring(with: NSRange(location: start, length: next.location - start)))
             let copy = text.attribute(copyKey, at: next.location, effectiveRange: nil) as? String
             let spoken = forSpeech ? text.attribute(speechKey, at: next.location, effectiveRange: nil) as? String : nil
-            result.append(spoken ?? copy ?? "")
+            let attachment = text.attribute(.attachment, at: next.location, effectiveRange: nil) as? NSTextAttachment
+            result.append(spoken ?? copy ?? attachment?.accessibilityLabel ?? "")
             start = NSMaxRange(next)
             next = source.range(of: marker, options: [], range: NSRange(location: start, length: source.length - start))
         }
@@ -139,12 +140,13 @@ public final class TextForgeAttachment: NSObject {
         return result as String
     }
 
-    /// 编辑器只接管带显式替代文案的内容，其余选择继续交给 UIKit 的原生复制和辅助功能。
+    /// 编辑器只接管带显式或原生替代文案的内容，其余选择继续交给 UIKit 的原生复制和辅助功能。
     static func hasTextAlternatives(in text: NSAttributedString) -> Bool {
         guard text.string.contains("\u{FFFC}") else { return false }
         var found = false
         text.enumerateAttributes(in: NSRange(location: 0, length: text.length)) { attributes, _, stop in
             found = attributes[copyKey] != nil || attributes[speechKey] != nil
+                || (attributes[.attachment] as? NSTextAttachment)?.accessibilityLabel != nil
             if found { stop.pointee = true }
         }
         return found

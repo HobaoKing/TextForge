@@ -55,6 +55,7 @@ final class ExampleViewController: UIViewController {
         }
 
         let article = TextForgeLabel()
+        article.isSelectable = true
         article.numberOfLines = 2
         article.lineBreakMode = .byTruncatingTail
         article.truncationToken = TextForgeContainer.readMoreToken { [weak article] _, _, _, _ in article?.numberOfLines = 0 }
@@ -108,6 +109,7 @@ final class ExampleViewController: UIViewController {
         failures.append(contentsOf: verifyLayoutFeatures())
         failures.append(contentsOf: verifyTruncationEdges())
         failures.append(contentsOf: verifyWrappingAndInteraction())
+        failures.append(contentsOf: verifyLabelSelection())
         input.placeholderFont = .systemFont(ofSize: 19, weight: .semibold)
         input.placeholderTextColor = .purple
         input.layoutIfNeeded()
@@ -145,7 +147,9 @@ final class ExampleViewController: UIViewController {
         input.setMarkedText("n", selectedRange: NSRange(location: 1, length: 0))
         input.setMarkedText("ni", selectedRange: NSRange(location: 2, length: 0))
         input.unmarkText()
-        if received != ["", "ni"] { failures.append("repeated marked edits changed the committed baseline") }
+        if received != ["", "ni"] { failures.append("repeated marked edits: callbacks=\(received), text=\(input.text ?? "")") }
+
+        failures.append(contentsOf: verifyCompositionTransactions())
 
         verifyAsyncPreparation { asyncResults in
             self.verifyExplicitLayoutAppearance { appearanceFailures in
@@ -164,6 +168,92 @@ final class ExampleViewController: UIViewController {
         }
     }
 
+    /// 模拟替换已有选区的拼音、候选上屏、取消和重复通知。每次 UIKit 操作只允许交付返回时已提交的最终正文。
+    private func verifyCompositionTransactions() -> [String] {
+        var failures: [String] = []
+        for i in 0..<18 {
+            input.text = "前X后"
+            input.selectedRange = NSRange(location: 1, length: 1)
+            received.removeAll()
+            var committed = "前X后"
+            var expected: [String] = []
+            // 某些系统输入模式会在 setMarkedText 返回前自行结束标记，按实际原生状态核对。
+            func edit(_ operation: () -> Void) {
+                operation()
+                if input.markedTextRange == nil, let final = input.text, final != committed {
+                    expected.append(final)
+                    committed = final
+                }
+                if received != expected { failures.append("IME step \(i): expected \(expected), got \(received)") }
+            }
+            edit { input.setMarkedText("n", selectedRange: NSRange(location: 1, length: 0)) }
+            edit { input.setMarkedText("ni", selectedRange: NSRange(location: 2, length: 0)) }
+            switch i % 6 {
+            case 0: edit { input.insertText("你") }
+            case 1: edit { input.setMarkedText("", selectedRange: NSRange(location: 0, length: 0)) }
+            case 2: edit { if let range = input.markedTextRange { input.replace(range, withText: "你") } }
+            case 3: edit { input.deleteBackward() }
+            case 4: edit { input.unmarkText() }
+            default: break
+            }
+            edit { input.unmarkText() }
+            edit { NotificationCenter.default.post(name: UITextView.textDidChangeNotification, object: input) }
+            if !failures.isEmpty { break }
+        }
+        return failures
+    }
+
+    /// 从触点选词，并验证局部复制、附件替代、字素边界、隐藏正文和换文清理。
+    private func verifyLabelSelection() -> [String] {
+        let label = TextForgeLabel(frame: CGRect(x: 0, y: 0, width: 320, height: 100))
+        label.numberOfLines = 0
+        label.font = .systemFont(ofSize: 18)
+        view.addSubview(label)
+        defer { label.removeFromSuperview() }
+        let source = NSMutableAttributedString(string: "条款 contract 👨‍👩‍👧‍👦 ")
+        let slot = TextForgeAttachment.view(UIView(), size: CGSize(width: 14, height: 12), font: label.font, alignment: .center)
+        source.append(TextForgeAttachment.withTextAlternatives(slot, copyText: "[会员]", accessibilityText: "会员"))
+        source.append(NSAttributedString(string: " 后文"))
+        label.attributedText = source
+        let ns = source.string as NSString
+        let word = ns.range(of: "contract")
+        let pointRect = label.rect(forRange: NSRange(location: word.location + 2, length: 1))
+        let point = CGPoint(x: pointRect.midX, y: pointRect.midY)
+        if label.selectWord(at: point) { return ["selection unexpectedly enabled by default"] }
+        label.isSelectable = true
+        let press = ExamplePress()
+        let actual = label.rect(forRange: NSRange(location: word.location + 2, length: 1))
+        press.point = CGPoint(x: actual.midX, y: actual.midY)
+        _ = label.perform(NSSelectorFromString("handleLongPress:"), with: press)
+        guard label.selectedRange == word, label.selectedText == "contract" else { return ["long press failed to select word"] }
+        label.copy(nil)
+        guard UIPasteboard.general.string == "contract" else { return ["copy did not use selected word"] }
+        let emoji = ns.range(of: "👨‍👩‍👧‍👦")
+        guard label.selectText(in: NSRange(location: emoji.location + 1, length: 1)), label.selectedRange == emoji else {
+            return ["selection split grapheme cluster"]
+        }
+        let badge = ns.range(of: "\u{fffc}")
+        guard label.selectText(in: badge), label.selectedText == "[会员]" else { return ["selection lost attachment alternative"] }
+        guard !label.selectText(in: NSRange(location: Int.max - 1, length: 10)), label.selectedRange == badge else {
+            return ["invalid selection replaced previous selection"]
+        }
+        label.text = String(repeating: "ABCDEFG ", count: 20)
+        guard label.selectedRange.location == NSNotFound else { return ["selection survived content reuse"] }
+        label.numberOfLines = 1
+        label.lineBreakMode = .byTruncatingMiddle
+        label.bounds.size.width = 95
+        let length = (label.text! as NSString).length
+        guard label.isTruncated, !label.selectText(in: NSRange(location: 0, length: length)),
+              !label.selectText(in: NSRange(location: length / 2, length: 1)),
+              label.selectText(in: NSRange(location: 0, length: 1)),
+              label.selectText(in: NSRange(location: length - 2, length: 1))
+            else { return ["middle truncation selection did not isolate visible prefix and suffix"] }
+        label.isSelectable = false
+        label.allowsCopy = true
+        label.copy(nil)
+        return UIPasteboard.general.string == label.text ? [] : ["whole-label copy regressed"]
+    }
+
     /// 对照真实命中对象、逐字换行和双向片段；缩字号后核对最后一个字符的几何与点击。
     private func verifyWrappingAndInteraction() -> [String] {
         var failures: [String] = []
@@ -179,6 +269,32 @@ final class ExampleViewController: UIViewController {
         let explicit = TextForgeLayout(container: box, attributedText: word)
         if chars.lines.first?.range == words.lines.first?.range || explicit.lines.first?.range != words.lines.first?.range {
             failures.append("character wrap or explicit paragraph override")
+        }
+
+        let clipped = TextForgeLabel(frame: CGRect(x: 0, y: 0, width: 80, height: 40))
+        clipped.numberOfLines = 1
+        clipped.lineBreakMode = .byClipping
+        clipped.highlightTapAction = { _, _, _, _ in }
+        let long = NSMutableAttributedString(string: String(repeating: "Sample ", count: 20), attributes: [.font: font])
+        let tail = NSRange(location: long.length - 6, length: 5)
+        long.addAttribute(.link, value: URL(string: "https://example.invalid/")!, range: tail)
+        clipped.attributedText = long
+        if !clipped.isTruncated || NSMaxRange(clipped.displayedTextLayout!.visibleRange) >= long.length ||
+            !clipped.rect(forRange: tail).isNull || !(clipped.accessibilityCustomActions ?? []).isEmpty {
+            failures.append("clipping exposed invisible link")
+        }
+        clipped.bounds.size.width = 4
+        clipped.attributedText = NSAttributedString(string: "W", attributes: [.font: font])
+        if !clipped.isTruncated || clipped.displayedTextLayout?.visibleRange.length != 1 {
+            failures.append("partially visible glyph lost clipping or hit range")
+        }
+        clipped.bounds.size.width = 80
+        clipped.text = "短"
+        if clipped.isTruncated { failures.append("short clipping text misreported overflow") }
+
+        clipped.attributedText = NSAttributedString(string: "שלום שלום שלום שלום", attributes: [.font: font])
+        if !clipped.isTruncated || clipped.displayedTextLayout!.visibleRange.length >= clipped.attributedText!.length {
+            failures.append("RTL clipping retained full range")
         }
 
         let bidi = TextForgeLayout(attributedText: NSAttributedString(string: "ABC אבג DEF", attributes: [.font: font]),
@@ -225,6 +341,13 @@ final class ExampleViewController: UIViewController {
         if label.isTruncated || tapped != last { failures.append("last scaled glyph missing or untappable") }
         label.adjustsFontSizeToFitWidth = false
         if !label.isTruncated { failures.append("disabling shrink reused the scaled layout") }
+        label.lineSpacing = 2
+        label.textColor = .blue
+        label.highlightedTextColor = .red
+        label.isHighlighted = true
+        if pixels(of: label).red == 0 { failures.append("custom layout ignored UILabel highlighted color") }
+        label.isHighlighted = false
+        if pixels(of: label).blue == 0 { failures.append("normal color not restored") }
         return failures
     }
 
@@ -236,7 +359,7 @@ final class ExampleViewController: UIViewController {
         }.base64EncodedString()
         let html = """
         <html><body><p><strong style="color:#f00">标题</strong> &amp; <a href="help">帮助</a></p>
-        <ul><li>列表项目</li></ul><img width="4" height="4" src="data:image/png;base64,\(icon)"></body></html>
+        <ul><li>列表项目</li></ul><img width="4" height="4" alt="红花" src="data:image/png;base64,\(icon)"></body></html>
         """
         let base = URL(string: "https://example.com/guide/")!
         TextForgeHTML.attributedString(from: html, baseURL: base) { text, error in
@@ -259,6 +382,10 @@ final class ExampleViewController: UIViewController {
                 link?.absoluteString != "https://example.com/guide/help" {
                 failures.append("HTML style/image/link: \(text.string) \(String(describing: link)), image=\(attachment != nil)")
             }
+            if !TextForgeAttachment.copyText(for: text).contains("红花") ||
+                !TextForgeAttachment.accessibilityText(for: text).contains("红花") {
+                failures.append("HTML image alt lost from copy or speech")
+            }
             let label = TextForgeLabel(frame: CGRect(x: 0, y: 0, width: 130, height: 30))
             label.numberOfLines = 0
             label.preferredMaxLayoutWidth = 130
@@ -270,8 +397,262 @@ final class ExampleViewController: UIViewController {
                     failures.append("intrinsic height after finite async layout")
                 }
                 guard let attachment else { completion(failures); return }
-                self.verifyImportedImage(attachment) { completion(failures + $0) }
+                self.verifyImportedImage(attachment) { imageFailures in
+                    self.verifyHTMLReadingStyle { completion(failures + imageFailures + $0) }
+                }
             }
+        }
+    }
+
+    /// 验证旧编码声明下的 Unicode 正文、作者 CSS 优先级、图片去重、独立快照与尺寸回流。
+    private func verifyHTMLReadingStyle(completion: @escaping ([String]) -> Void) {
+        let style = TextForgeHTMLReadingStyle()
+        style.defaultFont = .systemFont(ofSize: 19)
+        style.textColor = .red
+        style.linkColor = .green
+        style.underlinesLinks = false
+        style.maximumImageWidth = 60
+        style.placeholderSize = CGSize(width: 16, height: 8)
+        let image = UIGraphicsImageRenderer(size: CGSize(width: 120, height: 30)).image { ctx in
+            UIColor.red.setFill(); ctx.fill(CGRect(x: 0, y: 0, width: 120, height: 30))
+        }
+        let embedded = image.pngData()!.base64EncodedString()
+        let html = """
+        <html><head><meta http-equiv="Content-Type" content="text/html; charset=GB18030"><base href="/cdn/"><style>.author { color: #0000ff; font-size: 11px }</style></head>
+        <body>中文 café 😄 默认<a href="link">链接</a><b class="author">指定</b>
+        <picture><source srcset="ignored.png"><img src='ok?a=1&amp;b=2' width=100 alt='首图'></picture>
+        <img src='ok?a=1&amp;b=2' style='width:20px' alt='小图'><img src=missing alt='缺图'><img src='data:image/png;base64,\(embedded)' alt='内嵌图'><img style='display:none' src='hidden'></body></html>
+        """
+        var initial: NSAttributedString?
+        var urls: [URL] = []
+        var failures: [String] = []
+        // 直接读取用户所见附件的排版尺寸，比较两个快照并确认旧快照没有被修改。
+        func sizes(_ text: NSAttributedString) -> [CGSize] {
+            var result: [CGSize] = []
+            text.enumerateAttribute(.attachment, in: NSRange(location: 0, length: text.length)) { value, _, _ in
+                if let attachment = value as? NSTextAttachment { result.append(attachment.bounds.size) }
+            }
+            return result
+        }
+        _ = TextForgeHTML.importHTML(html, baseURL: URL(string: "https://example.invalid/docs/"),
+            readingStyle: style, imageLoader: { url, reply in
+                urls.append(url)
+                let loaded = url.lastPathComponent == "ok" ? image : nil
+                DispatchQueue.global().async { reply(loaded); reply(nil) }
+                return nil
+            }, update: { if initial == nil { initial = $0 } }) { result, error in
+                guard let result, let initial, error == nil else { completion(["HTML host import: "+String(describing: error)]); return }
+                if !result.string.contains("中文 café 😄 默认") {
+                    failures.append("HTML legacy charset corrupted Unicode text: " + result.string)
+                }
+                let expected = ["https://example.invalid/cdn/missing", "https://example.invalid/cdn/ok?a=1&b=2"]
+                if urls.map(\.absoluteString).sorted() != expected ||
+                    sizes(initial) != [CGSize(width: 60, height: 30), CGSize(width: 20, height: 10), style.placeholderSize, CGSize(width: 60, height: 15)] ||
+                    sizes(result) != [CGSize(width: 60, height: 15), CGSize(width: 20, height: 5), style.placeholderSize, CGSize(width: 60, height: 15)] ||
+                    !TextForgeAttachment.copyText(for: result).contains("首图") {
+                    failures.append("HTML URLs or image sizes: \(urls), \(sizes(initial)), \(sizes(result))")
+                }
+                // 从实际导入的颜色通道、字号与链接属性断言，包括作者的 CSS 类。
+                for (word, size, component) in [("默认", 19.0, 0), ("链接", 19.0, 1), ("指定", 11.0, 2)] {
+                    let i = (result.string as NSString).range(of: word).location
+                    guard i != NSNotFound else { failures.append("missing " + word); continue }
+                    let attrs = result.attributes(at: i, effectiveRange: nil)
+                    let font = attrs[.font] as? UIFont
+                    var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+                    let rgb = (attrs[.foregroundColor] as? UIColor)?.getRed(&r, green: &g, blue: &b, alpha: &a)
+                    if rgb != true || [r,g,b][component] < 0.95 || abs((font?.pointSize ?? 0) - size) > 0.1 ||
+                        (component == 1 && (attrs[.link] == nil || (attrs[.underlineStyle] as? NSNumber)?.intValue ?? 0 != 0)) {
+                        failures.append("HTML reading style \(word) \(attrs)")
+                    }
+                }
+                let linkRange = (result.string as NSString).range(of: "链接")
+                if linkRange.location != NSNotFound {
+                    let link = result.attributedSubstring(from: linkRange)
+                    let label = TextForgeLabel(frame: CGRect(x: 0, y: 0, width: 120, height: 45))
+                    self.view.addSubview(label)
+                    label.attributedText = link
+                    if self.pixels(of: label).green == 0 { failures.append("HTML link color lost on label") }
+                    label.linkTextAttributes = [.foregroundColor: UIColor.blue]
+                    if self.pixels(of: label).blue == 0 { failures.append("explicit label link style lost") }
+                    label.removeFromSuperview()
+                    let input = TextForgeTextView(frame: label.bounds)
+                    input.isEditable = false
+                    input.backgroundColor = .clear
+                    self.view.addSubview(input)
+                    input.attributedText = link
+                    input.layoutIfNeeded()
+                    if self.pixels(of: input).green == 0 { failures.append("HTML link color lost on editor: \(self.pixels(of: input)) \(String(describing: input.linkTextAttributes))") }
+                    input.linkTextAttributes = [.foregroundColor: UIColor.blue]
+                    input.attributedText = link
+                    input.layoutIfNeeded()
+                    if self.pixels(of: input).blue == 0 { failures.append("explicit editor link style lost") }
+                    input.linkTextAttributes = nil
+                    input.text = "普通文本"
+                    input.attributedText = NSAttributedString(string: "默认链接", attributes: [.link: URL(string: "https://example.invalid")!])
+                    if input.linkTextAttributes?.isEmpty == true { failures.append("editor did not restore system link style") }
+                    input.removeFromSuperview()
+                }
+                self.verifyHTMLCellReuse { reuseFailures in
+                    self.verifyDecoratedBitmap { completion(failures + reuseFailures + $0) }
+                }
+            }
+    }
+
+    /// 在真正的 UITableView 重用队列中换绑同一 Cell，两篇文章共用 URL，并强制旧图在新图之后抵达。
+    private func verifyHTMLCellReuse(completion: @escaping ([String]) -> Void) {
+        let table = UITableView(frame: CGRect(x: 0, y: 0, width: 230, height: 64), style: .plain)
+        let source = HTMLReuseSource()
+        table.register(HTMLReuseCell.self, forCellReuseIdentifier: "article")
+        table.dataSource = source
+        table.isPrefetchingEnabled = false
+        table.rowHeight = 64
+        view.addSubview(table)
+        table.reloadData()
+        table.layoutIfNeeded()
+        let path = IndexPath(row: 0, section: 0)
+        guard let cell = table.cellForRow(at: path) as? HTMLReuseCell else {
+            table.removeFromSuperview(); completion(["missing original article cell"]); return
+        }
+
+        var failures: [String] = []
+        let base = URL(string: "https://example.invalid/article/")!
+        let oldHTML = "旧文章<img src='first' alt='旧首图'><img src='shared' alt='旧尾图'>"
+        let newHTML = "新文章<img src='shared' alt='新封面'>"
+        let image = UIGraphicsImageRenderer(size: CGSize(width: 13, height: 7)).image { _ in }
+        let style = TextForgeHTMLReadingStyle()
+        weak var loaderOwner: NSObject?
+        // 从独立作用域创建任务，确保返回后只有库持有加载器捕获的对象。
+        func pendingImport() -> TextForgeHTMLImportTask {
+            let owner = NSObject()
+            loaderOwner = owner
+            return TextForgeHTML.importHTML(oldHTML, baseURL: base, readingStyle: style, imageLoader: { [owner] _, _ in
+                withExtendedLifetime(owner) { failures.append("loader started after immediate cancel") }
+                return nil
+            }, completion: { _, _ in failures.append("immediately cancelled import delivered") })
+        }
+        let pending = pendingImport()
+        pending.cancel()
+        pending.cancel()
+        if loaderOwner != nil || !pending.isCancelled { failures.append("cancel retained loader before parsing") }
+
+        var firstSnapshotCancelled = false
+        var placeholderTask: TextForgeHTMLImportTask?
+        placeholderTask = TextForgeHTML.importHTML(oldHTML, baseURL: base, readingStyle: style, imageLoader: { _, _ in
+            failures.append("loader started after placeholder cancellation"); return nil
+        }, update: { _ in
+            firstSnapshotCancelled = true
+            placeholderTask?.cancel()
+        }, completion: { _, _ in failures.append("placeholder cancellation delivered final text") })
+        var cancelledInsideLoader = 0
+        var reentrant: TextForgeHTMLImportTask?
+        reentrant = TextForgeHTML.importHTML(newHTML, baseURL: base, readingStyle: style, imageLoader: { _, reply in
+            reentrant?.cancel()
+            reply(image)
+            return { cancelledInsideLoader += 1 }
+        }, completion: { _, _ in failures.append("reentrant cancellation delivered final text") })
+
+        var oldReplies: [String: @Sendable (UIImage?) -> Void] = [:]
+        var cancelled: [String] = []
+        var oldUpdates = 0, newUpdates = 0, newFinishes = 0
+        var articleFinished = false
+        var attempts = 0
+        // 在三个独立导入都到达断言点后读取当前 Cell，不假设 WebKit 的完成顺序。
+        func finishWhenReady() {
+            if (articleFinished && firstSnapshotCancelled && cancelledInsideLoader == 1) || attempts >= 100 {
+                if !firstSnapshotCancelled || cancelledInsideLoader != 1 || !articleFinished { failures.append("HTML cancellation boundary timeout") }
+                if oldUpdates != 2 || newUpdates != 1 || newFinishes != 1 || cancelled != ["shared"] {
+                    failures.append("article lifecycle counts: \(oldUpdates), \(newUpdates), \(newFinishes), \(cancelled)")
+                }
+                let current = cell.body.attributedText ?? NSAttributedString(string: "")
+                let alt = TextForgeAttachment.copyText(for: current)
+                let slot = (current.string as NSString).range(of: "\u{fffc}")
+                let attachment = slot.location == NSNotFound ? nil : current.attribute(.attachment, at: slot.location, effectiveRange: nil) as? NSTextAttachment
+                if !alt.contains("新文章新封面") || alt.contains("旧") || attachment?.bounds.size != image.size {
+                    failures.append("stale article image/text after reuse: " + alt)
+                }
+                table.removeFromSuperview()
+                completion(failures)
+            } else {
+                attempts += 1
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) { finishWhenReady() }
+            }
+        }
+
+        cell.task = TextForgeHTML.importHTML(oldHTML, baseURL: base, readingStyle: style, imageLoader: { url, reply in
+            oldReplies[url.lastPathComponent] = reply
+            if oldReplies.count == 2 { oldReplies["first"]?(image) }
+            return { cancelled.append(url.lastPathComponent) }
+        }, update: { snapshot in
+            oldUpdates += 1
+            cell.body.attributedText = snapshot
+            guard oldUpdates == 2 else { return }
+            source.count = 0
+            table.reloadData()
+            table.layoutIfNeeded()
+            source.count = 1
+            table.reloadData()
+            table.layoutIfNeeded()
+            guard let reused = table.cellForRow(at: path) as? HTMLReuseCell, reused === cell, cell.reuses > 0 else {
+                failures.append("UITableView did not reuse original cell"); return
+            }
+            reused.task = TextForgeHTML.importHTML(newHTML, baseURL: base, readingStyle: style, imageLoader: { _, reply in
+                reply(image); reply(nil)
+                oldReplies["shared"]?(nil); oldReplies["shared"]?(image)
+                return nil
+            }, update: { snapshot in
+                newUpdates += 1
+                reused.body.attributedText = snapshot
+            }, completion: { final, error in
+                newFinishes += 1
+                reused.body.attributedText = final
+                if error != nil { failures.append("rebound article import failed") }
+                DispatchQueue.main.async { articleFinished = true }
+            })
+        }, completion: { stale, _ in
+            cell.body.attributedText = stale
+            failures.append("old completion reached reused cell")
+        })
+        finishWhenReady()
+    }
+
+    /// 右对齐、外扩背景和阴影共用有限大容器。核对预绘的颜色位置、选中态与恢复后的常态。
+    private func verifyDecoratedBitmap(completion: @escaping ([String]) -> Void) {
+        let label = TextForgeLabel(frame: CGRect(x: 0, y: 0, width: 340, height: 520))
+        view.addSubview(label)
+        let style = NSMutableParagraphStyle()
+        style.alignment = .right
+        let shadow = NSShadow()
+        shadow.shadowOffset = CGSize(width: -12, height: 6)
+        shadow.shadowBlurRadius = 2
+        shadow.shadowColor = UIColor.red
+        let text = NSMutableAttributedString(string: "ABC", attributes: [
+            .font: UIFont.systemFont(ofSize: 20), .foregroundColor: UIColor.blue, .shadow: shadow, .paragraphStyle: style
+        ])
+        let decoration = TextForgeBackground(fillColor: .green, cornerRadius: 2)
+        decoration.insets = UIEdgeInsets(top: -7, left: -23, bottom: -8, right: -3)
+        decoration.apply(to: text, range: NSRange(location: 0, length: text.length))
+        let box = TextForgeContainer(size: label.bounds.size, insets: UIEdgeInsets(top: 14, left: 7, bottom: 4, right: 12))
+        label.textLayout = TextForgeLayout(container: box, attributedText: text)
+        let expected = pixels(of: label)
+        _ = TextForgeLayout.prepare(attributedText: text, container: box, renderScale: max(1, label.traitCollection.displayScale),
+                                    traitCollection: label.traitCollection) { prepared in
+            label.textLayout = prepared
+            let normal = self.pixels(of: label)
+            label.highlightedTextColor = .red
+            label.isHighlighted = true
+            let highlighted = self.pixels(of: label)
+            label.isHighlighted = false
+            let restored = self.pixels(of: label)
+            label.removeFromSuperview()
+            let bitmap = Mirror(reflecting: prepared).children.first { $0.label == "preparedImage" }?.value as? UIImage
+            // 位图经设备像素再采样后边缘有抗锯齿差异，背景主体、原色和选中色都应保留。
+            guard let bitmap, bitmap.size.width < 170, normal.green > 0, normal.blue > 0,
+                  abs(normal.green - expected.green) <= 20, highlighted.red > normal.red,
+                  highlighted.blue == 0, restored == normal else {
+                completion(["decorated/selected bitmap: \(expected), \(normal), \(highlighted), \(restored), \(String(describing: bitmap?.size))"])
+                return
+            }
+            completion([])
         }
     }
 
@@ -280,9 +661,10 @@ final class ExampleViewController: UIViewController {
         let source = NSAttributedString(attachment: attachment)
         let label = TextForgeLabel(frame: CGRect(x: 0, y: 0, width: 100, height: 60))
         view.addSubview(label)
-        let size = label.bounds.size
+        let size = CGSize(width: 340, height: 600)
+        label.bounds.size = size
         _ = TextForgeLayout.prepare(attributedText: source, size: size, insets: .zero, maximumNumberOfRows: 0,
-                                    lineBreakMode: .byWordWrapping, renderScale: 2, traitCollection: label.traitCollection) { prepared in
+                                    lineBreakMode: .byWordWrapping, renderScale: 3, traitCollection: label.traitCollection) { prepared in
             label.textLayout = prepared
             label.layoutIfNeeded()
             let usedPreparedLayout = label.displayedTextLayout === prepared
@@ -292,7 +674,8 @@ final class ExampleViewController: UIViewController {
             label.layoutIfNeeded()
             let syncRed = self.pixels(of: label).red
             label.removeFromSuperview()
-            let matches = usedPreparedLayout && syncRed > 0 && syncRed == preparedRed && sync.textBoundingSize == prepared.textBoundingSize
+            let bitmap = Mirror(reflecting: prepared).children.first { $0.label == "preparedImage" }?.value as? UIImage
+            let matches = bitmap != nil && bitmap!.size.width < 100 && bitmap!.size.height < 100 && usedPreparedLayout && syncRed > 0 && syncRed == preparedRed && sync.textBoundingSize == prepared.textBoundingSize
             completion(matches ? [] : ["HTML image: async \(preparedRed) red pixels, \(prepared.textBoundingSize); sync \(syncRed), \(sync.textBoundingSize)"])
         }
     }
@@ -957,6 +1340,42 @@ final class ExampleViewController: UIViewController {
         richLabel.frame.size.height = 0
         richLabel.layoutIfNeeded()
         return failures
+    }
+}
+
+/// 文章行示例通过 prepareForReuse 撤销旧文章并清空显示。
+private final class HTMLReuseCell: UITableViewCell {
+    let body = TextForgeLabel()
+    var task: TextForgeHTMLImportTask?
+    private(set) var reuses = 0
+
+    override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
+        super.init(style: style, reuseIdentifier: reuseIdentifier)
+        contentView.addSubview(body)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        body.frame = contentView.bounds
+    }
+
+    /// 先取消，再清空，确保旧回调无法覆盖下一篇文章。
+    override func prepareForReuse() {
+        super.prepareForReuse()
+        task?.cancel()
+        task = nil
+        body.attributedText = nil
+        reuses += 1
+    }
+}
+
+private final class HTMLReuseSource: NSObject, UITableViewDataSource {
+    var count = 1
+    func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int { count }
+    func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+        tableView.dequeueReusableCell(withIdentifier: "article", for: indexPath)
     }
 }
 

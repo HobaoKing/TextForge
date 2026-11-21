@@ -53,11 +53,11 @@ extension TextForgeLayout {
         let operation = Operation()
         let task = TextForgeLayoutTask(operation: operation)
         let detachedText = detachedTextForLayout(
-            renderingText(original, linkTextAttributes: container.linkTextAttributes), traits: traitCollection
+            renderingText(original, container: container), traits: traitCollection
         )
         let detachedToken = container.truncationToken.map {
             detachedTextForLayout(
-                renderingText($0, linkTextAttributes: container.linkTextAttributes), traits: traitCollection
+                renderingText($0, container: container), traits: traitCollection
             )
         }
         guard let detachedText, detachedToken.map({ $0 != nil }) ?? true else {

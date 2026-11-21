@@ -25,7 +25,10 @@ public final class TextForgeContainer: NSObject, NSCopying {
     @objc public var exclusionPaths: [UIBezierPath] = []
 
     /// 叠加在 `.link` 范围上的显示属性，会覆盖该范围原有的同名属性。传空字典则保留文本自身样式。
-    @objc public var linkTextAttributes: [NSAttributedString.Key: Any] = TextForgeContainer.defaultLinkTextAttributes
+    @objc public var linkTextAttributes: [NSAttributedString.Key: Any] = TextForgeContainer.defaultLinkTextAttributes {
+        didSet { hasExplicitLinkStyle = true }
+    }
+    private(set) var hasExplicitLinkStyle = false
 
     /// 链接的默认外观：系统链接色，不加下划线。
     @objc public static var defaultLinkTextAttributes: [NSAttributedString.Key: Any] {
@@ -60,7 +63,7 @@ public final class TextForgeContainer: NSObject, NSCopying {
         copy.minimumScaleFactor = minimumScaleFactor
         copy.truncationToken = truncationToken
         copy.exclusionPaths = exclusionPaths.map { $0.copy() as? UIBezierPath ?? $0 }
-        copy.linkTextAttributes = linkTextAttributes
+        if hasExplicitLinkStyle { copy.linkTextAttributes = linkTextAttributes }
         return copy
     }
 }

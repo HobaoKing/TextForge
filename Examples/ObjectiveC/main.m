@@ -188,6 +188,15 @@
     if (![UIPasteboard.generalPasteboard.string isEqualToString:@"[笑]会员"] ||
         ![self.input.accessibilityValue isEqualToString:@"你好微笑会员"]) { [failures addObject:@"Objective-C editor attachment alternatives"]; }
 
+    label.isSelectable = YES;
+    NSRange slice = NSMakeRange(1, 2);
+    if (![label selectTextInRange:slice] || !NSEqualRanges(label.selectedRange, slice) ||
+        ![label.selectedText isEqualToString:@"好[笑]"]) { [failures addObject:@"Objective-C partial selection"]; }
+    [label copy:nil];
+    if (![UIPasteboard.generalPasteboard.string isEqualToString:@"好[笑]"]) { [failures addObject:@"Objective-C partial copy"]; }
+    [label clearSelection];
+    if (label.selectedRange.location != NSNotFound) { [failures addObject:@"Objective-C clear selection"]; }
+
     [TextForgeHTML attributedStringFromHTML:@"<p>说明 &amp; <a href='details'>规则</a></p>"
                                     baseURL:[NSURL URLWithString:@"https://example.com/guide/"]
                                  completion:^(NSAttributedString *html, NSError *error) {
@@ -199,8 +208,49 @@
             || ![label.text containsString:@"&"] || ![self.input.text containsString:@"规则"]) {
             [failures addObject:@"Objective-C HTML import, link or control assignment"];
         }
-        [self writeVerificationResult:failures];
+        [self verifyHostImageLoader:failures];
     }];
+}
+
+// 从 Objective-C 接管图片，在收到请求后模拟 Cell 复用。取消必须撤销宿主请求并屏蔽迟到的结果。
+- (void)verifyHostImageLoader:(NSMutableArray<NSString *> *)failures {
+    TextForgeHTMLReadingStyle *style = [TextForgeHTMLReadingStyle new];
+    style.defaultFont = [UIFont systemFontOfSize:16];
+    style.maximumImageWidth = 48;
+    NSURL *base = [NSURL URLWithString:@"https://example.invalid/path/"];
+    __block BOOL cancelled = NO;
+    __block BOOL displayed = NO;
+    __block TextForgeHTMLImportTask *task = nil;
+    task = [TextForgeHTML importHTML:@"<p>旧<img src='one' alt='旧图'></p>" baseURL:base readingStyle:style
+        imageLoader:^dispatch_block_t(NSURL *url, void (^reply)(UIImage *)) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [task cancel];
+                reply(nil);
+                if (!task.isCancelled || !cancelled || !displayed) { [failures addObject:@"Objective-C loader cancellation"]; }
+                task = nil;
+                [TextForgeHTML importHTML:@"<p>新<img src='two' alt='新图'></p>" baseURL:base readingStyle:style
+                    imageLoader:^dispatch_block_t(NSURL *nextURL, void (^nextReply)(UIImage *)) {
+                        if (![nextURL.absoluteString isEqualToString:@"https://example.invalid/path/two"]) {
+                            [failures addObject:@"Objective-C relative image URL"];
+                        }
+                        nextReply(nil);
+                        return nil;
+                    } update:nil completion:^(NSAttributedString *result, NSError *error) {
+                        self.forgeLabel.attributedText = result;
+                        self.input.attributedText = result;
+                        if (error || ![self.forgeLabel.accessibilityLabel containsString:@"新图"] ||
+                            ![self.input.accessibilityValue containsString:@"新图"]) {
+                            [failures addObject:@"Objective-C replacement HTML or failed-image alternative"];
+                        }
+                        [self writeVerificationResult:failures];
+                    }];
+            });
+            return ^{ cancelled = YES; };
+        } update:^(NSAttributedString *snapshot) {
+            displayed = [[TextForgeAttachment copyTextForAttributedString:snapshot] containsString:@"旧图"];
+        } completion:^(NSAttributedString *result, NSError *error) {
+            [failures addObject:@"Cancelled HTML delivered a stale completion"];
+        }];
 }
 
 // 从 ObjC 验证容器配置、截断标记、逐行查询、圆角背景和标签上的同名能力，确认这些接口都已导出。

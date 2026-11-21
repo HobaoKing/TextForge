@@ -53,7 +53,7 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
 
     /// 叠加在 `.link` 范围上的显示属性，会覆盖该范围原有的同名属性。传空字典则保留文本自身样式。
     @objc public var linkTextAttributes: [NSAttributedString.Key: Any] = TextForgeContainer.defaultLinkTextAttributes {
-        didSet { invalidateTextLayout() }
+        didSet { hasExplicitLinkStyle = true; invalidateTextLayout() }
     }
 
     /// 高亮和链接的触摸热区向外扩展的半径，单位为点。手指落在多个热区内时取最近的一个。
@@ -61,6 +61,103 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
 
     /// 开启后长按弹出系统的拷贝菜单，复制当前文本的全文，附件占位字符不会进入剪贴板。
     @objc public var allowsCopy = false
+
+    /// 开启后长按正文按词选择，可拖手柄并复制选区。默认关闭，原来的长按全文复制继续由 allowsCopy 控制。
+    @objc public var isSelectable = false { didSet { if oldValue != isSelectable { invalidateTextLayout() } } }
+    private var selection: TextForgeLabelSelection?
+    private var extendingWord = false
+
+    /// 以原文 UTF-16 下标表示当前选区；无选区时 location 为 NSNotFound。
+    @objc public var selectedRange: NSRange { selection?.range ?? NSRange(location: NSNotFound, length: 0) }
+
+    /// 选区的复制文案，保留附件替代文字；无选区时为 nil。
+    @objc public var selectedText: String? {
+        guard let selection else { return nil }
+        return TextForgeAttachment.copyText(for: selection.layout.attributedText.attributedSubstring(from: selection.range))
+    }
+
+    /// 手动选择一段可见正文，端点扩展到完整字素。越界、跨截断缺口或未启用选择时返回 false，保留现有选区。
+    @objc(selectTextInRange:) @discardableResult
+    public func selectText(in range: NSRange) -> Bool {
+        guard isSelectable, let layout = displayedTextLayout else { return false }
+        let text = layout.attributedText.string as NSString
+        guard range.location >= 0, range.location < text.length, range.length > 0,
+              range.length <= text.length - range.location else { return false }
+        let expanded = text.rangeOfComposedCharacterSequences(for: range)
+        guard let segment = layout.selectionSegments.first(where: { NSIntersectionRange($0, expanded) == expanded }) else { return false }
+        if let selection, selection.layout === layout, selection.segment == segment {
+            selection.setRange(expanded, asAnchor: true)
+        } else {
+            clearSelection()
+            let overlay = TextForgeLabelSelection(layout: layout, segment: segment, range: expanded)
+            selection = overlay
+            addSubview(overlay)
+            positionSelection(overlay)
+        }
+        return true
+    }
+
+    /// 选择点中的系统分词；表情、标点和附件按单个字素选择。坐标相对标签，省略号与“全文”标记保留原交互。
+    @objc(selectWordAtPoint:) @discardableResult
+    public func selectWord(at point: CGPoint) -> Bool {
+        guard isSelectable, let layout = displayedTextLayout else { return false }
+        let index = characterIndex(at: point)
+        guard let segment = layout.selectionSegments.first(where: { NSLocationInRange(index, $0) }) else { return false }
+        let string = layout.attributedText.string as NSString
+        var word = string.rangeOfComposedCharacterSequence(at: index)
+        string.enumerateSubstrings(in: string.paragraphRange(for: word), options: [.byWords, .localized, .substringNotRequired]) { _, range, _, stop in
+            if NSLocationInRange(index, range) { word = range }
+            if NSMaxRange(range) > index { stop.pointee = true }
+        }
+        return selectText(in: NSIntersectionRange(word, segment))
+    }
+
+    /// 清除视觉选区及其菜单，Cell 换文或离开窗口时也会执行。
+    @objc public func clearSelection() {
+        guard let selection else { return }
+        extendingWord = false
+        self.selection = nil
+        selection.removeFromSuperview()
+        dismissSelectionMenu()
+    }
+
+    /// 选区覆盖在当前附件和文字上方；它仅在手柄附近拦截触摸。
+    private func positionSelection(_ overlay: TextForgeLabelSelection) {
+        overlay.frame = bounds
+        let origin = drawingOrigin(for: overlay.layout)
+        overlay.refresh(origin: CGPoint(x: origin.x - bounds.minX, y: origin.y - bounds.minY))
+        bringSubviewToFront(overlay)
+    }
+
+    /// 手指松开后使用实际选区作为系统复制菜单的锚点。
+    func showSelectionMenu() {
+        guard let selection, !selection.menuRect.isEmpty else { return }
+        let area = selection.convert(selection.menuRect, to: self)
+        presentCopyMenu(at: CGPoint(x: area.midX, y: area.midY))
+    }
+
+    /// 只收起本标签的菜单，避免复用或拖选打断其他第一响应者。
+    func dismissSelectionMenu() {
+        guard isFirstResponder else { return }
+        if #available(iOS 16.0, *) {
+            interactions.compactMap { $0 as? UIEditMenuInteraction }.first?.dismissMenu()
+        } else {
+            UIMenuController.shared.hideMenu(from: self)
+        }
+    }
+
+    /// 切换输入焦点后清理旧选区，防止继续复制先前标签内的文字。
+    open override func resignFirstResponder() -> Bool {
+        let resigned = super.resignFirstResponder()
+        if resigned { clearSelection() }
+        return resigned
+    }
+
+    /// 离开窗口时释放手柄，重用同一个标签也不会沿用上一次选择。
+    open override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window == nil { clearSelection() }
+    }
 
     /// 拷贝菜单出现和消失时在主线程回调，参数为是否可见。可用来切换选中底色。
     @objc public var copyMenuVisibilityHandler: ((Bool) -> Void)?
@@ -70,6 +167,7 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
     @objc public var highlightTapAction: TextForgeTextAction? { didSet { invalidateTextLayout() } }
     @objc public var highlightLongPressAction: TextForgeTextAction? { didSet { invalidateTextLayout() } }
 
+    private var hasExplicitLinkStyle = false
     private var cachedLayouts: [TextForgeLayout] = []
     private var explicitTextLayout: TextForgeLayout?
     private var preparedTextLayout: TextForgeLayout?
@@ -113,6 +211,9 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         get { textLayout?.attributedText ?? super.attributedText }
         set { storeAttributedText(newValue) }
     }
+    // 选中态仅影响绘制，切换时可继续使用同一份布局和常态位图。
+    open override var isHighlighted: Bool { didSet { if oldValue != isHighlighted { setNeedsDisplay() } } }
+    open override var highlightedTextColor: UIColor? { didSet { setNeedsDisplay() } }
     open override var font: UIFont! { didSet { if font != oldValue { invalidateTextLayout() } } }
     open override var textColor: UIColor! { didSet { if textColor != oldValue { invalidateTextLayout() } } }
     open override var textAlignment: NSTextAlignment { didSet { if textAlignment != oldValue { invalidateTextLayout() } } }
@@ -216,18 +317,20 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
     }
 
     /// 允许拷贝时可成为第一响应者，系统菜单据此找到拷贝操作。
-    open override var canBecomeFirstResponder: Bool { allowsCopy || super.canBecomeFirstResponder }
+    open override var canBecomeFirstResponder: Bool { allowsCopy || isSelectable || super.canBecomeFirstResponder }
 
     /// 只在允许拷贝且有文本时提供拷贝操作，其余编辑操作沿用系统判断。
     open override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
-        if action == #selector(copy(_:)) { return allowsCopy && !copyableText.isEmpty }
+        if action == #selector(copy(_:)) { return (allowsCopy || selection != nil) && !copyableText.isEmpty }
         return super.canPerformAction(action, withSender: sender)
     }
 
-    /// 把当前原文的纯文本写入系统剪贴板，未开启拷贝或文本为空时不改动剪贴板。
+    /// 有局部选区时复制选区，否则沿用全文复制。附件均使用其替代文案。
     open override func copy(_ sender: Any?) {
-        guard allowsCopy, !copyableText.isEmpty else { return }
-        UIPasteboard.general.string = copyableText
+        guard selection != nil || allowsCopy else { return }
+        let text = copyableText
+        guard !text.isEmpty else { return }
+        UIPasteboard.general.string = text
     }
 
     /// 清除旧内容并按指定的点尺寸准备新布局。更换内容、样式或设置不匹配的宽度会取消等待中的请求。
@@ -274,6 +377,7 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
     /// 首次获得宽度时也校验待交付结果。已交付的异步文本保留原文，宽度变化后重新排版。
     open override var bounds: CGRect {
         didSet {
+            if oldValue.size != bounds.size { clearSelection() }
             guard oldValue.width != bounds.width else { return }
             if let pendingLayoutWidth, bounds.width != pendingLayoutWidth {
                 cancelPendingLayout()
@@ -352,7 +456,8 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
                 activeRange: activeHighlight?.range,
                 activeInToken: activeHighlight?.inToken ?? false,
                 activeBackground: activeHighlight?.highlight.pressedBackground,
-                activeForeground: activeHighlight?.highlight.highlightedTextColor
+                activeForeground: activeHighlight?.highlight.highlightedTextColor,
+                highlightedColor: isHighlighted ? highlightedTextColor : nil
             )
             return
         }
@@ -377,6 +482,7 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
             view.frame = frame.offsetBy(dx: origin.x, dy: origin.y)
         }
         attachedViews = attachments.map { $0.0 }
+        if let selection { positionSelection(selection) }
     }
 
     /// 在按住高亮文字时显示背景，移动到其他范围或松开时结束高亮。
@@ -415,6 +521,7 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
     open override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         let target = super.hitTest(point, with: event)
         guard target === self else { return target }
+        if selection != nil || (isSelectable && characterIndex(at: point) != NSNotFound) { return self }
         if textTapAction != nil || textLongPressAction != nil || (allowsCopy && !copyableText.isEmpty) { return self }
         if gestureRecognizers?.contains(where: {
             $0 !== actionTapGesture && $0 !== actionPressGesture && $0.isEnabled
@@ -431,6 +538,8 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         guard gestureRecognizer === actionTapGesture || gestureRecognizer === actionPressGesture else {
             return super.gestureRecognizerShouldBegin(gestureRecognizer)
         }
+        if gestureRecognizer === actionTapGesture, selection != nil { return true }
+        if gestureRecognizer === actionPressGesture, isSelectable, characterIndex(at: gestureRecognizer.location(in: self)) != NSNotFound { return true }
         if gestureRecognizer is UILongPressGestureRecognizer, allowsCopy, !copyableText.isEmpty { return true }
         guard usesCustomLayout, !bounds.isEmpty else { return false }
         let hit = interaction(at: gestureRecognizer.location(in: self))
@@ -446,7 +555,7 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
 
     /// 判断当前内容是否需要同一份可查询、可复用的布局。
     private var usesCustomLayout: Bool {
-        textLayout != nil || requiresAttributedLayout || textVerticalAlignment != .center
+        isSelectable || textLayout != nil || requiresAttributedLayout || textVerticalAlignment != .center
             || truncationToken != nil || !exclusionPaths.isEmpty
             || characterSpacing != 0 || lineSpacing != 0 || paragraphSpacing != 0
             || textTapAction != nil || textLongPressAction != nil || highlightTapAction != nil || highlightLongPressAction != nil
@@ -486,7 +595,7 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         container.minimumScaleFactor = adjustsFontSizeToFitWidth ? minimumScaleFactor : 1
         container.truncationToken = truncationToken
         container.exclusionPaths = exclusionPaths
-        container.linkTextAttributes = linkTextAttributes
+        if hasExplicitLinkStyle { container.linkTextAttributes = linkTextAttributes }
         return container
     }
 
@@ -596,6 +705,11 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         return resultHit
     }
 
+    /// 手柄的拖动由选区自身识别，父标签保留普通文字、链接与截断标记的原有手势。
+    public func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+        touch.view !== selection || selection == nil
+    }
+
     /// 为长按和短按分别配置 UIKit 手势，长按成立时避免重复短按。
     private func configureInteraction() {
         isUserInteractionEnabled = true
@@ -613,7 +727,9 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
 
     /// 先派发整标签点击，再派发对应高亮；同一高亮优先使用局部回调。
     @objc private func handleTap(_ gesture: UITapGestureRecognizer) {
-        _ = dispatchTap(interaction(at: gesture.location(in: self)))
+        let hit = interaction(at: gesture.location(in: self))
+        clearSelection()
+        _ = dispatchTap(hit)
     }
 
     /// 派发整段和高亮回调，返回是否确实执行操作。
@@ -628,19 +744,30 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         return genericAction != nil
     }
 
-    /// 只在长按进入识别状态时派发一次，避免移动和结束重复回调。回调之后按需弹出拷贝菜单。
+    /// 显式长按回调优先。普通正文长按选词，持续拖动扩选，松手才弹菜单；关闭选词时沿用原来的全文复制。
     @objc private func handleLongPress(_ gesture: UILongPressGestureRecognizer) {
-        guard gesture.state == .began else { return }
         let point = gesture.location(in: self)
-        if usesCustomLayout, !bounds.isEmpty {
-            let hit = interaction(at: point)
-            let highlightAction = hit.highlight?.longPressAction ?? highlightLongPressAction
-            textLongPressAction?(self, hit.text, hit.characterRange, hit.characterRect)
-            if hit.highlightRange.location != NSNotFound {
-                highlightAction?(self, hit.text, hit.highlightRange, hit.highlightRect)
+        switch gesture.state {
+        case .began:
+            if usesCustomLayout, !bounds.isEmpty {
+                let hit = interaction(at: point)
+                let action = hit.highlightRange.location == NSNotFound ? nil : hit.highlight?.longPressAction ?? highlightLongPressAction
+                if isSelectable, textLongPressAction == nil, action == nil, selectWord(at: point) {
+                    extendingWord = true
+                    return
+                }
+                textLongPressAction?(self, hit.text, hit.characterRange, hit.characterRect)
+                action?(self, hit.text, hit.highlightRange, hit.highlightRect)
             }
+            if allowsCopy { presentCopyMenu(at: point) }
+        case .changed:
+            if extendingWord, let selection { selection.extendWord(to: gesture.location(in: selection)) }
+        case .ended:
+            if extendingWord { extendingWord = false; showSelectionMenu() }
+        case .cancelled, .failed:
+            if extendingWord { clearSelection() }
+        default: break
         }
-        if allowsCopy { presentCopyMenu(at: point) }
     }
 
     /// 旧系统的菜单收起后只通知一次，随即停止监听，避免响应其他控件的菜单。
@@ -649,8 +776,9 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         copyMenuVisibilityHandler?(false)
     }
 
-    /// 取得当前原文全文，过滤附件占位符和展示时临时加入的截断标记。
+    /// 选区优先，全文复制仍从原文导出，省略号和展示标记不会进入剪贴板。
     private var copyableText: String {
+        if let selectedText { return selectedText }
         if let attributedText { return TextForgeAttachment.copyText(for: attributedText) }
         return (text ?? "").replacingOccurrences(of: "\u{FFFC}", with: "")
     }
@@ -671,7 +799,7 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
                 self, selector: #selector(copyMenuDidHide), name: UIMenuController.didHideMenuNotification, object: nil
             )
             copyMenuVisibilityHandler?(true)
-            UIMenuController.shared.showMenu(from: self, rect: bounds)
+            UIMenuController.shared.showMenu(from: self, rect: selection.map { $0.convert($0.menuRect, to: self) } ?? bounds)
         }
     }
 
@@ -700,6 +828,7 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
 
     /// 样式、内容或布局变化时丢弃派生结果、释放旧附件并重新测量。
     private func invalidateTextLayout() {
+        clearSelection()
         cancelPendingLayout()
         preparedTextLayout = nil
         cachedLayouts.removeAll(keepingCapacity: true)
@@ -754,6 +883,7 @@ extension TextForgeLabel: UIEditMenuInteractionDelegate {
         _ interaction: UIEditMenuInteraction, targetRectFor configuration: UIEditMenuConfiguration
     ) -> CGRect {
         MainActor.assumeIsolated {
+            if let selection { return selection.convert(selection.menuRect, to: self) }
             guard let result = displayedTextLayout else { return bounds }
             let origin = drawingOrigin(for: result)
             return result.textBoundingRect.offsetBy(dx: origin.x - result.insets.left, dy: origin.y - result.insets.top)

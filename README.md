@@ -1,14 +1,14 @@
 # TextForge
 Reusable iOS text rendering and input components for Swift and Objective-C.
 
-TextForge 支持 iOS 15+，使用 UIKit / Foundation / WebKit，实现由 Swift 和 Objective-C 共用的文本组件。
+TextForge 支持 iOS 15+，使用 UIKit、Foundation、WebKit 和系统 libxml2，实现由 Swift 和 Objective-C 共用的文本组件。
 
 - `TextForgeLabel` 支持普通文本、局部富文本、字间距、行间距、段间距、内边距、垂直对齐、点击和长按，以及自定义截断标记、排除路径、链接外观、触摸热区扩展和长按拷贝。
 - `TextForgeLayout` 提供固定宽度、最大行数、换行和尾部截断的预排版结果。列表模型可用 `textBoundingSize` 计算行高，Cell 将同一结果赋给 `textLayout` 进行绘制。设为 `nil` 后使用标签本身的文本和样式。布局可查询行数、逐行范围与基线、是否截断、点到字符和范围到矩形。
 - `TextForgeContainer` 集中描述一次排版的边界、内边距、行数、截断标记、排除路径和链接外观，同步和后台预排版共用。
 - `text`、`attributedText` 和默认无障碍文案跟随当前显示的布局。可见且可点击的高亮提供 VoiceOver 自定义操作。
 - `TextForgeTypography` 用于设置整个富文本的间距，并保留原有字体、颜色等逐段样式。`TextForgeHighlight` 支持区间交互和带圆角的按压样式，`TextForgeBackground` 在文字下方绘制圆角底色或描边，`TextForgeAttachment` 提供图片（可选内容模式）及 `UIView` 附件。
-- `TextForgeTextView` 继承 `UITextView` 并可继续被继承，支持占位文本、字体、颜色和富文本占位。直接赋值 `text` 或 `attributedText` 会同步显示。宿主通过系统 `UITextViewDelegate` 和编辑通知接收标准事件，额外的 `onTextChange` 归并中文组字过程，只报告已提交的文本变化。
+- `TextForgeTextView` 继承 `UITextView` 并可继续被继承，支持占位文本、字体、颜色和富文本占位。直接赋值 `text` 或 `attributedText` 会同步显示。宿主通过系统 `UITextViewDelegate` 和编辑通知接收标准事件，额外的 `onTextChange` 在系统结束组字后比较正文。修改拼音、取消后恢复原文时均不会多报一次变化，候选字上屏后按最终文本回调。
 
 在主线程创建和更新控件。输入内容、字数规则、键盘避让和提交动作由宿主负责。
 
@@ -18,7 +18,7 @@ TextForge 支持 iOS 15+，使用 UIKit / Foundation / WebKit，实现由 Swift 
 
 1. 打开消费项目的 workspace 或工程，在 Xcode 选择 **File → Add Package Dependency**。
 2. 输入仓库地址 `https://github.com/HobaoKing/TextForge.git`。
-3. 将依赖规则设为 **Exact Version**，输入 `1.0.2`。
+3. 将依赖规则设为 **Exact Version**，输入 `1.0.3`。
 4. 选择 `TextForge` 产品，添加到实际使用它的 iOS target。团队协作时提交工程配置和共享的 `Package.resolved`。
 
 ### `Package.swift`
@@ -34,7 +34,7 @@ let package = Package(
     platforms: [.iOS(.v15)],
     products: [.library(name: "MyFeature", targets: ["MyFeature"])],
     dependencies: [
-        .package(url: "https://github.com/HobaoKing/TextForge.git", exact: "1.0.2")
+        .package(url: "https://github.com/HobaoKing/TextForge.git", exact: "1.0.3")
     ],
     targets: [
         .target(name: "MyFeature", dependencies: [.product(name: "TextForge", package: "TextForge")])
@@ -118,6 +118,65 @@ TextForgeHTML.attributedString(from: html, baseURL: base) { text, error in
 - 图片可使用内嵌的 `data:` 地址。HTML 引用远程资源时，系统导入器可能发起网络请求，受宿主网络策略限制。离线内容应使用自包含 HTML。交互式网页使用宿主的网页视图。
 - 列表可在绑定 Cell 前导入，按模型标识保存并复用结果。直接在 Cell 中发起导入时，回调里核对当前模型，避免把旧内容赋给已复用的视图。
 
+### 阅读样式与宿主图片加载（1.0.3 起）
+
+需要统一文章字体、限制图片宽度或复用项目自己的图片缓存时，使用 `importHTML`。这个入口从 `1.0.3` 起可用。
+
+```swift
+let style = TextForgeHTMLReadingStyle()
+style.defaultFont = .preferredFont(forTextStyle: .body)
+style.textColor = .label
+style.linkColor = .systemIndigo
+style.underlinesLinks = false
+style.maximumImageWidth = availableWidth   // 点，传入扣除内边距后的实际栏宽
+style.placeholderSize = CGSize(width: 48, height: 32)
+
+let task = TextForgeHTML.importHTML(html, baseURL: base, readingStyle: style,
+    imageLoader: { url, reply in
+        let download = URLSession.shared.dataTask(with: url) { data, _, _ in
+            reply(data.flatMap { UIImage(data: $0) })
+        }
+        download.resume()
+        return { download.cancel() }
+    }, update: { [weak label] text in
+        label?.attributedText = text
+    }, completion: { [weak label] text, error in
+        label?.attributedText = text
+        if let error { label?.text = error.localizedDescription }
+    })
+// 在 Cell 中将 task 存到实例属性 articleTask。
+```
+
+```objc
+TextForgeHTMLReadingStyle *style = [TextForgeHTMLReadingStyle new];
+style.defaultFont = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
+style.linkColor = UIColor.systemIndigoColor;
+style.maximumImageWidth = availableWidth;
+__weak TextForgeLabel *weakLabel = label;
+TextForgeHTMLImportTask *task = [TextForgeHTML importHTML:html baseURL:base readingStyle:style
+    imageLoader:^dispatch_block_t(NSURL *url, void (^reply)(UIImage *)) {
+        NSURLSessionDataTask *download = [NSURLSession.sharedSession dataTaskWithURL:url
+            completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+                reply(data ? [UIImage imageWithData:data] : nil);
+            }];
+        [download resume];
+        return ^{ [download cancel]; };
+    } update:^(NSAttributedString *text) {
+        weakLabel.attributedText = text;
+    } completion:^(NSAttributedString *text, NSError *error) {
+        weakLabel.attributedText = text;
+        if (error) { weakLabel.text = error.localizedDescription; }
+    }];
+// 在 Cell 中将 task 存到实例属性 self.articleTask。
+```
+
+- **样式优先级。** 字体、字号、正文色和链接默认值先于作者 CSS 应用。动态颜色与字号取导入时的值，外观、系统字号或栏宽变化后可用新配置重新导入。标签或编辑器显式设置的 `linkTextAttributes` 仍可覆盖阅读样式。
+- **图片来源。** `imageLoader` 为空时使用 WebKit 原生加载。接管时，宿主收到解析后的 `img src` 地址；同一次导入中的相同 URL 合并请求。响应式图片取 `img src` 回退地址，`data:` 图片仍在本地解码。CSS 背景、字体、样式表等继续走系统导入器。
+- **图片尺寸。** 接管图片支持 `width`、`height` 的数值或内联 `px` 长度；只声明一边时根据原图比例补齐另一边。无声明时先用 `placeholderSize` 和可选的 `placeholderImage`，成功后按原图尺寸展示。`maximumImageWidth` 等比限制最终宽度，0 表示无限制。
+- **回调与复用。** 主线程发起加载；宿主可从任意线程回传一次图片或 `nil`。有待加载图片时，`update` 先给占位快照，其后可给部分加载成功的快照；所有图片结束后 `completion` 交付最终文本。单张失败保留占位与 alt，文档导入失败通过 `error` 返回。每份快照都可独立赋给标签、编辑器或用来预排版；自算行高的列表应在应用新快照后更新行高。取消会撤销待完成的宿主请求并停止投递。可在占位快照回调中取消，重复取消也安全。系统已开始的 HTML 转换可以继续结束，其结果会被丢弃。
+
+Cell 应在两个入口清理旧请求。一次是 `prepareForReuse()`，另一次是同一行就地重新绑定文章时。两个入口都先执行 `articleTask?.cancel()`、清空旧正文，再保存新任务。Objective-C 对应 `[self.articleTask cancel]`。即使新旧文章引用相同 URL，取消后到达的旧图片也不会写入新文章。
+
 ## 「…全文」和附件的文字替代
 
 ```swift
@@ -146,6 +205,31 @@ NSAttributedString *badgeText = [TextForgeAttachment attachmentString:slot copyT
 - 同一标记可赋给 `TextForgeContainer.truncationToken`。使用显式预排版结果时，展开操作应更新容器行数并生成新布局。标签和布局都可以查询 `showsTruncationToken` 和 `truncationTokenRect`。后者使用各自坐标系，标记隐藏时返回 `CGRect.null`。
 - 将 `badgeText` 拼入正文后，标签整段复制、输入框选区复制采用复制文案。标签默认朗读和输入框辅助功能值采用朗读名称。朗读名称为 nil 时沿用复制文案，空串表示静音。未配置的装饰性附件在标签纯文本中省略。
 - 单行标签开启 `adjustsFontSizeToFitWidth` 后，自定义排版也使用 `minimumScaleFactor`。多行按字符换行可设 `.byCharWrapping`，显式指定的段落策略优先。纯展示标签让触摸穿透，链接、整标签操作、可交互附件和宿主手势仍可响应。
+
+## 单个标签内选词与复制（1.0.3 起）
+
+给文章或聊天气泡开启 `isSelectable`，长按正文按系统分词选中，继续拖动可跨行扩选，松手后可拖两端手柄或从系统菜单复制。附件采用其复制文案，组合表情作为一个字素保留。默认关闭；只需要长按复制全文的标签继续设置 `allowsCopy`。已有的长按业务回调优先，轻点链接和「…全文」继续触发各自的操作。
+
+```swift
+label.isSelectable = true
+// 也可主动选择某段可见原文。range 使用 NSString 的 UTF-16 下标。
+if label.selectText(in: range) {
+    let excerpt = label.selectedText
+    // 使用 excerpt 展示引用或摘录
+}
+label.clearSelection()
+```
+
+```objc
+label.isSelectable = YES;
+if ([label selectTextInRange:range]) {
+    NSString *excerpt = label.selectedText;
+    // 使用 excerpt 展示引用或摘录
+}
+[label clearSelection];
+```
+
+按标签坐标选词可调用 Swift 的 `selectWord(at:)` 或 Objective-C 的 `selectWordAtPoint:`。跨越截断隐藏区的请求返回 `false` 并保留原选区。清除选区后 `selectedRange.location` 为 `NSNotFound`。标签换文、布局失效或离开窗口时自动清除选区。
 
 ## 截断标记、排版查询与拷贝
 

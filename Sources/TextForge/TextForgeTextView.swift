@@ -39,9 +39,39 @@ open class TextForgeTextView: UITextView {
     /// 仅在用户编辑后的已提交文本变化时，在主线程回调当前全文。
     @objc public var onTextChange: ((String) -> Void)?
 
+    private var usesDocumentLinkStyle = false
+    private var hasExplicitLinkStyle = false
+
+    /// 宿主显式设置时沿用 UIKit 的全局覆盖。设为 nil 恢复自动选择文档或系统链接外观。
+    open override var linkTextAttributes: [NSAttributedString.Key: Any]! {
+        get { super.linkTextAttributes }
+        set {
+            hasExplicitLinkStyle = newValue != nil
+            usesDocumentLinkStyle = false
+            super.linkTextAttributes = newValue
+            if newValue == nil { refreshLinkStyle(for: super.attributedText) }
+        }
+    }
+
+    /// 高级 HTML 导入的链接自带 CSS。切换回普通内容时恢复 UIKit 默认样式，不影响显式业务设置。
+    private func refreshLinkStyle(for text: NSAttributedString?) {
+        guard !hasExplicitLinkStyle else { return }
+        var styled = false
+        if let text {
+            text.enumerateAttribute(TextForgeHTML.styledLink, in: NSRange(location: 0, length: text.length)) { value, _, stop in
+                if value != nil { styled = true; stop.pointee = true }
+            }
+        }
+        if usesDocumentLinkStyle != styled {
+            usesDocumentLinkStyle = styled
+            super.linkTextAttributes = styled ? [:] : nil
+        }
+    }
+
     private let placeholderLabel = UILabel()
     private var lastCommittedText = ""
     private var observedStorageText = ""
+    private var isUpdatingComposition = false
     private var compositionBaseline: String?
     private var customAccessibilityValue: String?
     private var attributedPlaceholder: NSAttributedString?
@@ -59,9 +89,10 @@ open class TextForgeTextView: UITextView {
         setupPlaceholder()
     }
 
-    /// 直接设置文本时同步占位状态和比较基线，由调用端自行处理业务通知。
+    /// 直接设置纯文本时恢复系统链接外观并同步占位和比较基线。
     open override var text: String! {
         didSet {
+            refreshLinkStyle(for: nil)
             lastCommittedText = text ?? ""
             observedStorageText = lastCommittedText
             compositionBaseline = nil
@@ -69,9 +100,10 @@ open class TextForgeTextView: UITextView {
         }
     }
 
-    /// 直接设置富文本时同步占位状态，以其纯文本作为下一次编辑的比较基线。
+    /// 直接设置富文本时应用其链接样式并同步占位，以纯文本作为下一次编辑的比较基线。
     open override var attributedText: NSAttributedString! {
         didSet {
+            refreshLinkStyle(for: attributedText)
             lastCommittedText = text ?? ""
             observedStorageText = lastCommittedText
             compositionBaseline = nil
@@ -99,11 +131,37 @@ open class TextForgeTextView: UITextView {
         placeholderLabel.frame = CGRect(x: inset.left + padding, y: inset.top, width: width, height: height)
     }
 
-    /// 组字可包含多次底层存储修改。保存进入组字前的全文，只在最终提交时比较一次。
+    /// UIKit 替换标记时可先删后写，期间短暂没有 markedTextRange。等最外层操作完成再判断是否提交。
+    private func updateComposition(_ update: () -> Void) {
+        if isUpdatingComposition { update(); return }
+        if compositionBaseline == nil { compositionBaseline = text ?? "" }
+        isUpdatingComposition = true
+        update()
+        isUpdatingComposition = false
+        textDidChange()
+    }
+
+    /// 记录第一笔拼音前的正文。后续改写标记只更新占位状态，原生标记真正结束才比较最终文本。
     open override func setMarkedText(_ markedText: String?, selectedRange: NSRange) {
-        if compositionBaseline == nil, markedText != nil { compositionBaseline = text ?? "" }
-        super.setMarkedText(markedText, selectedRange: selectedRange)
-        if markedTextRange == nil, compositionBaseline != nil { textDidChange() }
+        updateComposition { super.setMarkedText(markedText, selectedRange: selectedRange) }
+    }
+
+    /// 候选字可直接替换标记；整次插入完成后再报告上屏结果。
+    open override func insertText(_ text: String) {
+        guard compositionBaseline != nil || markedTextRange != nil else { super.insertText(text); return }
+        updateComposition { super.insertText(text) }
+    }
+
+    /// 部分输入法经 UITextInput 的范围替换接口提交候选，沿用同一个组字边界。
+    open override func replace(_ range: UITextRange, withText text: String) {
+        guard compositionBaseline != nil || markedTextRange != nil else { super.replace(range, withText: text); return }
+        updateComposition { super.replace(range, withText: text) }
+    }
+
+    /// 删除或撤销标记时，UIKit 可以分多步修改存储，只比较操作结束后的正文。
+    open override func deleteBackward() {
+        guard compositionBaseline != nil || markedTextRange != nil else { super.deleteBackward(); return }
+        updateComposition { super.deleteBackward() }
     }
 
     /// 编辑器的朗读值使用附件的替代文案，保留宿主显式设置和系统安全输入行为。
@@ -137,9 +195,8 @@ open class TextForgeTextView: UITextView {
 
     /// 组字结束后读取最终文本，兼容提交时未单独发送文本变化通知的输入路径。
     open override func unmarkText() {
-        let wasComposing = markedTextRange != nil
-        super.unmarkText()
-        if wasComposing { textDidChange() }
+        guard compositionBaseline != nil || markedTextRange != nil else { super.unmarkText(); return }
+        updateComposition { super.unmarkText() }
     }
 
     /// 分别观察此输入框的文本存储和 UIKit 编辑通知，保持宿主对两个 delegate 的控制权。
@@ -187,7 +244,7 @@ open class TextForgeTextView: UITextView {
     /// 跳过中文组字和重复通知，先更新比较基线再回调，允许宿主在回调中改写文本。
     private func textDidChange() {
         updatePlaceholderVisibility()
-        guard markedTextRange == nil else { return }
+        guard !isUpdatingComposition, markedTextRange == nil else { return }
         let currentText = text ?? ""
         if let compositionBaseline {
             lastCommittedText = compositionBaseline

@@ -44,9 +44,9 @@ public final class TextForgeLayout: NSObject {
     @objc public convenience init(container: TextForgeContainer, attributedText: NSAttributedString) {
         let container = container.copy() as? TextForgeContainer ?? container
         let engine = TextForgeLayoutEngine(
-            text: Self.renderingText(attributedText, linkTextAttributes: container.linkTextAttributes),
+            text: Self.renderingText(attributedText, container: container),
             truncationToken: container.truncationToken.map {
-                Self.renderingText($0, linkTextAttributes: container.linkTextAttributes)
+                Self.renderingText($0, container: container)
             },
             parameters: Self.parameters(for: container)
         )
@@ -126,6 +126,15 @@ public final class TextForgeLayout: NSObject {
 
     // MARK: 供标签使用，坐标以排版区左上角为原点
 
+    /// 首次选择时才计算连续可见片段，拖动手柄复用同一份不可变布局。
+    private(set) lazy var selectionSegments = engine.selectionSegments()
+
+    /// 将拖选位置映射到最近字形，点相对于排版内容区。
+    func nearestSelectionIndex(to point: CGPoint) -> Int { engine.nearestIndex(to: point) }
+
+    /// 根据端点字形方向选择手柄位于字形框的左侧还是右侧。
+    func isRightToLeft(at index: Int) -> Bool { engine.isRightToLeft(at: index) }
+
     /// 文字自身宽度加内边距，标签按内容自适应时使用。
     var fittingSize: CGSize { engine.fittingSize }
 
@@ -144,14 +153,14 @@ public final class TextForgeLayout: NSObject {
         return !traits.hasDifferentColorAppearance(comparedTo: preparedTraits)
     }
 
-    /// 常态可直接贴用已准备的位图，按压时用同一字形布局绘制状态样式。
+    /// 常态位图按裁剪原点贴回；整标签选中或局部按压时用同一布局绘制状态色。
     /// activeRange 为原文或截断标记内部的范围，由 activeInToken 区分。
     func draw(
         at origin: CGPoint, activeRange: NSRange?, activeInToken: Bool,
-        activeBackground: TextForgeBackground?, activeForeground: UIColor?
+        activeBackground: TextForgeBackground?, activeForeground: UIColor?, highlightedColor: UIColor?
     ) {
-        if activeRange == nil, let preparedImage {
-            preparedImage.draw(at: CGPoint(x: origin.x - insets.left, y: origin.y - insets.top))
+        if activeRange == nil, highlightedColor == nil, let preparedImage {
+            preparedImage.draw(at: CGPoint(x: origin.x + engine.rasterOrigin.x, y: origin.y + engine.rasterOrigin.y))
             return
         }
         engine.draw(at: origin, active: activeRange.map {
@@ -159,7 +168,7 @@ public final class TextForgeLayout: NSObject {
                 range: engine.storageRange(for: $0, inToken: activeInToken),
                 background: activeBackground, foreground: activeForeground
             )
-        })
+        }, highlightedColor: highlightedColor)
     }
 
     /// 命中的字符下标及其是否位于截断标记内。
@@ -226,10 +235,10 @@ public final class TextForgeLayout: NSObject {
         )
     }
 
-    /// 生成只用于排版和绘制的文本：去掉 `.link` 并叠加链接显示属性。
+    /// 生成只用于排版的文本，HTML 阅读样式保留链接外观，调用方显式指定的控件样式优先。
     /// TextKit 会给 `.link` 强制套用系统链接色，保留它就无法自定义外观；交互仍读取原文里的链接。
     static func renderingText(
-        _ text: NSAttributedString, linkTextAttributes: [NSAttributedString.Key: Any]
+        _ text: NSAttributedString, container: TextForgeContainer
     ) -> NSAttributedString {
         var result: NSMutableAttributedString?
         text.enumerateAttribute(.link, in: NSRange(location: 0, length: text.length)) { value, range, _ in
@@ -237,7 +246,13 @@ public final class TextForgeLayout: NSObject {
             let target = result ?? NSMutableAttributedString(attributedString: text)
             result = target
             target.removeAttribute(.link, range: range)
-            target.addAttributes(linkTextAttributes, range: range)
+            if container.hasExplicitLinkStyle {
+                target.addAttributes(container.linkTextAttributes, range: range)
+            } else {
+                text.enumerateAttribute(TextForgeHTML.styledLink, in: range) { styled, part, _ in
+                    if styled == nil { target.addAttributes(container.linkTextAttributes, range: part) }
+                }
+            }
         }
         return result ?? text
     }

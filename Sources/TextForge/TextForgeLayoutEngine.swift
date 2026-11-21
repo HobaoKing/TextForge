@@ -44,12 +44,14 @@ final class TextForgeLayoutEngine {
     let isTruncated: Bool
     /// 自定义截断标记在排版串中的范围。排版串为原文前缀加标记，nil 表示未使用自定义标记。
     let tokenRange: NSRange?
+    private(set) var rasterOrigin: CGPoint = .zero
     private let sourceLength: Int
     /// 无界宽度下文字被排到远处时的横向平移量。对外的坐标都已减去它，传入的点会加回。
     private let shift: CGFloat
     private let storage: NSTextStorage
     private let manager = NSLayoutManager()
     private let container: NSTextContainer
+    private let clippedGlyphs: IndexSet
     private let glyphs: NSRange
     /// TextKit 未通过 truncatedGlyphRange 报告的头部或中部省略范围，包含替代省略号的字形位置。
     private let substitutedGlyphs: NSRange?
@@ -76,6 +78,7 @@ final class TextForgeLayoutEngine {
         manager.addTextContainer(container)
         storage.addLayoutManager(manager)
         guard width > 0, height > 0, text.length > 0 else {
+            clippedGlyphs = []
             glyphs = NSRange(location: 0, length: 0)
             usedRect = .zero
             shift = 0
@@ -104,9 +107,11 @@ final class TextForgeLayoutEngine {
         shift = width >= 1_000_000 && raw.minX > 10_000 ? raw.minX : 0
         let used = raw.offsetBy(dx: -shift, dy: 0)
         glyphs = manager.glyphRange(for: container)
+        let clipping = Self.clippingInfo(manager: manager, container: container, storage: storage)
+        clippedGlyphs = clipping.hidden
         substitutedGlyphs = Self.unreportedTruncation(in: glyphs, storage: storage, manager: manager, container: container)
         usedRect = used
-        isTruncated = overflowed || substitutedGlyphs != nil
+        isTruncated = overflowed || substitutedGlyphs != nil || clipping.overflows
         tokenRange = appliedToken
         let boundingHeight = ceil(used.maxY) + insets.top + insets.bottom
         textBoundingSize = CGSize(width: ceil(used.maxX) + insets.left + insets.right, height: boundingHeight)
@@ -137,6 +142,7 @@ final class TextForgeLayoutEngine {
             let glyphs = manager.glyphRange(for: container)
             return !overflows(manager: manager, container: container, length: storage.length)
                 && manager.usedRect(for: container).width <= container.size.width + 0.01
+                && !clippingInfo(manager: manager, container: container, storage: storage).overflows
                 && unreportedTruncation(in: glyphs, storage: storage, manager: manager, container: container) == nil
         }
         // 每次从原始字体计算，避免多轮试排把字号累乘。
@@ -196,8 +202,8 @@ final class TextForgeLayoutEngine {
         return fitting
     }
 
-    /// 依次绘制系统背景、圆角背景装饰、按压背景和字形。临时按压前景色在绘制后恢复。
-    func draw(at origin: CGPoint, active: TextForgeActiveStyle?) {
+    /// 依次绘制系统背景、圆角背景装饰、按压背景和字形。选中色作用于可见正文和标记，局部按压色优先，绘制后恢复原色。
+    func draw(at origin: CGPoint, active: TextForgeActiveStyle?, highlightedColor: UIColor? = nil) {
         guard glyphs.length > 0 else { return }
         let glyphOrigin = CGPoint(x: origin.x - shift, y: origin.y)
         manager.drawBackground(forGlyphRange: glyphs, at: glyphOrigin)
@@ -210,16 +216,17 @@ final class TextForgeLayoutEngine {
         if let active, let activeRange, let background = active.background {
             for rect in runRects(for: activeRange) { background.draw(in: rect.offsetBy(dx: origin.x, dy: origin.y)) }
         }
-        var original: NSAttributedString?
+        let tintedRange = highlightedColor != nil ? visible : (active?.foreground == nil ? nil : activeRange)
+        let original = tintedRange.map { storage.attributedSubstring(from: $0) }
+        if let highlightedColor { storage.addAttribute(.foregroundColor, value: highlightedColor, range: visible) }
         if let active, let activeRange, activeRange.length > 0, let foreground = active.foreground {
-            original = storage.attributedSubstring(from: activeRange)
             storage.addAttribute(.foregroundColor, value: foreground, range: activeRange)
         }
         manager.drawGlyphs(forGlyphRange: glyphs, at: glyphOrigin)
-        if let original, let activeRange {
+        if let original, let tintedRange {
             storage.beginEditing()
             original.enumerateAttribute(.foregroundColor, in: NSRange(location: 0, length: original.length)) { value, range, _ in
-                let target = NSRange(location: activeRange.location + range.location, length: range.length)
+                let target = NSRange(location: tintedRange.location + range.location, length: range.length)
                 if let value {
                     storage.addAttribute(.foregroundColor, value: value, range: target)
                 } else {
@@ -244,6 +251,38 @@ final class TextForgeLayoutEngine {
             return index < NSMaxRange(tokenRange) ? .token(index - tokenRange.location) : nil
         }
         return index < sourceLength ? .text(index) : nil
+    }
+
+    /// 选词只允许在连续可见的原文中扩展。按行排除系统省略和自定义标记，合并跨行相邻的 UTF-16 范围。
+    func selectionSegments() -> [NSRange] {
+        guard glyphs.length > 0 else { return [] }
+        if !isTruncated { return [NSRange(location: 0, length: sourceLength)] }
+        let source = NSRange(location: 0, length: tokenRange?.location ?? sourceLength)
+        var indices = IndexSet()
+        manager.enumerateLineFragments(forGlyphRange: glyphs) { _, _, _, line, _ in
+            for part in self.visibleGlyphParts(of: NSIntersectionRange(line, self.glyphs)) {
+                let range = NSIntersectionRange(source, self.manager.characterRange(forGlyphRange: part, actualGlyphRange: nil))
+                if range.length > 0 { indices.insert(integersIn: range.location..<NSMaxRange(range)) }
+            }
+        }
+        return indices.rangeView.map { NSRange(location: $0.lowerBound, length: $0.count) }
+    }
+
+    /// 只在拖动已存在的手柄时使用最近字形；行尾和行间留白也能延伸选区，结果随后限制到起点所在片段。
+    func nearestIndex(to point: CGPoint) -> Int {
+        guard glyphs.length > 0 else { return NSNotFound }
+        let local = CGPoint(x: point.x + shift, y: point.y)
+        let glyph = min(max(glyphs.location, manager.glyphIndex(for: local, in: container)), NSMaxRange(glyphs) - 1)
+        return manager.characterIndexForGlyph(at: glyph)
+    }
+
+    /// 使用字形的双向嵌入层级定位选区端点；同一行的 RTL 和 LTR 段分别选择正确的一侧。
+    func isRightToLeft(at index: Int) -> Bool {
+        var level: UInt8 = 0
+        let glyph = manager.glyphIndexForCharacter(at: index)
+        manager.getGlyphs(in: NSRange(location: glyph, length: 1), glyphs: nil, properties: nil,
+                          characterIndexes: nil, bidiLevels: &level)
+        return !level.isMultiple(of: 2)
     }
 
     /// 把 UTF-16 查询范围裁到正文或标记可用的区间。无效位置返回空范围，长度先裁切再相加，避免整数溢出。
@@ -320,6 +359,12 @@ final class TextForgeLayoutEngine {
     var visibleCharacterRange: NSRange? {
         guard glyphs.length > 0 else { return nil }
         let characters = manager.characterRange(forGlyphRange: glyphs, actualGlyphRange: nil)
+        if !clippedGlyphs.isEmpty {
+            let parts = visibleGlyphParts(of: glyphs)
+            guard let first = parts.first, let last = parts.last else { return nil }
+            return NSUnionRange(manager.characterRange(forGlyphRange: first, actualGlyphRange: nil),
+                                manager.characterRange(forGlyphRange: last, actualGlyphRange: nil))
+        }
         var lower = characters.location
         var upper = min(NSMaxRange(characters), tokenRange?.location ?? sourceLength)
         if let hidden = omittedGlyphs(inLineAt: NSMaxRange(glyphs) - 1) {
@@ -388,11 +433,29 @@ final class TextForgeLayoutEngine {
     /// 按内容尺寸生成透明位图，像素超出单条文本预算时保留排版结果供同步绘制。
     func rasterize(scale: CGFloat, traits: UITraitCollection, viewport: CGSize, insets: UIEdgeInsets) -> UIImage? {
         guard glyphs.length > 0, scale.isFinite, scale > 0 else { return nil }
-        let size = CGSize(
-            width: viewport.width < 1_000_000 ? viewport.width : textBoundingSize.width,
-            height: viewport.height < 1_000_000 ? viewport.height : textBoundingSize.height
-        )
-        guard size.width > 0, size.height > 0 else { return nil }
+        // TextKit 的行框可能不包含斜体字形外伸、描边、阴影和外扩的圆角背景。
+        let visible = manager.characterRange(forGlyphRange: glyphs, actualGlyphRange: nil)
+        var ink = usedRect.union(manager.boundingRect(forGlyphRange: glyphs, in: container).offsetBy(dx: -shift, dy: 0))
+        storage.enumerateAttributes(in: visible) { attributes, _, _ in
+            let font = (attributes[.font] as? UIFont)?.pointSize ?? 12
+            let stroke = abs((attributes[.strokeWidth] as? NSNumber)?.doubleValue ?? 0) * font / 100
+            let overhang = font + stroke
+            var area = usedRect.insetBy(dx: -overhang, dy: -overhang)
+            if let shadow = attributes[.shadow] as? NSShadow {
+                let blur = 3 * max(0, shadow.shadowBlurRadius)
+                area = area.union(area.offsetBy(dx: shadow.shadowOffset.width, dy: shadow.shadowOffset.height)
+                    .insetBy(dx: -blur, dy: -blur))
+            }
+            if let background = attributes[TextForgeBackground.attributeName] as? TextForgeBackground {
+                area = area.union(usedRect.inset(by: background.insets))
+            }
+            ink = ink.union(area)
+        }
+        let viewportRect = CGRect(origin: CGPoint(x: -insets.left, y: -insets.top), size: viewport)
+        let clip = ink.intersection(viewportRect)
+        guard !clip.isNull, !clip.isEmpty else { return nil }
+        let x = floor(clip.minX * scale) / scale, y = floor(clip.minY * scale) / scale
+        let size = CGSize(width: ceil(clip.maxX * scale) / scale - x, height: ceil(clip.maxY * scale) / scale - y)
         let pixels = ceil(size.width * scale) * ceil(size.height * scale)
         guard pixels <= 1_000_000 else { return nil }
         let format = UIGraphicsImageRendererFormat()
@@ -401,15 +464,16 @@ final class TextForgeLayoutEngine {
         var image: UIImage?
         traits.performAsCurrent {
             image = renderer.image { _ in
-                draw(at: CGPoint(x: insets.left, y: insets.top), active: nil)
+                draw(at: CGPoint(x: -x, y: -y), active: nil)
             }
         }
+        rasterOrigin = CGPoint(x: x, y: y)
         return image
     }
 
     /// 排除容器外或末行截断替换掉的字形。
     private func isVisible(_ glyph: Int) -> Bool {
-        guard NSLocationInRange(glyph, glyphs) else { return false }
+        guard NSLocationInRange(glyph, glyphs), !clippedGlyphs.contains(glyph) else { return false }
         guard let omitted = omittedGlyphs(inLineAt: glyph) else { return true }
         return !NSLocationInRange(glyph, omitted)
     }
@@ -417,6 +481,10 @@ final class TextForgeLayoutEngine {
     /// 从同一行片段中剔除 TextKit 以省略号代替的字形。中部截断可能留下前后两段。
     private func visibleGlyphParts(of range: NSRange) -> [NSRange] {
         guard range.length > 0 else { return [] }
+        if !clippedGlyphs.isEmpty {
+            let selected = IndexSet(integersIn: range.location..<NSMaxRange(range))
+            return selected.subtracting(clippedGlyphs).rangeView.map { NSRange(location: $0.lowerBound, length: $0.count) }
+        }
         guard isTruncated, let hidden = omittedGlyphs(inLineAt: range.location) else { return [range] }
         let omitted = NSIntersectionRange(range, hidden)
         guard omitted.length > 0 else { return [range] }
@@ -455,8 +523,8 @@ final class TextForgeLayoutEngine {
             guard !manager.notShownAttribute(forGlyphAt: glyph), manager.notShownAttribute(forGlyphAt: glyph + 1) else { continue }
             let index = manager.characterIndexForGlyph(at: glyph)
             let font = storage.attribute(.font, at: index, effectiveRange: nil) as? UIFont ?? .systemFont(ofSize: UIFont.systemFontSize)
-            let ctFont = CTFontCreateWithName(font.fontName as CFString, font.pointSize, nil)
-            let fallbackFont = CTFontCreateForString(ctFont, "…" as CFString, CFRange(location: 0, length: 1))
+            // 系统字体的私有名称重新查找可能变成 Times；直接桥接排版用的实例才能比较同一字体的字形编号。
+            let fallbackFont = CTFontCreateForString(font as CTFont, "…" as CFString, CFRange(location: 0, length: 1))
             var ellipsis = UniChar(0x2026)
             var ellipsisGlyph = CGGlyph(0)
             guard CTFontGetGlyphsForCharacters(fallbackFont, &ellipsis, &ellipsisGlyph, 1),
@@ -469,6 +537,51 @@ final class TextForgeLayoutEngine {
             }
         }
         return nil
+    }
+
+    /// clipping 行可能保留整段字形，并把不可见部分压到行边缘的零宽矩形。
+    /// 只检查排满的片段，按完整字素确认，以免误删表情内部的零宽字形或普通换行。
+    /// 最后一个字也可能只裁掉一部分：仍可命中，但需要报告溢出。
+    private static func clippingInfo(
+        manager: NSLayoutManager, container: NSTextContainer, storage: NSTextStorage
+    ) -> (hidden: IndexSet, overflows: Bool) {
+        guard container.lineBreakMode == .byClipping else { return ([], false) }
+        var overflows = false
+        let string = storage.string as NSString
+        var hidden = IndexSet()
+        manager.enumerateLineFragments(forGlyphRange: manager.glyphRange(for: container)) { fragment, used, _, glyphs, _ in
+            guard used.width + 0.5 >= fragment.width else { return }
+            let characters = manager.characterRange(forGlyphRange: glyphs, actualGlyphRange: nil)
+            var lineClipped = false
+            var index = characters.location
+            while index < NSMaxRange(characters) {
+                let cluster = string.rangeOfComposedCharacterSequence(at: index)
+                let part = NSIntersectionRange(glyphs, manager.glyphRange(forCharacterRange: cluster, actualCharacterRange: nil))
+                index = NSMaxRange(cluster)
+                guard part.length > 0 else { continue }
+                let box = manager.boundingRect(forGlyphRange: part, in: container)
+                if box.width == 0, (box.minX >= fragment.maxX - 0.01 || box.maxX <= fragment.minX + 0.01),
+                   (lineClipped || string.rangeOfCharacter(from: .controlCharacters.inverted, options: [], range: cluster).location != NSNotFound) {
+                    lineClipped = true
+                    hidden.insert(integersIn: part.location..<NSMaxRange(part))
+                }
+            }
+            if lineClipped { overflows = true }
+            else if !overflows {
+                // TextKit 会把部分可见字形的矩形宽度裁平。使用同一行内容在宽容器中的自然宽度辨别恰好放下。
+                let sample = storage.attributedSubstring(from: characters)
+                let probe = NSTextContainer(size: CGSize(width: fragment.width + 1024, height: 1_000_000))
+                probe.lineFragmentPadding = 0
+                probe.maximumNumberOfLines = 1
+                let manager = NSLayoutManager()
+                let storage = NSTextStorage(attributedString: sample)
+                storage.addLayoutManager(manager)
+                manager.addTextContainer(probe)
+                manager.ensureLayout(for: probe)
+                overflows = manager.usedRect(for: probe).width > fragment.width + 0.01
+            }
+        }
+        return (hidden, overflows)
     }
 
     /// 容器是否没能放下全部内容：后续段落整段落在容器外，或末行被系统省略号截断。

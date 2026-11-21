@@ -5,6 +5,36 @@ import WebKit
 @MainActor
 @objc(TextForgeHTML)
 public final class TextForgeHTML: NSObject {
+    static let styledLink = NSAttributedString.Key("TextForge.HTMLStyledLink")
+
+    /// 导入 HTML 并按阅读样式排版。宿主可接管 img 的非 data 地址，同一 URL 仅请求一次。
+    /// update 在主线程交付可显示的占位或中间快照；completion 交付最终结果或文档错误。取消后均停止。
+    @discardableResult
+    @objc(importHTML:baseURL:readingStyle:imageLoader:update:completion:)
+    public static func importHTML(
+        _ html: String, baseURL: URL? = nil, readingStyle: TextForgeHTMLReadingStyle,
+        imageLoader: TextForgeHTMLImageLoader? = nil, update: (@MainActor (NSAttributedString) -> Void)? = nil,
+        completion: @escaping TextForgeHTMLCompletion
+    ) -> TextForgeHTMLImportTask {
+        let task = TextForgeHTMLImportTask(style: readingStyle, imageLoader: imageLoader, update: update, completion: completion)
+        let css = readingStyle.stylesheet
+        let takesImages = imageLoader != nil
+        Task { @MainActor in
+            guard !task.isCancelled else { return }
+            do {
+                let document = try await task.prepare(html, baseURL: baseURL, css: css, takesImages: takesImages)
+                guard !task.isCancelled else { return }
+                let slots = document.slots
+                attributedString(from: document.html, baseURL: baseURL) { text, error in
+                    guard !task.isCancelled else { return }
+                    if let text { task.load(text, slots: slots) }
+                    else { task.finish(error ?? CocoaError(.fileReadCorruptFile)) }
+                }
+            } catch { task.finish(error) }
+        }
+        return task
+    }
+
     /// 导入段落、内联样式、链接和图片。baseURL 用于相对地址，文档引用的资源可能由 WebKit 加载。
     /// 成功或失败都在主线程异步回调一次。复用控件的调用方应在赋值前确认结果仍属于当前内容。
     @objc(attributedStringFromHTML:baseURL:completion:)
