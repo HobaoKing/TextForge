@@ -147,6 +147,58 @@
             [failures addObject:@"Objective-C synchronous attributed text did not replace the completed async content"];
         }
         [reusedLabel removeFromSuperview];
+        [self verifyImportedContent:failures];
+    }];
+}
+
+// 验证公开全文标记的可见位置和独立操作，并实际复制、朗读包含两个语义附件的文本。
+- (void)verifyImportedContent:(NSMutableArray<NSString *> *)failures {
+    TextForgeLabel *label = [[TextForgeLabel alloc] initWithFrame:CGRectMake(0, 0, 110, 46)];
+    label.numberOfLines = 1;
+    label.lineBreakMode = NSLineBreakByTruncatingTail;
+    label.text = @"这段文字应当在末行显示一个可以点击的全文标记";
+    __block NSString *activated = nil;
+    label.truncationToken = [TextForgeContainer readMoreTokenWithTitle:@"…全文" action:^(UIView *view, NSAttributedString *text, NSRange range, CGRect rect) {
+        activated = [text.string substringWithRange:range];
+    }];
+    if (!label.showsTruncationToken || CGRectIsNull(label.truncationTokenRect)
+        || !label.displayedTextLayout.showsTruncationToken || CGRectIsNull(label.displayedTextLayout.truncationTokenRect)) {
+        [failures addObject:@"Objective-C visible token geometry"];
+    }
+    UIAccessibilityCustomAction *action = label.accessibilityCustomActions.firstObject;
+    if (!action.actionHandler || !action.actionHandler(action) || ![activated isEqualToString:@"…全文"]) {
+        [failures addObject:@"Objective-C token action"];
+    }
+    label.text = @"短";
+    if (label.showsTruncationToken || !CGRectIsNull(label.truncationTokenRect)) { [failures addObject:@"hidden token geometry"]; }
+
+    UIFont *font = [UIFont systemFontOfSize:16];
+    NSAttributedString *slot = [TextForgeAttachment view:[UIView new] size:CGSizeMake(12, 12) font:font alignment:TextForgeVerticalAlignmentCenter];
+    NSMutableAttributedString *body = [[NSMutableAttributedString alloc] initWithString:@"你好"];
+    [body appendAttributedString:[TextForgeAttachment attachmentString:slot copyText:@"[笑]" accessibilityText:@"微笑"]];
+    [body appendAttributedString:[TextForgeAttachment attachmentString:slot copyText:@"会员" accessibilityText:nil]];
+    label.attributedText = body;
+    label.allowsCopy = YES;
+    [label copy:nil];
+    if (![UIPasteboard.generalPasteboard.string isEqualToString:@"你好[笑]会员"] ||
+        ![label.accessibilityLabel isEqualToString:@"你好微笑会员"]) { [failures addObject:@"Objective-C label attachment alternatives"]; }
+    self.input.attributedText = body;
+    self.input.selectedRange = NSMakeRange(2, 2);
+    [self.input copy:nil];
+    if (![UIPasteboard.generalPasteboard.string isEqualToString:@"[笑]会员"] ||
+        ![self.input.accessibilityValue isEqualToString:@"你好微笑会员"]) { [failures addObject:@"Objective-C editor attachment alternatives"]; }
+
+    [TextForgeHTML attributedStringFromHTML:@"<p>说明 &amp; <a href='details'>规则</a></p>"
+                                    baseURL:[NSURL URLWithString:@"https://example.com/guide/"]
+                                 completion:^(NSAttributedString *html, NSError *error) {
+        NSRange range = [html.string rangeOfString:@"规则"];
+        NSURL *url = html && range.location != NSNotFound ? [html attribute:NSLinkAttributeName atIndex:range.location effectiveRange:NULL] : nil;
+        label.attributedText = html;
+        self.input.attributedText = html;
+        if (error || !NSThread.isMainThread || ![url.absoluteString isEqualToString:@"https://example.com/guide/details"]
+            || ![label.text containsString:@"&"] || ![self.input.text containsString:@"规则"]) {
+            [failures addObject:@"Objective-C HTML import, link or control assignment"];
+        }
         [self writeVerificationResult:failures];
     }];
 }

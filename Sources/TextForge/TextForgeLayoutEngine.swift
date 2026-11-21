@@ -7,6 +7,7 @@ struct TextForgeLayoutParameters {
     var insets: UIEdgeInsets
     var maximumNumberOfRows: Int
     var lineBreakMode: NSLineBreakMode
+    var minimumScaleFactor: CGFloat
     var exclusionPaths: [UIBezierPath]
 }
 
@@ -59,7 +60,7 @@ final class TextForgeLayoutEngine {
         let insets = parameters.insets
         let rows = max(0, parameters.maximumNumberOfRows)
         sourceLength = text.length
-        storage = NSTextStorage(attributedString: Self.wrappingText(text, maximumNumberOfRows: rows))
+        storage = NSTextStorage(attributedString: Self.wrappingText(text, maximumNumberOfRows: rows, mode: parameters.lineBreakMode))
         let width = Self.containerDimension(parameters.size.width, minus: insets.left + insets.right)
         let height = Self.containerDimension(parameters.size.height, minus: insets.top + insets.bottom)
         container = NSTextContainer(size: CGSize(width: width, height: height))
@@ -85,12 +86,15 @@ final class TextForgeLayoutEngine {
             substitutedGlyphs = nil
             return
         }
+        if rows == 1, parameters.minimumScaleFactor < 1 {
+            Self.fitFonts(in: storage, manager: manager, container: container, minimumScale: parameters.minimumScaleFactor)
+        }
         manager.ensureLayout(for: container)
         let overflowed = Self.overflows(manager: manager, container: container, length: storage.length)
         var appliedToken: NSRange?
         if overflowed, parameters.lineBreakMode == .byTruncatingTail, let truncationToken, truncationToken.length > 0 {
             appliedToken = Self.applyTruncationToken(
-                truncationToken, source: text, maximumNumberOfRows: rows,
+                truncationToken, source: NSAttributedString(attributedString: storage), maximumNumberOfRows: rows,
                 storage: storage, manager: manager, container: container
             )
         }
@@ -113,6 +117,54 @@ final class TextForgeLayoutEngine {
             // 排除路径会把文字推离左缘，缩窄后排版结构不再相同，保留完整宽度。
             fittingSize = textBoundingSize
         }
+    }
+
+    /// 只在单行确实放不下时等比缩小各段字体。用同一容器试排，保留附件尺寸、字距、缩进与命中坐标。
+    /// 强制换行后的内容仍按原策略截断，不能因为后续段落而把第一行缩到最小。
+    private static func fitFonts(
+        in storage: NSTextStorage, manager: NSLayoutManager, container: NSTextContainer, minimumScale: CGFloat
+    ) {
+        let source = NSAttributedString(attributedString: storage)
+        let firstBreak = (source.string as NSString).rangeOfCharacter(from: .newlines)
+        let sample = firstBreak.location == NSNotFound ? source :
+            source.attributedSubstring(from: NSRange(location: 0, length: firstBreak.location))
+        guard sample.length > 0 else { return }
+        if firstBreak.location != NSNotFound { storage.setAttributedString(sample) }
+
+        // 使用实际字形和系统报告的省略范围判定，兼容头部和中部截断。
+        func fits() -> Bool {
+            manager.ensureLayout(for: container)
+            let glyphs = manager.glyphRange(for: container)
+            return !overflows(manager: manager, container: container, length: storage.length)
+                && manager.usedRect(for: container).width <= container.size.width + 0.01
+                && unreportedTruncation(in: glyphs, storage: storage, manager: manager, container: container) == nil
+        }
+        // 每次从原始字体计算，避免多轮试排把字号累乘。
+        func apply(_ factor: CGFloat, to original: NSAttributedString) {
+            storage.setAttributedString(original)
+            guard factor < 1 else { return }
+            storage.beginEditing()
+            original.enumerateAttribute(.font, in: NSRange(location: 0, length: original.length)) { value, range, _ in
+                let font = value as? UIFont ?? UIFont.systemFont(ofSize: 12)
+                storage.addAttribute(.font, value: font.withSize(font.pointSize * factor), range: range)
+            }
+            storage.endEditing()
+        }
+        if fits() {
+            if firstBreak.location != NSNotFound { storage.setAttributedString(source) }
+            return
+        }
+        var low = max(1.0 / 1024, minimumScale)
+        var high: CGFloat = 1
+        apply(low, to: sample)
+        if fits() {
+            for _ in 0..<8 {
+                let mid = (low + high) / 2
+                apply(mid, to: sample)
+                if fits() { low = mid } else { high = mid }
+            }
+        }
+        apply(low, to: source)
     }
 
     /// 计算去除对齐留白后的宽度。TextKit 的行片段起点不能区分缩进与对齐，按段落配置补回缩进。
@@ -217,13 +269,12 @@ final class TextForgeLayoutEngine {
         guard range.length > 0 else { return .null }
         let selected = NSIntersectionRange(manager.glyphRange(forCharacterRange: range, actualCharacterRange: nil), glyphs)
         guard selected.length > 0 else { return .null }
-        if !isTruncated {
-            return manager.boundingRect(forGlyphRange: selected, in: container).offsetBy(dx: -shift, dy: 0)
-        }
         var bounds = CGRect.null
         manager.enumerateLineFragments(forGlyphRange: selected) { _, _, _, line, _ in
             for part in self.visibleGlyphParts(of: NSIntersectionRange(line, selected)) {
-                bounds = bounds.union(self.manager.boundingRect(forGlyphRange: part, in: self.container))
+                self.manager.enumerateEnclosingRects(forGlyphRange: part, withinSelectedGlyphRange: part, in: self.container) { rect, _ in
+                    if !rect.isEmpty { bounds = bounds.union(rect) }
+                }
             }
         }
         return bounds.isNull ? .null : bounds.offsetBy(dx: -shift, dy: 0)
@@ -238,7 +289,6 @@ final class TextForgeLayoutEngine {
         var result: [CGRect] = []
         manager.enumerateLineFragments(forGlyphRange: selected) { fragment, _, _, lineGlyphs, _ in
             for part in self.visibleGlyphParts(of: NSIntersectionRange(lineGlyphs, selected)) {
-                let bounds = self.manager.boundingRect(forGlyphRange: part, in: self.container).offsetBy(dx: -self.shift, dy: 0)
                 let baseline = fragment.minY + self.manager.location(forGlyphAt: part.location).y
                 var ascent: CGFloat = 0
                 var descent: CGFloat = 0
@@ -252,10 +302,14 @@ final class TextForgeLayoutEngine {
                         descent = min(descent, font.descender)
                     }
                 }
-                if ascent - descent > 0 {
-                    result.append(CGRect(x: bounds.minX, y: baseline - ascent, width: bounds.width, height: ascent - descent))
-                } else {
-                    result.append(bounds)
+                // 双向文字的同一逻辑范围可能有多个不相邻的视觉片段。
+                self.manager.enumerateEnclosingRects(forGlyphRange: part, withinSelectedGlyphRange: part, in: self.container) { rect, _ in
+                    var bounds = rect.offsetBy(dx: -self.shift, dy: 0)
+                    if ascent > descent {
+                        bounds.origin.y = baseline - ascent
+                        bounds.size.height = ascent - descent
+                    }
+                    if !bounds.isEmpty { result.append(bounds) }
                 }
             }
         }
@@ -499,7 +553,7 @@ final class TextForgeLayoutEngine {
         }
         while true {
             let end = trimmedEnd(boundaries[choice])
-            let piece = wrappingText(inheritedToken(end), maximumNumberOfRows: maximumNumberOfRows)
+            let piece = wrappingText(inheritedToken(end), maximumNumberOfRows: maximumNumberOfRows, mode: container.lineBreakMode)
             storage.replaceCharacters(in: NSRange(location: end, length: storage.length - end), with: piece)
             manager.ensureLayout(for: container)
             if choice == 0 || !overflows(manager: manager, container: container, length: storage.length) {
@@ -515,13 +569,19 @@ final class TextForgeLayoutEngine {
         return max(0, min(value - inset, 1_000_000))
     }
 
-    /// 富文本段落先正常折行，再由容器决定最后一行如何截断。
-    private static func wrappingText(_ text: NSAttributedString, maximumNumberOfRows: Int) -> NSAttributedString {
-        guard maximumNumberOfRows != 1 else { return text }
+    /// 缺少段落样式时采用容器的逐字换行。多行文本先折行，末行由容器决定如何截断。
+    private static func wrappingText(_ text: NSAttributedString, maximumNumberOfRows: Int, mode: NSLineBreakMode) -> NSAttributedString {
+        guard maximumNumberOfRows != 1 || mode == .byCharWrapping else { return text }
         let result = NSMutableAttributedString(attributedString: text)
         let fullRange = NSRange(location: 0, length: text.length)
         text.enumerateAttribute(.paragraphStyle, in: fullRange) { value, range, _ in
-            guard let style = value as? NSParagraphStyle,
+            if value == nil, mode == .byCharWrapping {
+                let style = NSMutableParagraphStyle()
+                style.lineBreakMode = .byCharWrapping
+                result.addAttribute(.paragraphStyle, value: style, range: range)
+                return
+            }
+            guard maximumNumberOfRows != 1, let style = value as? NSParagraphStyle,
                   truncates(style.lineBreakMode),
                   let wrapping = style.mutableCopy() as? NSMutableParagraphStyle else { return }
             wrapping.lineBreakMode = .byWordWrapping

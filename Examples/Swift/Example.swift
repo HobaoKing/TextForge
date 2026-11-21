@@ -54,7 +54,19 @@ final class ExampleViewController: UIViewController {
             self?.status.text = text
         }
 
-        let stack = UIStackView(arrangedSubviews: [label, input, status])
+        let article = TextForgeLabel()
+        article.numberOfLines = 2
+        article.lineBreakMode = .byTruncatingTail
+        article.truncationToken = TextForgeContainer.readMoreToken { [weak article] _, _, _, _ in article?.numberOfLines = 0 }
+        article.highlightTapAction = { [weak self] _, text, range, _ in
+            self?.status.text = (text.attribute(.link, at: range.location, effectiveRange: nil) as? URL)?.absoluteString
+        }
+        let html = "<p><b>HTML 富文本</b></p><p>这段示例可以展开阅读全文，包含 <a href='https://example.com/help'>帮助链接</a>。</p>"
+        TextForgeHTML.attributedString(from: html) { text, error in
+            article.attributedText = text
+            if let error { article.text = error.localizedDescription }
+        }
+        let stack = UIStackView(arrangedSubviews: [label, article, input, status])
         stack.axis = .vertical
         stack.spacing = 12
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -95,6 +107,7 @@ final class ExampleViewController: UIViewController {
         failures.append(contentsOf: verifyRichText())
         failures.append(contentsOf: verifyLayoutFeatures())
         failures.append(contentsOf: verifyTruncationEdges())
+        failures.append(contentsOf: verifyWrappingAndInteraction())
         input.placeholderFont = .systemFont(ofSize: 19, weight: .semibold)
         input.placeholderTextColor = .purple
         input.layoutIfNeeded()
@@ -122,6 +135,18 @@ final class ExampleViewController: UIViewController {
         input.insertText("好")
         if received != ["A", "ni", "ni好"] { failures.append("multilingual input callback: \(received)") }
 
+        input.text = ""
+        received.removeAll()
+        input.textStorage.replaceCharacters(in: NSRange(location: 0, length: 0), with: "ABC")
+        if placeholder?.isHidden != true || !received.isEmpty { failures.append("storage edit placeholder or callback") }
+        input.selectedRange = NSRange(location: 0, length: 3)
+        input.deleteBackward()
+        if received != [""] || placeholder?.isHidden != false { failures.append("missing user deletion after storage edit") }
+        input.setMarkedText("n", selectedRange: NSRange(location: 1, length: 0))
+        input.setMarkedText("ni", selectedRange: NSRange(location: 2, length: 0))
+        input.unmarkText()
+        if received != ["", "ni"] { failures.append("repeated marked edits changed the committed baseline") }
+
         verifyAsyncPreparation { asyncResults in
             self.verifyExplicitLayoutAppearance { appearanceFailures in
                 self.verifyCopyMenu { copyFailures in
@@ -136,6 +161,139 @@ final class ExampleViewController: UIViewController {
                     }
                 }
             }
+        }
+    }
+
+    /// 对照真实命中对象、逐字换行和双向片段；缩字号后核对最后一个字符的几何与点击。
+    private func verifyWrappingAndInteraction() -> [String] {
+        var failures: [String] = []
+        let font = UIFont.systemFont(ofSize: 20)
+        let box = TextForgeContainer(size: CGSize(width: 95, height: 200))
+        let word = NSMutableAttributedString(string: "1234 abcdefg 1234", attributes: [.font: font])
+        let words = TextForgeLayout(container: box, attributedText: word)
+        box.lineBreakMode = .byCharWrapping
+        let chars = TextForgeLayout(container: box, attributedText: word)
+        let style = NSMutableParagraphStyle()
+        style.lineBreakMode = .byWordWrapping
+        word.addAttribute(.paragraphStyle, value: style, range: NSRange(location: 0, length: word.length))
+        let explicit = TextForgeLayout(container: box, attributedText: word)
+        if chars.lines.first?.range == words.lines.first?.range || explicit.lines.first?.range != words.lines.first?.range {
+            failures.append("character wrap or explicit paragraph override")
+        }
+
+        let bidi = TextForgeLayout(attributedText: NSAttributedString(string: "ABC אבג DEF", attributes: [.font: font]),
+                                   size: CGSize(width: 260, height: 60))
+        let rects = bidi.rects(forRange: NSRange(location: 0, length: 5))
+        let gap = bidi.rect(forRange: NSRange(location: 5, length: 1))
+        if rects.count != 2 || rects.contains(where: { $0.contains(CGPoint(x: gap.midX, y: gap.midY)) }) {
+            failures.append("bidi highlights crossed an unselected glyph")
+        }
+
+        let image = UIGraphicsImageRenderer(size: CGSize(width: 5, height: 5)).image { _ in }
+        let attachment = TextForgeAttachment.image(image, size: image.size, font: font, alignment: .center)
+        let copy = TextForgeAttachment.withTextAlternatives(attachment, copyText: "[星]", accessibilityText: "星星")
+        let muted = TextForgeAttachment.withTextAlternatives(attachment, copyText: "★", accessibilityText: "")
+        let icons = NSMutableAttributedString(string: "🌟")
+        icons.append(copy)
+        icons.append(muted)
+        if TextForgeAttachment.copyText(for: icons) != "🌟[星]★" || TextForgeAttachment.accessibilityText(for: icons) != "🌟星星" {
+            failures.append("Swift image attachment copy/speech alternatives")
+        }
+
+        let button = UIButton(frame: CGRect(x: 0, y: 0, width: 110, height: 40))
+        let label = TextForgeLabel(frame: button.bounds)
+        button.addSubview(label)
+        label.font = .systemFont(ofSize: 24)
+        label.text = "0123456789"
+        let point = CGPoint(x: 5, y: 5)
+        if button.hitTest(point, with: nil) !== button { failures.append("plain label intercepted button") }
+        let custom = UITapGestureRecognizer()
+        label.addGestureRecognizer(custom)
+        if button.hitTest(point, with: nil) !== label { failures.append("host gesture lost its hit target") }
+        label.removeGestureRecognizer(custom)
+        var tapped = NSRange(location: NSNotFound, length: 0)
+        label.textTapAction = { _, _, range, _ in tapped = range }
+        label.minimumScaleFactor = 0.4
+        label.adjustsFontSizeToFitWidth = true
+        let last = NSRange(location: 9, length: 1)
+        let rect = label.rect(forRange: last)
+        let tap = ExampleTap()
+        if !rect.isNull {
+            tap.point = CGPoint(x: rect.midX, y: rect.midY)
+            _ = label.perform(NSSelectorFromString("handleTap:"), with: tap)
+        }
+        if label.isTruncated || tapped != last { failures.append("last scaled glyph missing or untappable") }
+        label.adjustsFontSizeToFitWidth = false
+        if !label.isTruncated { failures.append("disabling shrink reused the scaled layout") }
+        return failures
+    }
+
+    /// 同一份 HTML 验证内联样式、实体、相对链接和 data 图片，并检查异步预排版交付后的自适应高度。
+    private func verifyHTMLAndIntrinsicSize(completion: @escaping ([String]) -> Void) {
+        let icon = UIGraphicsImageRenderer(size: CGSize(width: 4, height: 4)).pngData { context in
+            UIColor.red.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 4, height: 4))
+        }.base64EncodedString()
+        let html = """
+        <html><body><p><strong style="color:#f00">标题</strong> &amp; <a href="help">帮助</a></p>
+        <ul><li>列表项目</li></ul><img width="4" height="4" src="data:image/png;base64,\(icon)"></body></html>
+        """
+        let base = URL(string: "https://example.com/guide/")!
+        TextForgeHTML.attributedString(from: html, baseURL: base) { text, error in
+            guard let text, error == nil else { completion(["HTML import: \(String(describing: error))"]); return }
+            var failures: [String] = []
+            let string = text.string as NSString
+            let title = string.range(of: "标题")
+            let help = string.range(of: "帮助")
+            let font = title.location == NSNotFound ? nil : text.attribute(.font, at: title.location, effectiveRange: nil) as? UIFont
+            let color = title.location == NSNotFound ? nil : text.attribute(.foregroundColor, at: title.location, effectiveRange: nil) as? UIColor
+            let link = help.location == NSNotFound ? nil : text.attribute(.link, at: help.location, effectiveRange: nil) as? URL
+            var red: CGFloat = 0, green: CGFloat = 0, blue: CGFloat = 0, alpha: CGFloat = 0
+            var attachment: NSTextAttachment?
+            text.enumerateAttribute(.attachment, in: NSRange(location: 0, length: text.length)) { value, _, _ in
+                if let image = value as? NSTextAttachment { attachment = image }
+            }
+            if !Thread.isMainThread || !text.string.contains("&") || !text.string.contains("列表项目") || attachment == nil ||
+                font?.fontDescriptor.symbolicTraits.contains(.traitBold) != true ||
+                color?.getRed(&red, green: &green, blue: &blue, alpha: &alpha) != true || red < 0.9 || green > 0.1 ||
+                link?.absoluteString != "https://example.com/guide/help" {
+                failures.append("HTML style/image/link: \(text.string) \(String(describing: link)), image=\(attachment != nil)")
+            }
+            let label = TextForgeLabel(frame: CGRect(x: 0, y: 0, width: 130, height: 30))
+            label.numberOfLines = 0
+            label.preferredMaxLayoutWidth = 130
+            let body = NSAttributedString(string: String(repeating: "排版测量。", count: 15), attributes: [.font: UIFont.systemFont(ofSize: 20)])
+            label.setAttributedTextAsynchronously(body, size: label.bounds.size, rendersAsynchronously: true) {
+                label.bounds.size.height = 400
+                let fit = label.sizeThatFits(CGSize(width: 130, height: CGFloat.greatestFiniteMagnitude))
+                if fit.height <= 30 || label.intrinsicContentSize.height != fit.height {
+                    failures.append("intrinsic height after finite async layout")
+                }
+                guard let attachment else { completion(failures); return }
+                self.verifyImportedImage(attachment) { completion(failures + $0) }
+            }
+        }
+    }
+
+    /// 先后台预绘首次展示的 HTML 图片，再同步绘制对照，核对真实可见像素与占位尺寸。
+    private func verifyImportedImage(_ attachment: NSTextAttachment, completion: @escaping ([String]) -> Void) {
+        let source = NSAttributedString(attachment: attachment)
+        let label = TextForgeLabel(frame: CGRect(x: 0, y: 0, width: 100, height: 60))
+        view.addSubview(label)
+        let size = label.bounds.size
+        _ = TextForgeLayout.prepare(attributedText: source, size: size, insets: .zero, maximumNumberOfRows: 0,
+                                    lineBreakMode: .byWordWrapping, renderScale: 2, traitCollection: label.traitCollection) { prepared in
+            label.textLayout = prepared
+            label.layoutIfNeeded()
+            let usedPreparedLayout = label.displayedTextLayout === prepared
+            let preparedRed = self.pixels(of: label).red
+            let sync = TextForgeLayout(attributedText: source, size: size)
+            label.textLayout = sync
+            label.layoutIfNeeded()
+            let syncRed = self.pixels(of: label).red
+            label.removeFromSuperview()
+            let matches = usedPreparedLayout && syncRed > 0 && syncRed == preparedRed && sync.textBoundingSize == prepared.textBoundingSize
+            completion(matches ? [] : ["HTML image: async \(preparedRed) red pixels, \(prepared.textBoundingSize); sync \(syncRed), \(sync.textBoundingSize)"])
         }
     }
 
@@ -384,6 +542,10 @@ final class ExampleViewController: UIViewController {
         tap.point = CGPoint(x: target.midX, y: target.maxY + 30)
         _ = agreementLabel.perform(NSSelectorFromString("handleTap:"), with: tap)
         if extendedTaps != 1 || target.isNull { failures.append("touch extension radius: taps \(extendedTaps), target \(target)") }
+        if agreementLabel.hitTest(CGPoint(x: target.midX, y: target.midY), with: nil) !== agreementLabel ||
+            agreementLabel.hitTest(CGPoint(x: 190, y: 75), with: nil) != nil {
+            failures.append("interactive and passive parts of the label must hit different targets")
+        }
 
         // 附件内容模式：等比缩放后填满槽高，居中模式保持原尺寸。
         let swatch = UIGraphicsImageRenderer(size: CGSize(width: 8, height: 8)).image { context in
@@ -676,7 +838,7 @@ final class ExampleViewController: UIViewController {
             if label.attributedText?.string != original.string || label.sizeThatFits(narrow).height <= narrowLayout.textBoundingSize.height {
                 failures.append("changing line spacing discarded the async content or reused its old layout")
             }
-            completion(failures)
+            self.verifyHTMLAndIntrinsicSize { completion(failures + $0) }
         }
     }
 

@@ -92,6 +92,64 @@ public final class TextForgeHighlight: NSObject {
 @MainActor
 @objc(TextForgeAttachment)
 public final class TextForgeAttachment: NSObject {
+    private static let copyKey = NSAttributedString.Key("TextForge.AttachmentCopyText")
+    private static let speechKey = NSAttributedString.Key("TextForge.AttachmentAccessibilityText")
+
+    /// 给已有的图片或视图附件设置文字替代。nil 清除该项，朗读默认沿用复制文本；空串可显式静音。
+    @objc(attachmentString:copyText:accessibilityText:)
+    public static func withTextAlternatives(_ text: NSAttributedString, copyText: String?, accessibilityText: String?) -> NSAttributedString {
+        let result = NSMutableAttributedString(attributedString: text)
+        text.enumerateAttribute(.attachment, in: NSRange(location: 0, length: text.length)) { value, range, _ in
+            guard value != nil else { return }
+            for (key, alternative) in [(copyKey, copyText), (speechKey, accessibilityText)] {
+                if let alternative { result.addAttribute(key, value: alternative, range: range) }
+                else { result.removeAttribute(key, range: range) }
+            }
+        }
+        return result
+    }
+
+    /// 导出全文或子串的纯文本，附件按复制文案展开。没有复制文案的装饰性附件省略。
+    @objc(copyTextForAttributedString:) public static func copyText(for text: NSAttributedString) -> String {
+        replacingAttachments(in: text, forSpeech: false)
+    }
+
+    /// 导出朗读文案，未单独设置朗读名称的附件沿用复制文案。
+    @objc(accessibilityTextForAttributedString:) public static func accessibilityText(for text: NSAttributedString) -> String {
+        replacingAttachments(in: text, forSpeech: true)
+    }
+
+    /// 按原串的 UTF-16 索引替换每个对象字符，保留相邻附件、表情和普通文字的原有顺序。
+    private static func replacingAttachments(in text: NSAttributedString, forSpeech: Bool) -> String {
+        let source = text.string as NSString
+        let marker = "\u{FFFC}"
+        var next = source.range(of: marker)
+        guard next.location != NSNotFound else { return text.string }
+        let result = NSMutableString(capacity: source.length)
+        var start = 0
+        while next.location != NSNotFound {
+            result.append(source.substring(with: NSRange(location: start, length: next.location - start)))
+            let copy = text.attribute(copyKey, at: next.location, effectiveRange: nil) as? String
+            let spoken = forSpeech ? text.attribute(speechKey, at: next.location, effectiveRange: nil) as? String : nil
+            result.append(spoken ?? copy ?? "")
+            start = NSMaxRange(next)
+            next = source.range(of: marker, options: [], range: NSRange(location: start, length: source.length - start))
+        }
+        result.append(source.substring(from: start))
+        return result as String
+    }
+
+    /// 编辑器只接管带显式替代文案的内容，其余选择继续交给 UIKit 的原生复制和辅助功能。
+    static func hasTextAlternatives(in text: NSAttributedString) -> Bool {
+        guard text.string.contains("\u{FFFC}") else { return false }
+        var found = false
+        text.enumerateAttributes(in: NSRange(location: 0, length: text.length)) { attributes, _, stop in
+            found = attributes[copyKey] != nil || attributes[speechKey] != nil
+            if found { stop.pointee = true }
+        }
+        return found
+    }
+
     /// 图片按原尺寸居中放入指定尺寸的附件槽，按字体基线对齐，尺寸以点计。
     @objc public static func image(
         _ image: UIImage,

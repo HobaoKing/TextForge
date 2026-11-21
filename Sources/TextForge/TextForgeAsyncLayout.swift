@@ -113,7 +113,7 @@ extension TextForgeLayout {
     }()
 
     /// 在主线程分离绘制属性与交互对象。UIView 附件仅保留槽尺寸，动态颜色在当前外观下解析。
-    /// 遇到无法安全复制的属性值时返回 nil，由调用方改走主线程同步排版。
+    /// HTML 图片可能只保存在文件包装器中。常规文件按数据和文件名复制，其余无法分离的内容回到主线程排版。
     private static func detachedTextForLayout(_ text: NSAttributedString, traits: UITraitCollection) -> NSAttributedString? {
         let detached = NSMutableAttributedString(string: text.string)
         var supported = true
@@ -145,8 +145,20 @@ extension TextForgeLayout {
                     slot.bounds = attachment.bounds
                     copied = slot
                 case let attachment as NSTextAttachment where type(of: attachment) == NSTextAttachment.self:
-                    let image = NSTextAttachment(data: attachment.contents, ofType: attachment.fileType)
-                    image.image = attachment.image
+                    let contents = attachment.contents
+                    let image = NSTextAttachment(data: contents, ofType: attachment.fileType)
+                    if let bitmap = attachment.image {
+                        image.image = bitmap
+                    } else if contents == nil, let wrapper = attachment.fileWrapper {
+                        guard wrapper.isRegularFile, let data = wrapper.regularFileContents else {
+                            supported = false
+                            stop.pointee = true
+                            return
+                        }
+                        let file = FileWrapper(regularFileWithContents: data)
+                        file.preferredFilename = wrapper.preferredFilename ?? wrapper.filename
+                        image.fileWrapper = file
+                    }
                     image.bounds = attachment.bounds
                     copied = image
                 case is UIFont, is NSNumber, is URL:

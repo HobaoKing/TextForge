@@ -41,6 +41,9 @@ open class TextForgeTextView: UITextView {
 
     private let placeholderLabel = UILabel()
     private var lastCommittedText = ""
+    private var observedStorageText = ""
+    private var compositionBaseline: String?
+    private var customAccessibilityValue: String?
     private var attributedPlaceholder: NSAttributedString?
 
     /// 默认使用上下 6 点、左右 4 点内容内边距，传入自定义容器时保留容器的行片段边距。
@@ -60,6 +63,8 @@ open class TextForgeTextView: UITextView {
     open override var text: String! {
         didSet {
             lastCommittedText = text ?? ""
+            observedStorageText = lastCommittedText
+            compositionBaseline = nil
             updatePlaceholderVisibility()
         }
     }
@@ -68,6 +73,8 @@ open class TextForgeTextView: UITextView {
     open override var attributedText: NSAttributedString! {
         didSet {
             lastCommittedText = text ?? ""
+            observedStorageText = lastCommittedText
+            compositionBaseline = nil
             updatePlaceholderVisibility()
         }
     }
@@ -92,6 +99,42 @@ open class TextForgeTextView: UITextView {
         placeholderLabel.frame = CGRect(x: inset.left + padding, y: inset.top, width: width, height: height)
     }
 
+    /// 组字可包含多次底层存储修改。保存进入组字前的全文，只在最终提交时比较一次。
+    open override func setMarkedText(_ markedText: String?, selectedRange: NSRange) {
+        if compositionBaseline == nil, markedText != nil { compositionBaseline = text ?? "" }
+        super.setMarkedText(markedText, selectedRange: selectedRange)
+        if markedTextRange == nil, compositionBaseline != nil { textDidChange() }
+    }
+
+    /// 编辑器的朗读值使用附件的替代文案，保留宿主显式设置和系统安全输入行为。
+    open override var accessibilityValue: String? {
+        get {
+            if let customAccessibilityValue { return customAccessibilityValue }
+            guard !isSecureTextEntry, let attributedText, TextForgeAttachment.hasTextAlternatives(in: attributedText) else {
+                return super.accessibilityValue
+            }
+            return TextForgeAttachment.accessibilityText(for: attributedText)
+        }
+        set {
+            customAccessibilityValue = newValue
+            super.accessibilityValue = newValue
+        }
+    }
+
+    /// 选区含语义附件时用其替代文字提供纯文本；其余选区沿用系统复制，包括安全输入限制。
+    open override func copy(_ sender: Any?) {
+        guard !isSecureTextEntry, let attributedText, selectedRange.location >= 0,
+              selectedRange.location <= attributedText.length, selectedRange.length > 0,
+              selectedRange.length <= attributedText.length - selectedRange.location else { return super.copy(sender) }
+        let selection = attributedText.attributedSubstring(from: selectedRange)
+        guard TextForgeAttachment.hasTextAlternatives(in: selection) else { return super.copy(sender) }
+        var item: [String: Any] = ["public.utf8-plain-text": TextForgeAttachment.copyText(for: selection)]
+        if allowsEditingTextAttributes, let data = try? selection.data(
+            from: NSRange(location: 0, length: selection.length), documentAttributes: [.documentType: NSAttributedString.DocumentType.rtfd]
+        ) { item["com.apple.flat-rtfd"] = data }
+        UIPasteboard.general.items = [item]
+    }
+
     /// 组字结束后读取最终文本，兼容提交时未单独发送文本变化通知的输入路径。
     open override func unmarkText() {
         let wasComposing = markedTextRange != nil
@@ -99,7 +142,7 @@ open class TextForgeTextView: UITextView {
         if wasComposing { textDidChange() }
     }
 
-    /// 只观察此输入框的 UIKit 编辑通知，保持宿主对 UITextViewDelegate 的控制权。
+    /// 分别观察此输入框的文本存储和 UIKit 编辑通知，保持宿主对两个 delegate 的控制权。
     private func setupPlaceholder() {
         placeholderLabel.numberOfLines = 0
         placeholderLabel.textColor = placeholderColor
@@ -107,13 +150,27 @@ open class TextForgeTextView: UITextView {
         placeholderLabel.isAccessibilityElement = false
         addSubview(placeholderLabel)
         lastCommittedText = text ?? ""
+        observedStorageText = lastCommittedText
         updatePlaceholderVisibility()
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(storageDidChange(_:)), name: NSTextStorage.didProcessEditingNotification, object: textStorage
+        )
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(handleTextChangeNotification(_:)),
             name: UITextView.textDidChangeNotification,
             object: self
         )
+    }
+
+    /// 存储通知先于 UIKit 编辑通知。直接写入只同步界面，下一次用户编辑以变更前的真实内容为基线。
+    @objc private func storageDidChange(_ note: Notification) {
+        guard let storage = note.object as? NSTextStorage, storage.editedMask.contains(.editedCharacters) else { return }
+        let current = storage.string
+        guard current != observedStorageText else { return }
+        lastCommittedText = compositionBaseline ?? observedStorageText
+        observedStorageText = current
+        updatePlaceholderVisibility()
     }
 
     @objc private func handleTextChangeNotification(_ notification: Notification) {
@@ -123,7 +180,7 @@ open class TextForgeTextView: UITextView {
     /// 文本或组字内容出现后隐藏占位，恢复为空时重新布局占位文字。
     private func updatePlaceholderVisibility() {
         let content = attributedPlaceholder?.string ?? placeholder ?? ""
-        placeholderLabel.isHidden = !(text ?? "").isEmpty || content.isEmpty
+        placeholderLabel.isHidden = textStorage.length > 0 || content.isEmpty
         if !placeholderLabel.isHidden { setNeedsLayout() }
     }
 
@@ -132,6 +189,10 @@ open class TextForgeTextView: UITextView {
         updatePlaceholderVisibility()
         guard markedTextRange == nil else { return }
         let currentText = text ?? ""
+        if let compositionBaseline {
+            lastCommittedText = compositionBaseline
+            self.compositionBaseline = nil
+        }
         guard currentText != lastCommittedText else { return }
         lastCommittedText = currentText
         onTextChange?(currentText)

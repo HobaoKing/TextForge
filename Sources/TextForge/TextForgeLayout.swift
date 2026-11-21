@@ -73,7 +73,7 @@ public final class TextForgeLayout: NSObject {
 
     // MARK: 公开查询
 
-    /// 创建布局时配置的截断标记，未配置时为 nil。是否真的显示见 `isTruncated`。
+    /// 创建布局时配置的截断标记，未配置时为 nil。实际显示情况见 `showsTruncationToken`。
     @objc public var truncationToken: NSAttributedString? { container.truncationToken }
 
     /// 内容超出行数或高度限制，末行显示了省略号或截断标记，或有内容被裁掉。
@@ -114,7 +114,7 @@ public final class TextForgeLayout: NSObject {
         outer(containerRect(for: range, inToken: false))
     }
 
-    /// 原文范围在每一行上的排版矩形，纵向只覆盖字体的升部到降部，适合画底色或选区。
+    /// 原文范围在各行的视觉片段矩形，双向混排可在同一行返回多段；纵向按字体升部和降部计算。
     @nonobjc public func rects(forRange range: NSRange) -> [CGRect] {
         runRects(for: range, inToken: false).map(outer)
     }
@@ -130,7 +130,13 @@ public final class TextForgeLayout: NSObject {
     var fittingSize: CGSize { engine.fittingSize }
 
     /// 截断标记实际显示出来了。
-    var showsTruncationToken: Bool { engine.tokenRange != nil }
+    @objc public var showsTruncationToken: Bool { !truncationTokenRect.isNull }
+
+    /// 自定义标记可见部分的外接矩形，使用布局外部坐标。未显示或完全被裁掉时返回 CGRect.null。
+    @objc public var truncationTokenRect: CGRect {
+        guard let range = engine.tokenRange else { return .null }
+        return outer(engine.boundingRect(for: range))
+    }
 
     /// 后台结果中的动态色已解析，换外观时需要从原始富文本重新生成。
     func matchesAppearance(_ traits: UITraitCollection) -> Bool {
@@ -215,6 +221,7 @@ public final class TextForgeLayout: NSObject {
         TextForgeLayoutParameters(
             size: container.size, insets: container.insets,
             maximumNumberOfRows: container.maximumNumberOfRows, lineBreakMode: container.lineBreakMode,
+            minimumScaleFactor: container.minimumScaleFactor,
             exclusionPaths: container.exclusionPaths.map { $0.copy() as? UIBezierPath ?? $0 }
         )
     }

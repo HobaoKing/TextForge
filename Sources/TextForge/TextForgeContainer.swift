@@ -12,6 +12,9 @@ public final class TextForgeContainer: NSObject, NSCopying {
     /// 放不下时的处理方式，默认折行且不加省略号。
     @objc public var lineBreakMode: NSLineBreakMode = .byWordWrapping
 
+    /// 单行允许的最小字号比例。1 保持原字号，仅在启用缩放时试排。
+    @objc public var minimumScaleFactor: CGFloat = 1
+
     /// 替代系统省略号的截断标记，仅在 `lineBreakMode` 为 `.byTruncatingTail` 且内容放不下时生效。
     /// 标记缺少的字体、前景色和段落样式沿用截断处的正文，可携带 TextForgeHighlight 或链接来响应点击。
     @objc public var truncationToken: NSAttributedString? {
@@ -38,11 +41,23 @@ public final class TextForgeContainer: NSObject, NSCopying {
         self.init(size: size, insets: .zero)
     }
 
+    /// 生成可直接交给标签或预排版容器的全文标记。点击可见文字或执行辅助操作时，在主线程回调标记自身的范围。
+    @objc(readMoreTokenWithTitle:action:)
+    public static func readMoreToken(title: String = "…全文", action: @escaping TextForgeTextAction) -> NSAttributedString {
+        let text = NSMutableAttributedString(string: title)
+        let highlight = TextForgeHighlight(color: .link, backgroundColor: .tertiarySystemFill)
+        highlight.cornerRadius = 3
+        highlight.tapAction = action
+        highlight.apply(to: text, range: NSRange(location: 0, length: text.length))
+        return text
+    }
+
     /// 复制全部配置。排除路径逐个复制，调用方之后修改原路径不会影响副本。
     public func copy(with zone: NSZone? = nil) -> Any {
         let copy = TextForgeContainer(size: size, insets: insets)
         copy.maximumNumberOfRows = maximumNumberOfRows
         copy.lineBreakMode = lineBreakMode
+        copy.minimumScaleFactor = minimumScaleFactor
         copy.truncationToken = truncationToken
         copy.exclusionPaths = exclusionPaths.map { $0.copy() as? UIBezierPath ?? $0 }
         copy.linkTextAttributes = linkTextAttributes

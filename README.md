@@ -1,7 +1,7 @@
 # TextForge
 Reusable iOS text rendering and input components for Swift and Objective-C.
 
-TextForge 支持 iOS 15+，使用 UIKit / Foundation，实现由 Swift 和 Objective-C 共用的文本组件。
+TextForge 支持 iOS 15+，使用 UIKit / Foundation / WebKit，实现由 Swift 和 Objective-C 共用的文本组件。
 
 - `TextForgeLabel` 支持普通文本、局部富文本、字间距、行间距、段间距、内边距、垂直对齐、点击和长按，以及自定义截断标记、排除路径、链接外观、触摸热区扩展和长按拷贝。
 - `TextForgeLayout` 提供固定宽度、最大行数、换行和尾部截断的预排版结果。列表模型可用 `textBoundingSize` 计算行高，Cell 将同一结果赋给 `textLayout` 进行绘制。设为 `nil` 后使用标签本身的文本和样式。布局可查询行数、逐行范围与基线、是否截断、点到字符和范围到矩形。
@@ -18,7 +18,7 @@ TextForge 支持 iOS 15+，使用 UIKit / Foundation，实现由 Swift 和 Objec
 
 1. 打开消费项目的 workspace 或工程，在 Xcode 选择 **File → Add Package Dependency**。
 2. 输入仓库地址 `https://github.com/HobaoKing/TextForge.git`。
-3. 将依赖规则设为 **Exact Version**，输入 `1.0.1`。
+3. 将依赖规则设为 **Exact Version**，输入 `1.0.2`。
 4. 选择 `TextForge` 产品，添加到实际使用它的 iOS target。团队协作时提交工程配置和共享的 `Package.resolved`。
 
 ### `Package.swift`
@@ -34,7 +34,7 @@ let package = Package(
     platforms: [.iOS(.v15)],
     products: [.library(name: "MyFeature", targets: ["MyFeature"])],
     dependencies: [
-        .package(url: "https://github.com/HobaoKing/TextForge.git", exact: "1.0.1")
+        .package(url: "https://github.com/HobaoKing/TextForge.git", exact: "1.0.2")
     ],
     targets: [
         .target(name: "MyFeature", dependencies: [.product(name: "TextForge", package: "TextForge")])
@@ -84,6 +84,69 @@ input.placeholderFont = [UIFont systemFontOfSize:14];
 input.onTextChange = ^(NSString *text) { NSLog(@"%@", text); };
 ```
 
+## HTML 富文本
+
+以下 HTML、全文标记便捷入口和附件替代文本 API 从 `1.0.2` 起可用。HTML 字符串由系统 [WebKit 的 HTML 导入接口](https://developer.apple.com/documentation/foundation/nsattributedstring/loadfromhtml(string:options:completionhandler:)) 异步转换为 `NSAttributedString`，可用于标签、输入框和预排版。导入一次即可在多个控件间复用。Swift 和 Objective-C 的完成回调都在主线程执行。
+
+```swift
+let html = "<p><strong>服务说明</strong> &amp; <a href='terms'>使用条款</a></p>"
+let base = URL(string: "https://example.com/help/")
+TextForgeHTML.attributedString(from: html, baseURL: base) { text, error in
+    guard let text else {
+        label.text = error?.localizedDescription
+        return
+    }
+    label.attributedText = text
+    input.attributedText = text
+}
+```
+
+```objc
+[TextForgeHTML attributedStringFromHTML:@"<p><b>服务说明</b> &amp; <a href='terms'>使用条款</a></p>"
+                               baseURL:[NSURL URLWithString:@"https://example.com/help/"]
+                            completion:^(NSAttributedString *text, NSError *error) {
+    if (error) {
+        label.text = error.localizedDescription;
+        return;
+    }
+    label.attributedText = text;
+    input.attributedText = text;
+}];
+```
+
+- 段落、列表、粗斜体、内联 CSS、HTML 实体和图片按系统导入器能表达的富文本样式呈现。链接保留标准 `.link` 属性，标签的 `highlightTapAction` 可读取该范围的 URL，决定如何打开。
+- 图片可使用内嵌的 `data:` 地址。HTML 引用远程资源时，系统导入器可能发起网络请求，受宿主网络策略限制。离线内容应使用自包含 HTML。交互式网页使用宿主的网页视图。
+- 列表可在绑定 Cell 前导入，按模型标识保存并复用结果。直接在 Cell 中发起导入时，回调里核对当前模型，避免把旧内容赋给已复用的视图。
+
+## 「…全文」和附件的文字替代
+
+```swift
+label.numberOfLines = 3
+label.lineBreakMode = .byTruncatingTail
+label.truncationToken = TextForgeContainer.readMoreToken { [weak label] _, _, _, _ in
+    label?.numberOfLines = 0
+}
+let slot = TextForgeAttachment.view(badge, size: badge.bounds.size, font: label.font, alignment: .center)
+let badgeText = TextForgeAttachment.withTextAlternatives(slot, copyText: "[VIP]", accessibilityText: "会员")
+```
+
+```objc
+label.numberOfLines = 3;
+label.lineBreakMode = NSLineBreakByTruncatingTail;
+__weak TextForgeLabel *weakLabel = label;
+label.truncationToken = [TextForgeContainer readMoreTokenWithTitle:@"…全文"
+    action:^(UIView *view, NSAttributedString *token, NSRange range, CGRect rect) {
+        weakLabel.numberOfLines = 0;
+    }];
+NSAttributedString *slot = [TextForgeAttachment view:badge size:badge.bounds.size
+                                               font:label.font alignment:TextForgeVerticalAlignmentCenter];
+NSAttributedString *badgeText = [TextForgeAttachment attachmentString:slot copyText:@"[VIP]" accessibilityText:@"会员"];
+```
+
+- 同一标记可赋给 `TextForgeContainer.truncationToken`。使用显式预排版结果时，展开操作应更新容器行数并生成新布局。标签和布局都可以查询 `showsTruncationToken` 和 `truncationTokenRect`。后者使用各自坐标系，标记隐藏时返回 `CGRect.null`。
+- 将 `badgeText` 拼入正文后，标签整段复制、输入框选区复制采用复制文案。标签默认朗读和输入框辅助功能值采用朗读名称。朗读名称为 nil 时沿用复制文案，空串表示静音。未配置的装饰性附件在标签纯文本中省略。
+- 单行标签开启 `adjustsFontSizeToFitWidth` 后，自定义排版也使用 `minimumScaleFactor`。多行按字符换行可设 `.byCharWrapping`，显式指定的段落策略优先。纯展示标签让触摸穿透，链接、整标签操作、可交互附件和宿主手势仍可响应。
+
 ## 截断标记、排版查询与拷贝
 
 `truncationToken` 在末行放不下时替代系统省略号，只在 `.byTruncatingTail` 下生效。标记缺少的字体和颜色沿用截断处的正文，截断点落在字素边界上。标记可以携带 `TextForgeHighlight` 或链接，点击回调收到的富文本和范围都是标记自身的。
@@ -117,7 +180,7 @@ layout.isTruncated              // 内容是否放不下
 layout.lines                    // 每行的原文范围、矩形和基线
 layout.visibleRange             // 覆盖可见原文的范围，头部或中部截断可能在范围内留下空缺
 layout.characterIndex(at: point)
-layout.rects(forRange: range)   // 每行一段，适合画底色
+layout.rects(forRange: range)   // 按视觉片段返回，适合画底色
 ```
 
 标签上的 `displayedTextLayout`、`isTruncated`、`characterIndex(at:)` 和 `rect(forRange:)` 给出当前边界下的同类信息，后两者使用控件坐标。宽度不限的布局在居中或右对齐时，文字仍从布局左缘开始排，`textBoundingSize` 与左对齐一致。

@@ -118,6 +118,12 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
     open override var textAlignment: NSTextAlignment { didSet { if textAlignment != oldValue { invalidateTextLayout() } } }
     open override var lineBreakMode: NSLineBreakMode { didSet { if lineBreakMode != oldValue { invalidateTextLayout() } } }
     open override var numberOfLines: Int { didSet { if numberOfLines != oldValue { invalidateTextLayout() } } }
+    open override var adjustsFontSizeToFitWidth: Bool {
+        didSet { if adjustsFontSizeToFitWidth != oldValue { invalidateTextLayout() } }
+    }
+    open override var minimumScaleFactor: CGFloat {
+        didSet { if minimumScaleFactor != oldValue { invalidateTextLayout() } }
+    }
     open override var preferredMaxLayoutWidth: CGFloat {
         didSet { if preferredMaxLayoutWidth != oldValue { invalidateTextLayout() } }
     }
@@ -126,6 +132,7 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
     open override var accessibilityLabel: String? {
         get {
             if let customAccessibilityLabel { return customAccessibilityLabel }
+            if let attributedText { return TextForgeAttachment.accessibilityText(for: attributedText) }
             return text?.replacingOccurrences(of: "\u{FFFC}", with: "") ?? super.accessibilityLabel
         }
         set {
@@ -156,7 +163,8 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
                     let hit = interaction(atCharacter: index, inToken: scope.inToken, in: result)
                     guard hit.highlight?.tapAction != nil || highlightTapAction != nil || textTapAction != nil,
                           seen.insert(hit.highlightRange).inserted else { return }
-                    let name = (hit.text.string as NSString).substring(with: hit.highlightRange)
+                    let name = TextForgeAttachment.accessibilityText(for: hit.text.attributedSubstring(from: hit.highlightRange))
+                    guard !name.isEmpty else { return }
                     actions.append(UIAccessibilityCustomAction(name: name) { [weak self, weak result] _ in
                         guard let self, let result, !self.bounds.isEmpty,
                               self.layout(for: self.bounds.size) === result else { return false }
@@ -178,6 +186,18 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
 
     /// 当前边界下内容是否放不下。控件尚无尺寸时为 false。
     @objc public var isTruncated: Bool { displayedTextLayout?.isTruncated ?? false }
+
+    /// 是否有可见的自定义截断标记。
+    @objc public var showsTruncationToken: Bool { displayedTextLayout?.showsTruncationToken ?? false }
+
+    /// 可见标记在标签坐标中的外接矩形，未显示时返回 CGRect.null。
+    @objc public var truncationTokenRect: CGRect {
+        guard let result = displayedTextLayout else { return .null }
+        let rect = result.truncationTokenRect
+        guard !rect.isNull else { return .null }
+        let origin = drawingOrigin(for: result)
+        return rect.offsetBy(dx: origin.x - result.insets.left, dy: origin.y - result.insets.top)
+    }
 
     /// 返回控件坐标下该点所在字形对应的原文 UTF-16 下标，落在空白或截断标记上时返回 NSNotFound。
     @objc(characterIndexAtPoint:) public func characterIndex(at point: CGPoint) -> Int {
@@ -275,7 +295,7 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
 
     /// 为富文本使用当前可用宽度测量，普通标签保持系统固有尺寸算法。
     open override var intrinsicContentSize: CGSize {
-        if let textLayout { return measuredSize(of: textLayout) }
+        if let explicitTextLayout { return measuredSize(of: explicitTextLayout) }
         guard usesCustomLayout else { return super.intrinsicContentSize }
         let width = preferredMaxLayoutWidth > 0 ? preferredMaxLayoutWidth : (
             numberOfLines != 1 && bounds.width > 0 ? bounds.width : .greatestFiniteMagnitude
@@ -391,6 +411,21 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         clearHighlight()
     }
 
+    /// 让普通文字和链接之外的空白透传给下层控件，保留附件子视图、宿主手势以及确实可执行的标签操作。
+    open override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        let target = super.hitTest(point, with: event)
+        guard target === self else { return target }
+        if textTapAction != nil || textLongPressAction != nil || (allowsCopy && !copyableText.isEmpty) { return self }
+        if gestureRecognizers?.contains(where: {
+            $0 !== actionTapGesture && $0 !== actionPressGesture && $0.isEnabled
+        }) == true { return self }
+        guard usesCustomLayout else { return nil }
+        let hit = interaction(at: point)
+        guard hit.highlightRange.location != NSNotFound else { return nil }
+        return hit.highlight?.tapAction != nil || hit.highlight?.longPressAction != nil
+            || highlightTapAction != nil || highlightLongPressAction != nil ? self : nil
+    }
+
     /// 无匹配回调时让位给父级手势，空白只允许明确的整标签操作。
     open override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
         guard gestureRecognizer === actionTapGesture || gestureRecognizer === actionPressGesture else {
@@ -448,6 +483,7 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         let container = TextForgeContainer(size: size, insets: contentInsets)
         container.maximumNumberOfRows = rows
         container.lineBreakMode = lineBreakMode
+        container.minimumScaleFactor = adjustsFontSizeToFitWidth ? minimumScaleFactor : 1
         container.truncationToken = truncationToken
         container.exclusionPaths = exclusionPaths
         container.linkTextAttributes = linkTextAttributes
@@ -466,6 +502,7 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
             if attributes[.paragraphStyle] == nil {
                 let style = NSMutableParagraphStyle()
                 style.alignment = textAlignment
+                if lineBreakMode == .byCharWrapping { style.lineBreakMode = .byCharWrapping }
                 prepared.addAttribute(.paragraphStyle, value: style, range: segment)
             }
         }
@@ -614,7 +651,8 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
 
     /// 取得当前原文全文，过滤附件占位符和展示时临时加入的截断标记。
     private var copyableText: String {
-        (text ?? "").replacingOccurrences(of: "\u{FFFC}", with: "")
+        if let attributedText { return TextForgeAttachment.copyText(for: attributedText) }
+        return (text ?? "").replacingOccurrences(of: "\u{FFFC}", with: "")
     }
 
     /// 在触摸点弹出系统拷贝菜单。只有控件在窗口内、有原文且拿到第一响应者时才尝试呈现。

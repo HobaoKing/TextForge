@@ -38,12 +38,13 @@ prepare_app() {
 
 prepare_app Swift
 prepare_app ObjectiveC
+# 模拟宿主移除未引用动态库的链接配置，确认两种语言调用 HTML 分类时 WebKit 都实际可用。
 xcrun --sdk iphonesimulator swiftc -target "$target" -sdk "$sdk" -parse-as-library -I "$products_dir" \
-    "$repo_dir/Examples/Swift/Example.swift" "$library" -o "$scratch_dir/Swift.app/Swift"
+    -Xlinker -dead_strip_dylibs -framework WebKit "$repo_dir/Examples/Swift/Example.swift" "$library" -o "$scratch_dir/Swift.app/Swift"
 xcrun --sdk iphonesimulator clang -target "$target" -fmodules -fobjc-arc \
     -fmodule-map-file="$module_maps/TextForge.modulemap" \
     -c "$repo_dir/Examples/ObjectiveC/main.m" -o "$scratch_dir/ObjectiveC.o"
-xcrun --sdk iphonesimulator swiftc -target "$target" -sdk "$sdk" -framework UIKit -framework Foundation \
+xcrun --sdk iphonesimulator swiftc -target "$target" -sdk "$sdk" -framework UIKit -framework Foundation -Xlinker -dead_strip_dylibs -framework WebKit \
     "$scratch_dir/ObjectiveC.o" "$library" -o "$scratch_dir/ObjectiveC.app/ObjectiveC"
 
 # 运行独立样例，读取应用沙盒内的断言结果，避免误把进程启动当作交互验收。
