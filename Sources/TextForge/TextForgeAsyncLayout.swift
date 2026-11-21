@@ -5,7 +5,10 @@ import UIKit
 public final class TextForgeLayoutTask: NSObject, Sendable {
     private let operation: Operation
 
-    init(operation: Operation) {
+    private let onCancel: (@Sendable () -> Void)?
+
+    init(operation: Operation, onCancel: (@Sendable () -> Void)? = nil) {
+        self.onCancel = onCancel
         self.operation = operation
     }
 
@@ -14,6 +17,7 @@ public final class TextForgeLayoutTask: NSObject, Sendable {
     /// 取消尚未完成的请求，包括等待回到主线程的结果。
     @objc public func cancel() {
         operation.cancel()
+        onCancel?()
     }
 }
 
@@ -48,27 +52,28 @@ extension TextForgeLayout {
         traitCollection: UITraitCollection,
         completion: @escaping (TextForgeLayout) -> Void
     ) -> TextForgeLayoutTask {
-        let original = NSAttributedString(attributedString: attributedText)
-        let container = container.copy() as? TextForgeContainer ?? container
+        let item = TextForgeListItem(attributedText: attributedText, container: container)
+        return prepare(item: item, size: container.size, renderScale: renderScale, traitCollection: traitCollection, completion: completion)
+    }
+
+    /// 同一列表项跨尺寸复用已分离的正文和标记，工作线程仍各自独占 TextKit 引擎。
+    static func prepare(item: TextForgeListItem, size: CGSize, renderScale: CGFloat, traitCollection: UITraitCollection,
+                        completion: @escaping (TextForgeLayout) -> Void) -> TextForgeLayoutTask {
+        let original = item.attributedText
+        let container = item.container.copy() as! TextForgeContainer
+        container.size = size
         let operation = Operation()
         let task = TextForgeLayoutTask(operation: operation)
-        let detachedText = detachedTextForLayout(
-            renderingText(original, container: container), traits: traitCollection
-        )
-        let detachedToken = container.truncationToken.map {
-            detachedTextForLayout(
-                renderingText($0, container: container), traits: traitCollection
-            )
-        }
-        guard let detachedText, detachedToken.map({ $0 != nil }) ?? true else {
+        let snapshot = item.snapshot(for: traitCollection)
+        guard let detachedText = snapshot.text, snapshot.supportsToken else {
             DispatchQueue.main.async {
                 guard !operation.isCancelled else { return }
-                completion(TextForgeLayout(container: container, attributedText: original))
+                completion(TextForgeLayout(container: container, attributedText: original, fallbackTraits: traitCollection))
             }
             return task
         }
         let input = TextForgeRenderingInput(
-            text: detachedText, token: detachedToken ?? nil,
+            text: detachedText, token: snapshot.token,
             parameters: parameters(for: container), traits: traitCollection
         )
         Task { @MainActor in
@@ -80,24 +85,27 @@ extension TextForgeLayout {
                         continuation.resume(returning: nil)
                         return
                     }
-                    let engine = TextForgeLayoutEngine(
-                        text: input.text, truncationToken: input.token, parameters: input.parameters
-                    )
-                    guard !operation.isCancelled else {
-                        continuation.resume(returning: nil)
-                        return
+                    input.traits.performAsCurrent {
+                        let engine = TextForgeLayoutEngine(
+                            text: input.text, truncationToken: input.token, parameters: input.parameters
+                        )
+                        guard !operation.isCancelled else {
+                            continuation.resume(returning: nil)
+                            return
+                        }
+                        engine.prepareDrawingBounds()
+                        let image = engine.rasterize(
+                            scale: renderScale, traits: input.traits,
+                            viewport: input.parameters.size, insets: input.parameters.insets
+                        )
+                        continuation.resume(returning: TextForgeLayoutHandoff(engine: engine, image: image))
                     }
-                    let image = engine.rasterize(
-                        scale: renderScale, traits: input.traits,
-                        viewport: input.parameters.size, insets: input.parameters.insets
-                    )
-                    continuation.resume(returning: TextForgeLayoutHandoff(engine: engine, image: image))
                 }
             }
             guard !operation.isCancelled, let handoff else { return }
             completion(TextForgeLayout(
                 attributedText: original, container: container,
-                engine: handoff.engine, preparedImage: handoff.image, preparedTraits: traitCollection
+                engine: handoff.engine, preparedImage: handoff.image, preparedTraits: traitCollection, paint: snapshot.paint
             ))
         }
         return task
@@ -114,40 +122,38 @@ extension TextForgeLayout {
 
     /// 在主线程分离绘制属性与交互对象。UIView 附件仅保留槽尺寸，动态颜色在当前外观下解析。
     /// HTML 图片可能只保存在文件包装器中。常规文件按数据和文件名复制，其余无法分离的内容回到主线程排版。
-    private static func detachedTextForLayout(_ text: NSAttributedString, traits: UITraitCollection) -> NSAttributedString? {
-        let detached = NSMutableAttributedString(string: text.string)
+    static func detachedTextForLayout(_ text: NSAttributedString, paint: TextForgePaintPalette) -> NSAttributedString? {
+        let detached = NSMutableAttributedString(attributedString: text)
         var supported = true
         text.enumerateAttributes(in: NSRange(location: 0, length: text.length)) { attributes, range, stop in
+            if attributes[TextForgeHighlight.attributeName] != nil {
+                detached.removeAttribute(TextForgeHighlight.attributeName, range: range)
+            }
             for (key, value) in attributes where key != TextForgeHighlight.attributeName {
                 let copied: Any
                 switch value {
-                case let color as UIColor:
-                    copied = color.resolvedColor(with: traits)
+                case is UIColor, is NSShadow, is TextForgeBackground:
+                    guard let entry = paint.entry(for: value as! NSObject, key: key) else {
+                        supported = false
+                        stop.pointee = true
+                        return
+                    }
+                    copied = entry.resolved
+                    if let index = entry.index {
+                        detached.addAttribute(TextForgePaintPalette.marker(for: key), value: index, range: range)
+                    }
                 case let paragraph as NSParagraphStyle:
                     copied = paragraph.copy()
-                case let shadow as NSShadow:
-                    let copy = NSShadow()
-                    copy.shadowOffset = shadow.shadowOffset
-                    copy.shadowBlurRadius = shadow.shadowBlurRadius
-                    if let color = shadow.shadowColor {
-                        guard let uiColor = color as? UIColor else {
-                            supported = false
-                            stop.pointee = true
-                            return
-                        }
-                        copy.shadowColor = uiColor.resolvedColor(with: traits)
-                    }
-                    copied = copy
-                case let background as TextForgeBackground:
-                    copied = background.resolved(with: traits)
                 case let attachment as TextForgeViewAttachment:
                     let slot = NSTextAttachment()
                     slot.bounds = attachment.bounds
                     copied = slot
                 case let attachment as NSTextAttachment where type(of: attachment) == NSTextAttachment.self:
+                    paint.hasImages = true
                     let contents = attachment.contents
                     let image = NSTextAttachment(data: contents, ofType: attachment.fileType)
                     if let bitmap = attachment.image {
+                        if bitmap.imageAsset != nil, attachment.bounds.size == .zero { paint.requiresExactGeometry = true }
                         image.image = bitmap
                     } else if contents == nil, let wrapper = attachment.fileWrapper {
                         guard wrapper.isRegularFile, let data = wrapper.regularFileContents else {
@@ -162,7 +168,7 @@ extension TextForgeLayout {
                     image.bounds = attachment.bounds
                     copied = image
                 case is UIFont, is NSNumber, is URL:
-                    copied = value
+                    continue
                 case let directions as [NSNumber]:
                     copied = directions
                 case let string as NSString:
@@ -172,7 +178,7 @@ extension TextForgeLayout {
                     stop.pointee = true
                     return
                 }
-                detached.addAttribute(key, value: copied, range: range)
+                if (copied as AnyObject) !== (value as AnyObject) { detached.addAttribute(key, value: copied, range: range) }
             }
         }
         return supported ? NSAttributedString(attributedString: detached) : nil

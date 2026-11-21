@@ -16,7 +16,29 @@ public final class TextForgeHTML: NSObject {
         imageLoader: TextForgeHTMLImageLoader? = nil, update: (@MainActor (NSAttributedString) -> Void)? = nil,
         completion: @escaping TextForgeHTMLCompletion
     ) -> TextForgeHTMLImportTask {
-        let task = TextForgeHTMLImportTask(style: readingStyle, imageLoader: imageLoader, update: update, completion: completion)
+        start(html, baseURL: baseURL, readingStyle: readingStyle, imageLoader: imageLoader, update: update, imageUpdate: nil, completion: completion)
+    }
+
+    /// 有待加载图片时先交付占位，再按主队列批次交付变更位置和尺寸标记；末批与完成回调共享不可变快照。
+    @discardableResult
+    @objc(importHTML:baseURL:readingStyle:imageLoader:imageUpdate:completion:)
+    public static func importHTML(
+        _ html: String, baseURL: URL? = nil, readingStyle: TextForgeHTMLReadingStyle,
+        imageLoader: @escaping TextForgeHTMLImageLoader, imageUpdate: @escaping @MainActor (TextForgeHTMLImageUpdate) -> Void,
+        completion: @escaping TextForgeHTMLCompletion
+    ) -> TextForgeHTMLImportTask {
+        start(html, baseURL: baseURL, readingStyle: readingStyle, imageLoader: imageLoader, update: nil,
+              imageUpdate: imageUpdate, completion: completion)
+    }
+
+    /// 两个语言入口共用同一套解析、去重、取消和最终交付顺序。
+    private static func start(
+        _ html: String, baseURL: URL?, readingStyle: TextForgeHTMLReadingStyle, imageLoader: TextForgeHTMLImageLoader?,
+        update: (@MainActor (NSAttributedString) -> Void)?, imageUpdate: (@MainActor (TextForgeHTMLImageUpdate) -> Void)?,
+        completion: @escaping TextForgeHTMLCompletion
+    ) -> TextForgeHTMLImportTask {
+        let task = TextForgeHTMLImportTask(style: readingStyle, imageLoader: imageLoader, update: update,
+                                           imageUpdate: imageUpdate, completion: completion)
         let css = readingStyle.stylesheet
         let takesImages = imageLoader != nil
         Task { @MainActor in

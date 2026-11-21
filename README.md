@@ -18,7 +18,7 @@ TextForge 支持 iOS 15+，使用 UIKit、Foundation、WebKit 和系统 libxml2�
 
 1. 打开消费项目的 workspace 或工程，在 Xcode 选择 **File → Add Package Dependency**。
 2. 输入仓库地址 `https://github.com/HobaoKing/TextForge.git`。
-3. 将依赖规则设为 **Exact Version**，输入 `1.0.3`。
+3. 将依赖规则设为 **Exact Version**，输入 `1.0.4`。
 4. 选择 `TextForge` 产品，添加到实际使用它的 iOS target。团队协作时提交工程配置和共享的 `Package.resolved`。
 
 ### `Package.swift`
@@ -34,7 +34,7 @@ let package = Package(
     platforms: [.iOS(.v15)],
     products: [.library(name: "MyFeature", targets: ["MyFeature"])],
     dependencies: [
-        .package(url: "https://github.com/HobaoKing/TextForge.git", exact: "1.0.3")
+        .package(url: "https://github.com/HobaoKing/TextForge.git", exact: "1.0.4")
     ],
     targets: [
         .target(name: "MyFeature", dependencies: [.product(name: "TextForge", package: "TextForge")])
@@ -175,6 +175,12 @@ TextForgeHTMLImportTask *task = [TextForgeHTML importHTML:html baseURL:base read
 - **图片尺寸。** 接管图片支持 `width`、`height` 的数值或内联 `px` 长度；只声明一边时根据原图比例补齐另一边。无声明时先用 `placeholderSize` 和可选的 `placeholderImage`，成功后按原图尺寸展示。`maximumImageWidth` 等比限制最终宽度，0 表示无限制。
 - **回调与复用。** 主线程发起加载；宿主可从任意线程回传一次图片或 `nil`。有待加载图片时，`update` 先给占位快照，其后可给部分加载成功的快照；所有图片结束后 `completion` 交付最终文本。单张失败保留占位与 alt，文档导入失败通过 `error` 返回。每份快照都可独立赋给标签、编辑器或用来预排版；自算行高的列表应在应用新快照后更新行高。取消会撤销待完成的宿主请求并停止投递。可在占位快照回调中取消，重复取消也安全。系统已开始的 HTML 转换可以继续结束，其结果会被丢弃。
 
+**多图合并更新（1.0.4 起）。** 同一主队列批次内成功的图片合并投递。原 `update` 接口保留占位和中间快照，最后一批直接交给 `completion`。需要区分局部刷新和重新测高时，Swift 使用 `importHTML(_:baseURL:readingStyle:imageLoader:imageUpdate:completion:)`，Objective-C 使用 `importHTML:baseURL:readingStyle:imageLoader:imageUpdate:completion:`。两端收到的 `TextForgeHTMLImageUpdate` 提供以下信息。
+
+- `attributedText` 是独立快照。`isInitial` 标识首次占位，此时宿主首次排版。
+- `changedIndexes` 是自上次投递以来成功替换图片的位置（UTF-16）；同 URL 多处使用会包含每个位置。`didChangeSize` 为真时，至少一个位置需要重新测量。图片失败保留原占位。
+- `isFinal` 标识末批，随后 `completion` 收到同一个快照。使用详细回调更新 UI 时，完成回调只需处理结束状态。有图请求才发图片更新；无图或导入失败直接走完成回调。
+
 Cell 应在两个入口清理旧请求。一次是 `prepareForReuse()`，另一次是同一行就地重新绑定文章时。两个入口都先执行 `articleTask?.cancel()`、清空旧正文，再保存新任务。Objective-C 对应 `[self.articleTask cancel]`。即使新旧文章引用相同 URL，取消后到达的旧图片也不会写入新文章。
 
 ## 「…全文」和附件的文字替代
@@ -300,6 +306,32 @@ let task = TextForgeLayout.prepare(
 若由 Cell 的标签直接发起请求，可以调用 `setAttributedTextAsynchronously(_:size:rendersAsynchronously:completion:)`。此方法先清掉旧内容。再次赋值、调整样式或获得不匹配的宽度时，会取消尚未交付的请求。结果交付后，仍可通过 `text` 或 `attributedText` 替换或清空内容。ObjC 可调用 `setAttributedTextAsynchronously:size:rendersAsynchronously:completion:`。
 
 后台排版使用独占的 TextKit 对象，真实 `UIView` 附件在主线程挂载。自定义绘制属性或附件需要时走同步排版；大图只准备布局，按压或外观变化时用原始富文本绘制。
+
+### 跨 Cell 复用（1.0.4 起）
+
+每个列表持有一个 `TextForgeListLayoutCache`，每个内容版本持有一个 `TextForgeListItem`。预取、测高和 Cell 绑定传入同一项、外部尺寸和倍率。普通富文本在页面与 Cell 的字体、方向和字重环境相同时共享几何结果，绘制时采用标签当前的颜色。缓存命中也在主线程异步交付；Cell 换绑或复用时取消自己的任务，其他订阅者继续接收结果。宽度变化可复用已分离的文本样式。正文、字体、交互回调、附件或容器配置变化时创建新项。含同一个 `UIView` 的内容只能由一个标签同时挂载。
+
+```swift
+let item = TextForgeListItem(attributedText: body, container: container) // 随模型保留
+// cache 随列表保留，task 随 Cell 保留。
+task?.cancel()
+label.textLayout = nil
+task = cache.prepare(item, size: rowSize, renderScale: traits.displayScale, traitCollection: traits) { layout in
+    label.textLayout = layout
+}
+let measured = cache.cachedSize(for: item, size: rowSize, traitCollection: traits)?.cgSizeValue
+```
+
+```objc
+TextForgeListItem *item = [[TextForgeListItem alloc] initWithAttributedText:body container:container];
+[self.task cancel];
+self.label.textLayout = nil;
+self.task = [cache prepareItem:item size:rowSize renderScale:traits.displayScale traitCollection:traits
+                    completion:^(TextForgeLayout *layout) { self.label.textLayout = layout; }];
+NSValue *measured = [cache cachedSizeForItem:item size:rowSize traitCollection:traits];
+```
+
+缓存默认给预绘位图 16 MiB 的逻辑字节预算，最多保留 128 份布局和独立的 1024 条测量值；可在创建时调整渲染预算。超出预算的单条结果依然交付给当前订阅者，只缓存尺寸。长文局部重绘只处理与脏区及其外伸装饰相交的行，滚动容器中的交互附件按可见区挂载，附件对象的生命周期仍由富文本持有。
 
 ## 独立示例与验证
 

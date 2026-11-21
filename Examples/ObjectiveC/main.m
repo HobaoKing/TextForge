@@ -242,7 +242,7 @@
                             ![self.input.accessibilityValue containsString:@"新图"]) {
                             [failures addObject:@"Objective-C replacement HTML or failed-image alternative"];
                         }
-                        [self writeVerificationResult:failures];
+                        [self verifyImageBatchAndListCache:failures];
                     }];
             });
             return ^{ cancelled = YES; };
@@ -250,6 +250,40 @@
             displayed = [[TextForgeAttachment copyTextForAttributedString:snapshot] containsString:@"旧图"];
         } completion:^(NSAttributedString *result, NSError *error) {
             [failures addObject:@"Cancelled HTML delivered a stale completion"];
+        }];
+}
+
+// 同一批完成的等尺寸图片只反馈一次变化；使用最终快照预取两次并核对 OC 获取的行高和布局身份。
+- (void)verifyImageBatchAndListCache:(NSMutableArray<NSString *> *)failures {
+    TextForgeHTMLReadingStyle *style = [TextForgeHTMLReadingStyle new];
+    UIImage *image = [[[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(10, 10)] imageWithActions:^(UIGraphicsImageRendererContext *ctx) {}];
+    __block NSInteger updates = 0;
+    __block NSAttributedString *finalSnapshot = nil;
+    [TextForgeHTML importHTML:@"<img width='10' height='10' src='a'>配图<img width='10' height='10' src='b'>"
+        baseURL:[NSURL URLWithString:@"https://example.invalid/"] readingStyle:style
+        imageLoader:^dispatch_block_t(NSURL *url, void (^reply)(UIImage *)) { reply(image); return nil; }
+        imageUpdate:^(TextForgeHTMLImageUpdate *batch) {
+            updates++;
+            if (batch.isFinal) {
+                finalSnapshot = batch.attributedText;
+                if (batch.changedIndexes.count != 2 || batch.didChangeSize) { [failures addObject:@"OC equal-size image batch"]; }
+            }
+        } completion:^(NSAttributedString *text, NSError *error) {
+            if (error || !text || finalSnapshot != text || updates != 2) { [failures addObject:@"OC final image snapshot"]; }
+            if (!text) { [self writeVerificationResult:failures]; return; }
+            CGSize size = CGSizeMake(120, 60);
+            TextForgeListItem *item = [[TextForgeListItem alloc] initWithAttributedText:text container:[[TextForgeContainer alloc] initWithSize:size]];
+            TextForgeListLayoutCache *cache = [TextForgeListLayoutCache new];
+            UITraitCollection *traits = self.forgeLabel.traitCollection;
+            [cache prepareItem:item size:size renderScale:2 traitCollection:traits completion:^(TextForgeLayout *layout) {
+                [cache prepareItem:item size:size renderScale:2 traitCollection:traits completion:^(TextForgeLayout *hit) {
+                    NSValue *measured = [cache cachedSizeForItem:item size:size traitCollection:traits];
+                    if (hit != layout || !measured || !CGSizeEqualToSize(measured.CGSizeValue, layout.textBoundingSize)) {
+                        [failures addObject:@"OC list layout or size cache miss"];
+                    }
+                    [self writeVerificationResult:failures];
+                }];
+            }];
         }];
 }
 

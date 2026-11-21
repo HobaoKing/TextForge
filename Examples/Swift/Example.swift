@@ -150,6 +150,7 @@ final class ExampleViewController: UIViewController {
         if received != ["", "ni"] { failures.append("repeated marked edits: callbacks=\(received), text=\(input.text ?? "")") }
 
         failures.append(contentsOf: verifyCompositionTransactions())
+        failures.append(contentsOf: verifyViewportRendering())
 
         verifyAsyncPreparation { asyncResults in
             self.verifyExplicitLayoutAppearance { appearanceFailures in
@@ -434,14 +435,25 @@ final class ExampleViewController: UIViewController {
             }
             return result
         }
+        var changed = IndexSet()
+        var imageSizesChanged = false
+        var lastBatch: NSAttributedString?
         _ = TextForgeHTML.importHTML(html, baseURL: URL(string: "https://example.invalid/docs/"),
             readingStyle: style, imageLoader: { url, reply in
                 urls.append(url)
                 let loaded = url.lastPathComponent == "ok" ? image : nil
                 DispatchQueue.global().async { reply(loaded); reply(nil) }
                 return nil
-            }, update: { if initial == nil { initial = $0 } }) { result, error in
+            }, imageUpdate: { batch in
+                if batch.isInitial { initial = batch.attributedText }
+                changed.formUnion(batch.changedIndexes)
+                imageSizesChanged = imageSizesChanged || batch.didChangeSize
+                if batch.isFinal { lastBatch = batch.attributedText }
+            }) { result, error in
                 guard let result, let initial, error == nil else { completion(["HTML host import: "+String(describing: error)]); return }
+                if lastBatch !== result || changed.count != 2 || !imageSizesChanged {
+                    failures.append("HTML image change indexes, geometry or final snapshot")
+                }
                 if !result.string.contains("中文 café 😄 默认") {
                     failures.append("HTML legacy charset corrupted Unicode text: " + result.string)
                 }
@@ -582,9 +594,18 @@ final class ExampleViewController: UIViewController {
             oldReplies[url.lastPathComponent] = reply
             if oldReplies.count == 2 { oldReplies["first"]?(image) }
             return { cancelled.append(url.lastPathComponent) }
-        }, update: { snapshot in
+        }, imageUpdate: { batch in
             oldUpdates += 1
-            cell.body.attributedText = snapshot
+            cell.body.attributedText = batch.attributedText
+            if oldUpdates == 1 {
+                if !batch.isInitial || batch.isFinal || !batch.changedIndexes.isEmpty { failures.append("old article placeholder batch") }
+                return
+            }
+            let firstSlot = (batch.attributedText.string as NSString).range(of: "\u{fffc}").location
+            if batch.isInitial || batch.isFinal || !batch.didChangeSize ||
+                firstSlot == NSNotFound || batch.changedIndexes != IndexSet(integer: firstSlot) {
+                failures.append("old article partial image batch before reuse")
+            }
             guard oldUpdates == 2 else { return }
             source.count = 0
             table.reloadData()
@@ -1005,27 +1026,172 @@ final class ExampleViewController: UIViewController {
         return failures
     }
 
-    /// 用与标签外观不同的后台布局验证重建后仍保留调用方指定的显式布局尺寸。
+    /// 同一份含动态色的预排在浅、深、浅三种绑定中共享几何，并用实际像素核对轮换后的颜色。
     private func verifyExplicitLayoutAppearance(completion: @escaping ([String]) -> Void) {
         let size = CGSize(width: 200, height: 40)
         let label = TextForgeLabel(frame: CGRect(origin: .zero, size: size))
-        label.overrideUserInterfaceStyle = .light
+        label.overrideUserInterfaceStyle = .dark
         view.addSubview(label)
         let style = NSMutableParagraphStyle()
         style.alignment = .right
+        let color = UIColor { $0.userInterfaceStyle == .dark ? .blue : .red }
         let text = NSAttributedString(string: "右对齐", attributes: [
-            .font: UIFont.systemFont(ofSize: 16), .foregroundColor: UIColor.label, .paragraphStyle: style
+            .font: UIFont.systemFont(ofSize: 18), .foregroundColor: color, .paragraphStyle: style
         ])
-        _ = TextForgeLayout.prepare(
-            attributedText: text, container: TextForgeContainer(size: size), renderScale: 2,
-            traitCollection: UITraitCollection(userInterfaceStyle: .dark)
-        ) { result in
-            label.textLayout = result
-            let fitted = label.sizeThatFits(size)
-            let expected = result.textBoundingSize
-            label.removeFromSuperview()
-            completion(fitted == expected ? [] : ["explicit layout shrank after a trait change: \(fitted), expected \(expected)"])
+        let box = TextForgeContainer(size: size)
+        let item = TextForgeListItem(attributedText: text, container: box)
+        let cache = TextForgeListLayoutCache()
+        let traits = label.traitCollection
+        var failures: [String] = []
+        let stale = cache.prepare(item, size: size, renderScale: 3, traitCollection: traits) { _ in
+            failures.append("cancelled cache subscriber received a layout")
         }
+        stale.cancel()
+        var delivered: [TextForgeLayout] = []
+        // 两个仍然有效的订阅应得到同一个对象，Dictionary 的回调次序无关。
+        func received(_ layout: TextForgeLayout) {
+            delivered.append(layout)
+            guard delivered.count == 2 else { return }
+            if delivered[0] !== layout { failures.append("prefetch and cell performed different layouts") }
+            label.textLayout = layout
+            for appearance in [UIUserInterfaceStyle.light, .dark, .light] {
+                label.overrideUserInterfaceStyle = appearance
+                label.setNeedsDisplay()
+                let pixels = self.pixels(of: label)
+                if label.displayedTextLayout !== layout || label.sizeThatFits(size) != layout.textBoundingSize ||
+                    (appearance == .light ? pixels.red == 0 || pixels.blue > 0 : pixels.blue == 0 || pixels.red > 0) {
+                    failures.append("shared layout appearance \(appearance.rawValue): \(pixels)")
+                }
+            }
+            let narrow = CGSize(width: 80, height: 40)
+            if cache.cachedSize(for: item, size: size, traitCollection: traits)?.cgSizeValue != layout.textBoundingSize ||
+                cache.cachedSize(for: item, size: narrow, traitCollection: traits) != nil {
+                failures.append("list size cache mixed constraints")
+            }
+            let oldBinding = cache.prepare(item, size: size, renderScale: 3, traitCollection: label.traitCollection) { _ in
+                failures.append("cancelled cache hit reached a rebound Cell")
+            }
+            oldBinding.cancel()
+            cache.prepare(item, size: size, renderScale: 3, traitCollection: label.traitCollection) { hit in
+                if hit !== layout { failures.append("list cache missed resident layout") }
+                cache.removeAllCachedResults()
+                if cache.cachedSize(for: item, size: size, traitCollection: traits) != nil { failures.append("stale cached size") }
+                let tiny = TextForgeListLayoutCache(bitmapByteLimit: 1, layoutCountLimit: 2)
+                tiny.prepare(item, size: size, renderScale: 3, traitCollection: traits) { first in
+                    if tiny.cachedSize(for: item, size: size, traitCollection: traits) == nil {
+                        failures.append("oversized bitmap lost its independent measurement")
+                    }
+                    tiny.prepare(item, size: size, renderScale: 3, traitCollection: traits) { second in
+                        if first === second { failures.append("oversized bitmap was retained") }
+                        label.removeFromSuperview()
+                        self.verifyInvalidCacheSize { invalidSizeFailures in
+                            self.verifyAdaptiveAttachment { completion(failures + invalidSizeFailures + $0) }
+                        }
+                    }
+                }
+            }
+        }
+        cache.prepare(item, size: size, renderScale: 3, traitCollection: traits, completion: received)
+        cache.prepare(item, size: size, renderScale: 3, traitCollection: traits, completion: received)
+    }
+
+    /// 非法宽高应与同轴为零的请求共享空布局；分别验证回调到达、尺寸查询和复用身份。
+    private func verifyInvalidCacheSize(completion: @escaping ([String]) -> Void) {
+        let item = TextForgeListItem(attributedText: NSAttributedString(string: "等待测量"),
+                                     container: TextForgeContainer(size: .zero))
+        let cache = TextForgeListLayoutCache()
+        let traits = view.traitCollection
+        let cases = [(CGSize(width: CGFloat.nan, height: 40), CGSize(width: 0, height: 40)),
+                     (CGSize(width: 80, height: CGFloat.nan), CGSize(width: 80, height: 0))]
+        var completed = 0
+        var failures: [String] = []
+        var finished = false
+        for (invalid, zero) in cases {
+            cache.prepare(item, size: invalid, renderScale: 0, traitCollection: traits) { layout in
+                if cache.cachedSize(for: item, size: invalid, traitCollection: traits)?.cgSizeValue != CGSize.zero {
+                    failures.append("invalid dimension lost its empty measurement")
+                }
+                cache.prepare(item, size: zero, renderScale: 0, traitCollection: traits) { hit in
+                    if hit !== layout || hit.size != zero { failures.append("invalid dimension used a different layout key") }
+                    completed += 1
+                    if completed == cases.count, !finished { finished = true; completion(failures) }
+                }
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            if !finished { finished = true; completion(failures + ["invalid dimension lost cache callback: \(completed)/2"]) }
+        }
+    }
+
+    /// 自定义附件按外观返回不同高度，缓存与显式标签均须在目标外观下重新查询附件尺寸。
+    private func verifyAdaptiveAttachment(completion: @escaping ([String]) -> Void) {
+        let size = CGSize(width: 120, height: 120)
+        let item = TextForgeListItem(attributedText: NSAttributedString(attachment: AdaptiveAttachment()),
+                                     container: TextForgeContainer(size: size))
+        let cache = TextForgeListLayoutCache()
+        let dark = UITraitCollection(userInterfaceStyle: .dark)
+        let light = UITraitCollection(userInterfaceStyle: .light)
+        cache.prepare(item, size: size, renderScale: 0, traitCollection: dark) { darkLayout in
+            cache.prepare(item, size: size, renderScale: 0, traitCollection: light) { lightLayout in
+                let label = TextForgeLabel(frame: CGRect(origin: .zero, size: size))
+                label.overrideUserInterfaceStyle = .light
+                self.view.addSubview(label)
+                label.textLayout = darkLayout
+                let displayed = label.displayedTextLayout
+                let measured = label.intrinsicContentSize
+                label.removeFromSuperview()
+                completion(darkLayout !== lightLayout && darkLayout.textBoundingSize.height > lightLayout.textBoundingSize.height &&
+                           displayed?.textBoundingSize == lightLayout.textBoundingSize && measured == lightLayout.textBoundingSize ? [] : ["trait-dependent attachment metrics"])
+            }
+        }
+    }
+
+    /// 在滚动容器中核对附件移出、重新挂载，并逐像素比较带阴影和外扩背景的长文局部绘制。
+    private func verifyViewportRendering() -> [String] {
+        let scroll = UIScrollView(frame: CGRect(x: 0, y: 0, width: 160, height: 80))
+        view.addSubview(scroll)
+        defer { scroll.removeFromSuperview() }
+        let text = NSMutableAttributedString()
+        let font = UIFont.italicSystemFont(ofSize: 16)
+        let views = (0..<12).map { _ in UIView() }
+        let shadow = NSShadow()
+        shadow.shadowOffset = CGSize(width: 0, height: 12)
+        shadow.shadowBlurRadius = 2
+        shadow.shadowColor = UIColor.blue
+        let background = TextForgeBackground(fillColor: .yellow, cornerRadius: 3)
+        background.insets = UIEdgeInsets(top: -4, left: -2, bottom: -6, right: -2)
+        for badge in views {
+            text.append(TextForgeAttachment.view(badge, size: CGSize(width: 16, height: 20), font: font, alignment: .center))
+            text.append(NSAttributedString(string: "段落 abc שלום\n", attributes: [
+                .font: font, .shadow: shadow, TextForgeBackground.attributeName: background
+            ]))
+        }
+        let layout = TextForgeLayout(attributedText: text, size: CGSize(width: 160, height: 1000))
+        let label = TextForgeLabel(frame: CGRect(x: 0, y: 0, width: 160, height: layout.textBoundingSize.height))
+        label.textLayout = layout
+        scroll.addSubview(label)
+        scroll.contentSize = label.frame.size
+        label.layoutIfNeeded()
+        let initial = views.filter { $0.superview === label }
+        scroll.contentOffset.y = label.bounds.height - scroll.bounds.height
+        label.layoutIfNeeded()
+        if initial.isEmpty || views.last?.superview !== label || initial.first?.superview === label {
+            return ["viewport attachment mounting after scroll"]
+        }
+        scroll.contentOffset = .zero
+        label.layoutIfNeeded()
+        if initial.first?.superview !== label || views.last?.superview === label { return ["attachment remount after scrolling back"] }
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let renderer = UIGraphicsImageRenderer(size: label.bounds.size, format: format)
+        let slice = CGRect(x: 22, y: 112, width: 74, height: 21)
+        let full = renderer.image { _ in label.drawText(in: label.bounds) }
+        let partial = renderer.image { ctx in ctx.cgContext.clip(to: slice); label.drawText(in: slice) }
+        // 相同颜色空间重新取样，排除底层 CGImage 行对齐差异。
+        let patch = UIGraphicsImageRenderer(size: slice.size, format: format)
+        let a = patch.pngData { _ in full.draw(at: CGPoint(x: -slice.minX, y: -slice.minY)) }
+        let b = patch.pngData { _ in partial.draw(at: CGPoint(x: -slice.minX, y: -slice.minY)) }
+        return a == b ? [] : ["clipped text pixels differ from full draw"]
     }
 
     /// 验证长按拷贝及剪贴板文本，同时覆盖未开启、系统拒绝第一响应者和成功呈现三种路径。
@@ -1398,4 +1564,12 @@ private final class ExamplePress: UILongPressGestureRecognizer {
 /// 模拟系统拒绝切换第一响应者时的标签。
 private final class RejectingCopyLabel: TextForgeLabel {
     override func becomeFirstResponder() -> Bool { false }
+}
+
+private final class AdaptiveAttachment: NSTextAttachment {
+    /// 模拟宿主按主题切换图形规格，验证库使用当前请求环境测量自定义附件。
+    override func attachmentBounds(for textContainer: NSTextContainer?, proposedLineFragment lineFrag: CGRect,
+                                   glyphPosition position: CGPoint, characterIndex charIndex: Int) -> CGRect {
+        CGRect(x: 0, y: 0, width: 20, height: UITraitCollection.current.userInterfaceStyle == .dark ? 58 : 18)
+    }
 }

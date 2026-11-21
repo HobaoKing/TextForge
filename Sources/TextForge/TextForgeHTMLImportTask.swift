@@ -4,6 +4,24 @@ import UIKit
 public typealias TextForgeHTMLImageLoader = @MainActor (URL, @escaping @Sendable (UIImage?) -> Void) -> (() -> Void)?
 public typealias TextForgeHTMLCompletion = @MainActor @Sendable (NSAttributedString?, Error?) -> Void
 
+/// 一批图片更新。位置为当前快照中的 UTF-16 附件下标，每个位置长度为 1。
+@objc(TextForgeHTMLImageUpdate)
+public final class TextForgeHTMLImageUpdate: NSObject {
+    @objc public let attributedText: NSAttributedString
+    @objc public let changedIndexes: IndexSet
+    @objc public let didChangeSize: Bool
+    @objc public let isInitial: Bool
+    @objc public let isFinal: Bool
+
+    init(text: NSAttributedString, indexes: IndexSet, resized: Bool, initial: Bool, final: Bool) {
+        attributedText = text
+        changedIndexes = indexes
+        didChangeSize = resized
+        isInitial = initial
+        isFinal = final
+    }
+}
+
 /// 一次 HTML 导入及其图片请求。取消会撤销尚未完成的宿主请求，之后不再投递快照或完成回调。
 @MainActor
 @objc(TextForgeHTMLImportTask)
@@ -15,6 +33,10 @@ public final class TextForgeHTMLImportTask: NSObject {
     private var text: NSMutableAttributedString?
     private var positions: [URL: [(NSRange, TextForgeHTMLImageSlot)]] = [:]
     private var update: (@MainActor (NSAttributedString) -> Void)?
+    private var imageUpdate: (@MainActor (TextForgeHTMLImageUpdate) -> Void)?
+    private var changedIndexes = IndexSet()
+    private var didChangeSize = false
+    private var flushScheduled = false
     private var completion: TextForgeHTMLCompletion?
     private let maximumWidth: CGFloat
     private let placeholderSize: CGSize
@@ -22,13 +44,14 @@ public final class TextForgeHTMLImportTask: NSObject {
 
     /// 在调用入口快照尺寸、样式和回调，调用端之后可继续修改和复用阅读配置。
     init(style: TextForgeHTMLReadingStyle, imageLoader: TextForgeHTMLImageLoader?, update: (@MainActor (NSAttributedString) -> Void)?,
-         completion: @escaping TextForgeHTMLCompletion) {
+         imageUpdate: (@MainActor (TextForgeHTMLImageUpdate) -> Void)?, completion: @escaping TextForgeHTMLCompletion) {
         maximumWidth = style.maximumImageWidth.isFinite ? max(0, style.maximumImageWidth) : 0
         let size = style.placeholderSize
         placeholderSize = size.width.isFinite && size.height.isFinite && size.width > 0 && size.height > 0
             ? size : CGSize(width: 24, height: 24)
         placeholder = style.placeholderImage ?? Self.transparentPixel
         self.imageLoader = imageLoader
+        self.imageUpdate = imageUpdate
         self.update = update
         self.completion = completion
     }
@@ -57,12 +80,14 @@ public final class TextForgeHTMLImportTask: NSObject {
     }
 
     /// 只交付一次最终结果，并释放闭包与排版内容。取消后屏蔽所有交付。
-    func finish(_ error: Error?) {
+    func finish(_ error: Error?, snapshot: NSAttributedString? = nil) {
         let callback = completion
-        let result = isCancelled ? nil : text.map { NSAttributedString(attributedString: $0) }
+        let result = isCancelled ? nil : snapshot ?? text.map { NSAttributedString(attributedString: $0) }
         completion = nil
         imageLoader = nil
         update = nil
+        imageUpdate = nil
+        changedIndexes.removeAll()
         text = nil
         positions.removeAll()
         cancellations.removeAll()
@@ -100,7 +125,11 @@ public final class TextForgeHTMLImportTask: NSObject {
         let loader = imageLoader
         imageLoader = nil
         guard let loader, !positions.isEmpty else { finish(nil); return }
-        update?(NSAttributedString(attributedString: body))
+        if update != nil || imageUpdate != nil {
+            let initial = NSAttributedString(attributedString: body)
+            update?(initial)
+            imageUpdate?(TextForgeHTMLImageUpdate(text: initial, indexes: [], resized: false, initial: true, final: false))
+        }
         for url in Array(positions.keys) {
             guard !isCancelled else { return }
             let cancel = loader(url) { image in
@@ -120,16 +149,38 @@ public final class TextForgeHTMLImportTask: NSObject {
         return attachment
     }
 
-    /// 图片失败保留占位；忽略取消、迟到和重复回调。最后一张返回后交付最终快照。
+    /// 已完成、重复或取消后的 URL 不再交付。成功时记录各位置的真实尺寸变化，失败保留原占位。
     private func receive(_ image: UIImage?, for url: URL) {
         guard let matches = positions.removeValue(forKey: url), let text else { return }
         cancellations[url] = nil
         if let image, image.size.width > 0, image.size.height > 0 {
             for (range, slot) in matches {
-                text.addAttribute(.attachment, value: attachment(image, slot: slot, intrinsic: image.size), range: range)
+                let previous = text.attribute(.attachment, at: range.location, effectiveRange: nil) as? NSTextAttachment
+                let replacement = attachment(image, slot: slot, intrinsic: image.size)
+                didChangeSize = didChangeSize || previous?.bounds.size != replacement.bounds.size
+                changedIndexes.insert(integersIn: range.location..<NSMaxRange(range))
+                text.addAttribute(.attachment, value: replacement, range: range)
             }
         }
-        if positions.isEmpty { finish(nil) }
-        else if image != nil { update?(NSAttributedString(attributedString: text)) }
+        if positions.isEmpty {
+            flushImages(final: true)
+        } else if !flushScheduled, !changedIndexes.isEmpty, update != nil || imageUpdate != nil {
+            flushScheduled = true
+            DispatchQueue.main.async { [weak self] in self?.flushImages(final: false) }
+        }
+    }
+
+    /// 同一主队列批次只复制一次文本。末批与 completion 共享快照，回调内取消会屏蔽后续交付。
+    private func flushImages(final: Bool) {
+        flushScheduled = false
+        guard let text, final || !changedIndexes.isEmpty else { return }
+        let snapshot = NSAttributedString(attributedString: text)
+        let indexes = changedIndexes
+        let resized = didChangeSize
+        changedIndexes.removeAll()
+        didChangeSize = false
+        if !final { update?(snapshot) }
+        imageUpdate?(TextForgeHTMLImageUpdate(text: snapshot, indexes: indexes, resized: resized, initial: false, final: final))
+        if final { finish(nil, snapshot: snapshot) }
     }
 }

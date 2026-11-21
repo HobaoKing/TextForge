@@ -153,10 +153,11 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         return resigned
     }
 
-    /// 离开窗口时释放手柄，重用同一个标签也不会沿用上一次选择。
+    /// 离开窗口时释放手柄和滚动观察；进入新层级后按新视口挂载附件。
     open override func didMoveToWindow() {
         super.didMoveToWindow()
-        if window == nil { clearSelection() }
+        if window == nil { clearSelection(); stopObservingScrolls() }
+        setNeedsLayout()
     }
 
     /// 拷贝菜单出现和消失时在主线程回调，参数为是否可见。可用来切换选中底色。
@@ -174,6 +175,8 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
     private var pendingLayout: TextForgeLayoutTask?
     private var pendingLayoutWidth: CGFloat?
     private var requiresAttributedLayout = false
+    private var scrollObservations: [NSKeyValueObservation] = []
+    private var observedScrolls: [ObjectIdentifier] = []
     private var attachedViews: [UIView] = []
     private var activeHighlight: (highlight: TextForgeHighlight, range: NSRange, inToken: Bool)?
     private weak var actionTapGesture: UITapGestureRecognizer?
@@ -388,18 +391,25 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         }
     }
 
-    /// 外观变化后丢弃派生布局，后台任务交付的旧配色也会在此标签刷新时重建。
+    /// 标签环境变化时刷新像素；字号、方向或字重环境变化时清空派生几何并通知宿主重新测高。
     open override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
         super.traitCollectionDidChange(previousTraitCollection)
-        if traitCollection.hasDifferentColorAppearance(comparedTo: previousTraitCollection) {
-            cachedLayouts.removeAll(keepingCapacity: true)
-            setNeedsDisplay()
+        guard traitCollection != previousTraitCollection else { return }
+        cachedLayouts.removeAll(keepingCapacity: true)
+        let previousLayoutMatched = previousTraitCollection.map { textLayout?.matchesAppearance($0) ?? true } ?? true
+        if !previousLayoutMatched || textLayout?.matchesAppearance(traitCollection) == false ||
+            traitCollection.preferredContentSizeCategory != previousTraitCollection?.preferredContentSizeCategory ||
+            traitCollection.layoutDirection != previousTraitCollection?.layoutDirection ||
+            traitCollection.legibilityWeight != previousTraitCollection?.legibilityWeight {
+            invalidateIntrinsicContentSize()
+            setNeedsLayout()
         }
+        setNeedsDisplay()
     }
 
     /// 为富文本使用当前可用宽度测量，普通标签保持系统固有尺寸算法。
     open override var intrinsicContentSize: CGSize {
-        if let explicitTextLayout { return measuredSize(of: explicitTextLayout) }
+        if let explicitTextLayout { return measuredSize(of: layout(for: explicitTextLayout.size)) }
         guard usesCustomLayout else { return super.intrinsicContentSize }
         let width = preferredMaxLayoutWidth > 0 ? preferredMaxLayoutWidth : (
             numberOfLines != 1 && bounds.width > 0 ? bounds.width : .greatestFiniteMagnitude
@@ -457,7 +467,8 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
                 activeInToken: activeHighlight?.inToken ?? false,
                 activeBackground: activeHighlight?.highlight.pressedBackground,
                 activeForeground: activeHighlight?.highlight.highlightedTextColor,
-                highlightedColor: isHighlighted ? highlightedTextColor : nil
+                highlightedColor: isHighlighted ? highlightedTextColor : nil,
+                clip: rect.intersection(UIGraphicsGetCurrentContext()?.boundingBoxOfClipPath ?? rect), traits: traitCollection
             )
             return
         }
@@ -466,7 +477,36 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         super.drawText(in: contentRect)
     }
 
-    /// 可见附件随当前布局挂载，重用标签时清除已经离开布局的视图。
+    /// 退出窗口或换文时解除观察，避免滚动视图离开后继续驱动旧标签。
+    private func stopObservingScrolls() {
+        scrollObservations.removeAll()
+        observedScrolls.removeAll()
+    }
+
+    /// 求各级裁剪视图的交集；滚动不一定触发子视图布局，观察滚动容器的可见边界以驱动附件进出。
+    private func attachmentViewport() -> CGRect {
+        var visible = bounds
+        var ancestor = superview
+        var scrolls: [UIScrollView] = []
+        while let view = ancestor {
+            if view.clipsToBounds {
+                visible = visible.intersection(convert(view.bounds, from: view))
+                if let scroll = view as? UIScrollView { scrolls.append(scroll) }
+            }
+            ancestor = view.superview
+        }
+        let ids = scrolls.map(ObjectIdentifier.init)
+        if ids != observedScrolls {
+            observedScrolls = ids
+            scrollObservations = scrolls.flatMap { scroll in
+                [scroll.observe(\.contentOffset) { [weak self] _, _ in self?.setNeedsLayout() },
+                 scroll.observe(\.bounds) { [weak self] _, _ in self?.setNeedsLayout() }]
+            }
+        }
+        return visible
+    }
+
+    /// 按标签绘制原点和滚动视口挂载相交附件，回收离屏视图并保持选区位于附件上方。
     open override func layoutSubviews() {
         super.layoutSubviews()
         guard usesCustomLayout, !bounds.isEmpty else {
@@ -475,7 +515,15 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         }
         let result = layout(for: bounds.size)
         let origin = drawingOrigin(for: result)
-        let attachments = result.viewAttachments()
+        let frames = result.attachmentFrames
+        let attachments: [(UIView, CGRect)]
+        if frames.isEmpty {
+            stopObservingScrolls()
+            attachments = []
+        } else {
+            let viewport = attachmentViewport().offsetBy(dx: -origin.x, dy: -origin.y)
+            attachments = frames.filter { $0.1.intersects(viewport) }
+        }
         removeAttachments(except: Set(attachments.map { ObjectIdentifier($0.0) }))
         for (view, frame) in attachments where view !== self && !isDescendant(of: view) {
             if view.superview !== self { addSubview(view) }
@@ -565,16 +613,16 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
     private func layout(for size: CGSize, maximumNumberOfRows: Int? = nil) -> TextForgeLayout {
         if let textLayout = explicitTextLayout {
             if textLayout.matchesAppearance(traitCollection) { return textLayout }
-            if let rebuilt = cachedLayouts.first { return rebuilt }
-            let rebuilt = TextForgeLayout(container: textLayout.container, attributedText: textLayout.attributedText)
+            if let rebuilt = cachedLayouts.first, rebuilt.matchesAppearance(traitCollection) { return rebuilt }
+            let rebuilt = TextForgeLayout(container: textLayout.container, attributedText: textLayout.attributedText,
+                                         fallbackTraits: traitCollection)
             cachedLayouts = [rebuilt]
             return rebuilt
         }
         let rows = max(0, maximumNumberOfRows ?? numberOfLines)
         let fits: (TextForgeLayout) -> Bool = { result in
             result.size.width == size.width && result.maximumNumberOfRows == rows
-                && (result.size.height == size.height
-                    || (result.size.height > size.height && result.textBoundingSize.height <= size.height))
+                && result.fitsHeight(size.height)
         }
         if let preparedTextLayout, fits(preparedTextLayout), preparedTextLayout.matchesAppearance(traitCollection) {
             return preparedTextLayout
@@ -603,16 +651,15 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
     private func styledText(_ original: NSAttributedString) -> NSAttributedString {
         let prepared = NSMutableAttributedString(attributedString: original)
         let range = NSRange(location: 0, length: original.length)
-        original.enumerateAttributes(in: range) { attributes, segment, _ in
-            if attributes[.font] == nil, let font { prepared.addAttribute(.font, value: font, range: segment) }
-            if attributes[.foregroundColor] == nil, let textColor {
-                prepared.addAttribute(.foregroundColor, value: textColor, range: segment)
-            }
-            if attributes[.paragraphStyle] == nil {
-                let style = NSMutableParagraphStyle()
-                style.alignment = textAlignment
-                if lineBreakMode == .byCharWrapping { style.lineBreakMode = .byCharWrapping }
-                prepared.addAttribute(.paragraphStyle, value: style, range: segment)
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = textAlignment
+        if lineBreakMode == .byCharWrapping { paragraph.lineBreakMode = .byCharWrapping }
+        let defaults: [(NSAttributedString.Key, Any?)] = [(.font, font), (.foregroundColor, textColor), (.paragraphStyle, paragraph)]
+        // 按单个属性的连续区间补值；仅颜色频繁变化的长段落只需设置一次段落样式。
+        for (key, value) in defaults {
+            guard let value else { continue }
+            original.enumerateAttribute(key, in: range) { existing, part, _ in
+                if existing == nil { prepared.addAttribute(key, value: value, range: part) }
             }
         }
         return TextForgeTypography.styledText(
@@ -833,6 +880,7 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         preparedTextLayout = nil
         cachedLayouts.removeAll(keepingCapacity: true)
         clearHighlight()
+        stopObservingScrolls()
         removeAttachments(except: [])
         invalidateIntrinsicContentSize()
         setNeedsLayout()

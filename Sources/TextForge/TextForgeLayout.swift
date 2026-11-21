@@ -19,6 +19,8 @@ public final class TextForgeLayout: NSObject {
     private let engine: TextForgeLayoutEngine
     private let preparedImage: UIImage?
     private let preparedTraits: UITraitCollection?
+    let paint: TextForgePaintPalette?
+    var bitmapCost: Int { preparedImage?.cgImage.map { $0.bytesPerRow * $0.height } ?? 0 }
     private var cachedLines: [TextForgeLine]?
 
     /// 按给定边界同步排版，行数为 0 表示不限行。返回的尺寸包含内边距。
@@ -42,21 +44,32 @@ public final class TextForgeLayout: NSObject {
 
     /// 按容器配置同步排版。容器会被复制，之后修改不影响本布局。
     @objc public convenience init(container: TextForgeContainer, attributedText: NSAttributedString) {
+        self.init(container: container, attributedText: attributedText, fallbackTraits: nil)
+    }
+
+    /// 无法分离的自定义属性必须沿用宿主的目标环境；记录它以识别依赖外观的自定义附件尺寸。
+    convenience init(container: TextForgeContainer, attributedText: NSAttributedString, fallbackTraits: UITraitCollection?) {
         let container = container.copy() as? TextForgeContainer ?? container
-        let engine = TextForgeLayoutEngine(
-            text: Self.renderingText(attributedText, container: container),
-            truncationToken: container.truncationToken.map {
-                Self.renderingText($0, container: container)
-            },
-            parameters: Self.parameters(for: container)
-        )
-        self.init(attributedText: attributedText, container: container, engine: engine, preparedImage: nil, preparedTraits: nil)
+        let build = {
+            TextForgeLayoutEngine(
+                text: Self.renderingText(attributedText, container: container),
+                truncationToken: container.truncationToken.map { Self.renderingText($0, container: container) },
+                parameters: Self.parameters(for: container)
+            )
+        }
+        let engine: TextForgeLayoutEngine
+        if let fallbackTraits {
+            var target: TextForgeLayoutEngine!
+            fallbackTraits.performAsCurrent { target = build() }
+            engine = target
+        } else { engine = build() }
+        self.init(attributedText: attributedText, container: container, engine: engine, preparedImage: nil, preparedTraits: fallbackTraits)
     }
 
     /// 接管已排好的引擎，关联原始交互文本；可选位图仅用于常态绘制。container 须为本布局独占的副本。
     init(
         attributedText: NSAttributedString, container: TextForgeContainer,
-        engine: TextForgeLayoutEngine, preparedImage: UIImage?, preparedTraits: UITraitCollection?
+        engine: TextForgeLayoutEngine, preparedImage: UIImage?, preparedTraits: UITraitCollection?, paint: TextForgePaintPalette? = nil
     ) {
         self.attributedText = NSAttributedString(attributedString: attributedText)
         self.container = container
@@ -67,6 +80,7 @@ public final class TextForgeLayout: NSObject {
         self.engine = engine
         self.preparedImage = preparedImage
         self.preparedTraits = preparedTraits
+        self.paint = paint
         textBoundingSize = engine.textBoundingSize
         super.init()
     }
@@ -147,28 +161,47 @@ public final class TextForgeLayout: NSObject {
         return outer(engine.boundingRect(for: range))
     }
 
-    /// 后台结果中的动态色已解析，换外观时需要从原始富文本重新生成。
+    /// 高度放宽时，只有全文或指定行数已完整放下才能沿用。裁切、缩字和排除路径采用原约束重新测量。
+    func fitsHeight(_ height: CGFloat) -> Bool {
+        if size.height == height { return true }
+        guard textBoundingSize.height <= min(height, size.height), size.height > insets.top + insets.bottom else { return false }
+        if size.height > height { return true }
+        guard container.exclusionPaths.isEmpty, container.minimumScaleFactor >= 1 else { return false }
+        return !isTruncated || (maximumNumberOfRows > 0 && rowCount == maximumNumberOfRows)
+    }
+
+    /// 只有影响排版的环境变化才放弃几何结果；颜色在绘制时按目标标签解析。
     func matchesAppearance(_ traits: UITraitCollection) -> Bool {
         guard let preparedTraits else { return true }
-        return !traits.hasDifferentColorAppearance(comparedTo: preparedTraits)
+        if paint == nil || paint?.requiresExactGeometry == true { return preparedTraits == traits }
+        return traits.preferredContentSizeCategory == preparedTraits.preferredContentSizeCategory
+            && traits.layoutDirection == preparedTraits.layoutDirection
+            && traits.legibilityWeight == preparedTraits.legibilityWeight
     }
 
     /// 常态位图按裁剪原点贴回；整标签选中或局部按压时用同一布局绘制状态色。
     /// activeRange 为原文或截断标记内部的范围，由 activeInToken 区分。
     func draw(
         at origin: CGPoint, activeRange: NSRange?, activeInToken: Bool,
-        activeBackground: TextForgeBackground?, activeForeground: UIColor?, highlightedColor: UIColor?
+        activeBackground: TextForgeBackground?, activeForeground: UIColor?, highlightedColor: UIColor?,
+        clip: CGRect, traits: UITraitCollection
     ) {
-        if activeRange == nil, highlightedColor == nil, let preparedImage {
+        let samePaint = paint?.matches(traits) ?? true
+        if activeRange == nil, highlightedColor == nil, let preparedImage, samePaint,
+           preparedTraits?.displayScale == traits.displayScale,
+           paint?.hasImages != true || preparedTraits == traits {
             preparedImage.draw(at: CGPoint(x: origin.x + engine.rasterOrigin.x, y: origin.y + engine.rasterOrigin.y))
             return
         }
-        engine.draw(at: origin, active: activeRange.map {
-            TextForgeActiveStyle(
-                range: engine.storageRange(for: $0, inToken: activeInToken),
-                background: activeBackground, foreground: activeForeground
-            )
-        }, highlightedColor: highlightedColor)
+        traits.performAsCurrent {
+            if let paint { engine.applyPaint(paint, traits: traits) }
+            engine.draw(at: origin, active: activeRange.map {
+                TextForgeActiveStyle(
+                    range: engine.storageRange(for: $0, inToken: activeInToken),
+                    background: activeBackground, foreground: activeForeground
+                )
+            }, highlightedColor: highlightedColor, clip: clip.offsetBy(dx: -origin.x, dy: -origin.y))
+        }
     }
 
     /// 命中的字符下标及其是否位于截断标记内。
@@ -197,8 +230,11 @@ public final class TextForgeLayout: NSObject {
         engine.firstVisibleCharacter(in: range, inToken: inToken)
     }
 
+    /// 每份布局最多查询一次附件基线；滚动只筛选这些已定位的视图。
+    private(set) lazy var attachmentFrames = viewAttachments()
+
     /// 将正文和截断标记的可见字形基线与原始 UIView 配对。标记下标先换算到排版串，只在主线程读取视图。
-    func viewAttachments() -> [(UIView, CGRect)] {
+    private func viewAttachments() -> [(UIView, CGRect)] {
         var scopes: [(text: NSAttributedString, range: NSRange, offset: Int)] = []
         if let range = engine.visibleCharacterRange { scopes.append((attributedText, range, 0)) }
         if let token = truncationToken, let tokenRange = engine.tokenRange {

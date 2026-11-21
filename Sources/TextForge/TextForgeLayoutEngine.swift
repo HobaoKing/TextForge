@@ -45,6 +45,7 @@ final class TextForgeLayoutEngine {
     /// 自定义截断标记在排版串中的范围。排版串为原文前缀加标记，nil 表示未使用自定义标记。
     let tokenRange: NSRange?
     private(set) var rasterOrigin: CGPoint = .zero
+    private lazy var inkBounds = measureInkBounds()
     private let sourceLength: Int
     /// 无界宽度下文字被排到远处时的横向平移量。对外的坐标都已减去它，传入的点会加回。
     private let shift: CGFloat
@@ -202,8 +203,65 @@ final class TextForgeLayoutEngine {
         return fitting
     }
 
+    private var currentPaintTraits: UITraitCollection?
+
+    /// 在主线程按标记替换已排入容器的绘制属性。共享布局在不同外观之间轮转时也恢复各自配色。
+    @MainActor func applyPaint(_ paint: TextForgePaintPalette, traits: UITraitCollection) {
+        guard !paint.variants.isEmpty, currentPaintTraits != traits,
+              currentPaintTraits != nil || !paint.matches(traits) else { return }
+        currentPaintTraits = traits
+        let visible = manager.characterRange(forGlyphRange: glyphs, actualGlyphRange: nil)
+        let values = paint.variants.map { $0.resolve(traits) }
+        storage.beginEditing()
+        for key in Set(paint.variants.map(\.key)) {
+            storage.enumerateAttribute(TextForgePaintPalette.marker(for: key), in: visible) { value, range, _ in
+                if let index = value as? Int, values.indices.contains(index), paint.variants[index].key == key {
+                    self.storage.addAttribute(key, value: values[index], range: range)
+                }
+            }
+        }
+        storage.endEditing()
+    }
+
+    /// 后台提前计算局部绘制所需的外伸量，让从不预绘位图的长文也能直接绘制首屏。
+    func prepareDrawingBounds() { if glyphs.length > 0 { _ = inkBounds } }
+
+    /// 合并字形、斜体、偏移、阴影与圆角背景的墨迹范围；在排版所在线程计算，首次局部绘制直接查询。
+    private func measureInkBounds() -> CGRect {
+        let visible = manager.characterRange(forGlyphRange: glyphs, actualGlyphRange: nil)
+        var ink = usedRect.union(manager.boundingRect(forGlyphRange: glyphs, in: container).offsetBy(dx: -shift, dy: 0))
+        storage.enumerateAttributes(in: visible) { attributes, _, _ in
+            let font = (attributes[.font] as? UIFont)?.pointSize ?? 12
+            let stroke = abs((attributes[.strokeWidth] as? NSNumber)?.doubleValue ?? 0) * font / 100
+            let overhang = font + stroke
+            let baseline = abs((attributes[.baselineOffset] as? NSNumber)?.doubleValue ?? 0)
+            var area = self.usedRect.insetBy(dx: -overhang, dy: -overhang - baseline)
+            if let shadow = attributes[.shadow] as? NSShadow {
+                let blur = 3 * max(0, shadow.shadowBlurRadius)
+                area = area.union(area.offsetBy(dx: shadow.shadowOffset.width, dy: shadow.shadowOffset.height)
+                    .insetBy(dx: -blur, dy: -blur))
+            }
+            if let background = attributes[TextForgeBackground.attributeName] as? TextForgeBackground {
+                area = area.union(self.usedRect.inset(by: background.insets))
+            }
+            ink = ink.union(area)
+        }
+        return ink
+    }
+
+    /// 绘制只取与脏区及其外伸墨迹相交的完整行，避免切断同一行的双向文字、圆角或截断标记。
+    private func drawingGlyphs(in clip: CGRect?, activeBackground: TextForgeBackground?) -> NSRange {
+        guard let clip, !clip.contains(usedRect) else { return glyphs }
+        guard !clip.isEmpty else { return NSRange() }
+        let insets = activeBackground?.insets ?? .zero
+        let margin = max(usedRect.minY - inkBounds.minY, inkBounds.maxY - usedRect.maxY) + max(0, -insets.top, -insets.bottom)
+        let band = CGRect(x: 0, y: clip.minY - margin, width: container.size.width, height: clip.height + 2 * margin)
+        return NSIntersectionRange(glyphs, manager.glyphRange(forBoundingRectWithoutAdditionalLayout: band, in: container))
+    }
+
     /// 依次绘制系统背景、圆角背景装饰、按压背景和字形。选中色作用于可见正文和标记，局部按压色优先，绘制后恢复原色。
-    func draw(at origin: CGPoint, active: TextForgeActiveStyle?, highlightedColor: UIColor? = nil) {
+    func draw(at origin: CGPoint, active: TextForgeActiveStyle?, highlightedColor: UIColor? = nil, clip: CGRect? = nil) {
+        let glyphs = drawingGlyphs(in: clip, activeBackground: active?.background)
         guard glyphs.length > 0 else { return }
         let glyphOrigin = CGPoint(x: origin.x - shift, y: origin.y)
         manager.drawBackground(forGlyphRange: glyphs, at: glyphOrigin)
@@ -212,7 +270,7 @@ final class TextForgeLayoutEngine {
             guard let background = value as? TextForgeBackground else { return }
             for rect in runRects(for: range) { background.draw(in: rect.offsetBy(dx: origin.x, dy: origin.y)) }
         }
-        let activeRange = active.map { NSIntersectionRange($0.range, NSRange(location: 0, length: storage.length)) }
+        let activeRange = active.map { NSIntersectionRange($0.range, visible) }
         if let active, let activeRange, let background = active.background {
             for rect in runRects(for: activeRange) { background.draw(in: rect.offsetBy(dx: origin.x, dy: origin.y)) }
         }
@@ -433,26 +491,8 @@ final class TextForgeLayoutEngine {
     /// 按内容尺寸生成透明位图，像素超出单条文本预算时保留排版结果供同步绘制。
     func rasterize(scale: CGFloat, traits: UITraitCollection, viewport: CGSize, insets: UIEdgeInsets) -> UIImage? {
         guard glyphs.length > 0, scale.isFinite, scale > 0 else { return nil }
-        // TextKit 的行框可能不包含斜体字形外伸、描边、阴影和外扩的圆角背景。
-        let visible = manager.characterRange(forGlyphRange: glyphs, actualGlyphRange: nil)
-        var ink = usedRect.union(manager.boundingRect(forGlyphRange: glyphs, in: container).offsetBy(dx: -shift, dy: 0))
-        storage.enumerateAttributes(in: visible) { attributes, _, _ in
-            let font = (attributes[.font] as? UIFont)?.pointSize ?? 12
-            let stroke = abs((attributes[.strokeWidth] as? NSNumber)?.doubleValue ?? 0) * font / 100
-            let overhang = font + stroke
-            var area = usedRect.insetBy(dx: -overhang, dy: -overhang)
-            if let shadow = attributes[.shadow] as? NSShadow {
-                let blur = 3 * max(0, shadow.shadowBlurRadius)
-                area = area.union(area.offsetBy(dx: shadow.shadowOffset.width, dy: shadow.shadowOffset.height)
-                    .insetBy(dx: -blur, dy: -blur))
-            }
-            if let background = attributes[TextForgeBackground.attributeName] as? TextForgeBackground {
-                area = area.union(usedRect.inset(by: background.insets))
-            }
-            ink = ink.union(area)
-        }
         let viewportRect = CGRect(origin: CGPoint(x: -insets.left, y: -insets.top), size: viewport)
-        let clip = ink.intersection(viewportRect)
+        let clip = inkBounds.intersection(viewportRect)
         guard !clip.isNull, !clip.isEmpty else { return nil }
         let x = floor(clip.minX * scale) / scale, y = floor(clip.minY * scale) / scale
         let size = CGSize(width: ceil(clip.maxX * scale) / scale - x, height: ceil(clip.maxY * scale) / scale - y)
@@ -637,6 +677,10 @@ final class TextForgeLayoutEngine {
             token.enumerateAttributes(in: NSRange(location: 0, length: token.length)) { existing, range, _ in
                 for key in [NSAttributedString.Key.font, .foregroundColor, .paragraphStyle] where existing[key] == nil {
                     if let value = attributes[key] { result.addAttribute(key, value: value, range: range) }
+                    if key == .foregroundColor {
+                        let marker = TextForgePaintPalette.marker(for: key)
+                        if let index = attributes[marker] { result.addAttribute(marker, value: index, range: range) }
+                    }
                 }
             }
             return result
