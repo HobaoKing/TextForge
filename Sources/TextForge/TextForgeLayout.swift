@@ -47,15 +47,80 @@ public final class TextForgeLayout: NSObject {
         self.init(container: container, attributedText: attributedText, fallbackTraits: nil)
     }
 
-    /// 无法分离的自定义属性必须沿用宿主的目标环境；记录它以识别依赖外观的自定义附件尺寸。
-    convenience init(container: TextForgeContainer, attributedText: NSAttributedString, fallbackTraits: UITraitCollection?) {
+    /// 可变附件被原地更改后，旧富文本与新富文本可能仍指向同一对象。排版时记录影响字形的版本。
+    fileprivate struct AttachmentCheckpoint {
+        let index: Int
+        let attachment: NSTextAttachment
+        let bounds: CGRect
+        let image: UIImage?
+
+        /// 自定义排版或文件附件无法只由公开尺寸判定，保守地从该段起重排。
+        var needsLayout: Bool {
+            if attachment is TextForgeViewAttachment { return attachment.bounds != bounds }
+            return type(of: attachment) != NSTextAttachment.self || image == nil
+                || attachment.bounds != bounds || attachment.image !== image
+        }
+    }
+    private var attachmentCheckpoints: [AttachmentCheckpoint] = []
+
+    /// 只为标签私有的不限行布局留存附件度量，列表共享布局和后台交付不增加主线程扫描。
+    func captureAttachmentMetrics() {
+        attributedText.enumerateAttribute(.attachment, in: NSRange(location: 0, length: attributedText.length)) { value, range, _ in
+            if let attachment = value as? NSTextAttachment {
+                let image = type(of: attachment) == NSTextAttachment.self ? attachment.image : nil
+                attachmentCheckpoints.append(AttachmentCheckpoint(index: range.location, attachment: attachment,
+                                                                  bounds: attachment.bounds, image: image))
+            }
+        }
+    }
+
+    /// 标签换文时暂存排版栈；只有旧布局真正释放后才可独占修改，外部保留的公开快照继续独立可读。
+    @MainActor final class ParagraphCandidate {
+        weak var owner: TextForgeLayout?
+        let text: NSAttributedString
+        let box: TextForgeContainer
+        fileprivate let engine: TextForgeLayoutEngine
+        fileprivate let attachments: [AttachmentCheckpoint]
+
+        /// 截断或变换过的存储与原文范围不同，仅接管普通、不限行的同步正文。
+        init?(_ layout: TextForgeLayout) {
+            guard layout.preparedTraits == nil, layout.maximumNumberOfRows == 0, !layout.isTruncated,
+                  layout.container.minimumScaleFactor == 1, layout.container.exclusionPaths.isEmpty,
+                  layout.container.truncationToken == nil,
+                  TextForgeLayoutEngine.hasStandardLineMetrics(layout.attributedText,
+                      in: NSRange(location: 0, length: layout.attributedText.length)) else { return nil }
+            owner = layout
+            text = layout.attributedText
+            box = layout.container
+            engine = layout.engine
+            attachments = layout.attachmentCheckpoints
+        }
+    }
+
+    /// 自定义附件沿用宿主环境。标签独占的普通正文可接管旧栈，从变化段附近重排并重新计算度量。
+    convenience init(container: TextForgeContainer, attributedText: NSAttributedString, fallbackTraits: UITraitCollection?,
+                     reusing previous: ParagraphCandidate? = nil) {
         let container = container.copy() as? TextForgeContainer ?? container
+        // 只有普通不限行布局才可保留原 TextKit 栈。截断、缩字及排除路径仍由完整布局处理。
+        let rendered = Self.renderingText(attributedText, container: container)
+        let parameters = Self.parameters(for: container)
+        var prefix = 0
+        if let previous, previous.owner == nil, previous.box.size == container.size,
+           previous.box.insets == container.insets, previous.box.lineBreakMode == container.lineBreakMode,
+           container.maximumNumberOfRows == 0, container.truncationToken == nil, container.exclusionPaths.isEmpty,
+           container.minimumScaleFactor == 1,
+           TextForgeLayoutEngine.hasStandardLineMetrics(rendered, in: NSRange(location: 0, length: rendered.length)) {
+            let attachmentLimit = previous.attachments.first(where: \.needsLayout)?.index ?? attributedText.length
+            prefix = Self.unchangedParagraphPrefix(previous.text, attributedText, before: attachmentLimit)
+        }
+        let token = container.truncationToken.map { Self.renderingText($0, container: container) }
         let build = {
-            TextForgeLayoutEngine(
-                text: Self.renderingText(attributedText, container: container),
-                truncationToken: container.truncationToken.map { Self.renderingText($0, container: container) },
-                parameters: Self.parameters(for: container)
-            )
+            if prefix > rendered.length / 2, let previous {
+                let updated = TextForgeLayoutEngine(text: rendered, truncationToken: token, parameters: parameters,
+                                                    reusing: previous.engine, unchangedPrefix: prefix)
+                if updated.matchesFreshTail(rendered, from: prefix, parameters: parameters) { return updated }
+            }
+            return TextForgeLayoutEngine(text: rendered, truncationToken: token, parameters: parameters)
         }
         let engine: TextForgeLayoutEngine
         if let fallbackTraits {
@@ -66,12 +131,48 @@ public final class TextForgeLayout: NSObject {
         self.init(attributedText: attributedText, container: container, engine: engine, preparedImage: nil, preparedTraits: fallbackTraits)
     }
 
+    /// 逐段比较 UTF-16 原文和完整属性，将重排起点退到首个变化段的段首，保留 CRLF 和组合字符边界。
+    private static func unchangedParagraphPrefix(_ old: NSAttributedString, _ new: NSAttributedString, before changedIndex: Int) -> Int {
+        let original = old.string as NSString
+        let string = new.string as NSString
+        let limit = min(original.length, string.length, changedIndex)
+        var left = [unichar](repeating: 0, count: 512)
+        var right = left
+        var offset = 0
+        while offset < limit {
+            var lhs = NSRange(), rhs = NSRange()
+            let oldStyle = old.attributes(at: offset, effectiveRange: &lhs) as NSDictionary
+            let newStyle = new.attributes(at: offset, effectiveRange: &rhs)
+            guard oldStyle.isEqual(to: newStyle) else { break }
+            let end = min(limit, NSMaxRange(lhs), NSMaxRange(rhs))
+            // 逐块核对 UTF-16 码元，属性边界即使位于代理对中间也不会因桥接成替换字符而误判。
+            while offset < end {
+                let count = min(end - offset, left.count)
+                let range = NSRange(location: offset, length: count)
+                original.getCharacters(&left, range: range)
+                string.getCharacters(&right, range: range)
+                if memcmp(left, right, count * MemoryLayout<unichar>.stride) != 0 {
+                    for i in 0..<count where left[i] != right[i] { offset += i; break }
+                    break
+                }
+                offset += count
+            }
+            if offset != end { break }
+        }
+        guard offset > 0 else { return 0 }
+        // 前一字符可能是被追加 LF 的 CR，或与后续文字共同组成一个字素，连同该段重排。
+        let start = string.paragraphRange(for: NSRange(location: offset - 1, length: 0)).location
+        // TextKit 的首行基线会受上一段末行的字体和段后距影响，一起试排这个相邻段。
+        guard start > 0 else { return 0 }
+        return string.paragraphRange(for: NSRange(location: start - 1, length: 0)).location
+    }
+
     /// 接管已排好的引擎，关联原始交互文本；可选位图仅用于常态绘制。container 须为本布局独占的副本。
     init(
         attributedText: NSAttributedString, container: TextForgeContainer,
         engine: TextForgeLayoutEngine, preparedImage: UIImage?, preparedTraits: UITraitCollection?, paint: TextForgePaintPalette? = nil
     ) {
-        self.attributedText = NSAttributedString(attributedString: attributedText)
+        self.attributedText = attributedText.copy() as! NSAttributedString
         self.container = container
         size = container.size
         insets = container.insets
@@ -83,6 +184,16 @@ public final class TextForgeLayout: NSObject {
         self.paint = paint
         textBoundingSize = engine.textBoundingSize
         super.init()
+    }
+
+    /// 复用已验证的几何结果。只请求几何时按显示倍率筛选位图，显式预绘的调用仍按指定倍率取用。
+    func withSize(_ size: CGSize, displayScale: CGFloat? = nil) -> TextForgeLayout {
+        let useBitmap = displayScale == nil || preparedImage == nil || preparedImage?.scale == displayScale
+        if size == self.size && useBitmap { return self }
+        let box = container.copy() as! TextForgeContainer
+        box.size = size
+        return TextForgeLayout(attributedText: attributedText, container: box, engine: engine, preparedImage: useBitmap ? preparedImage : nil,
+                               preparedTraits: preparedTraits, paint: paint)
     }
 
     // MARK: 公开查询
@@ -170,6 +281,13 @@ public final class TextForgeLayout: NSObject {
         return !isTruncated || (maximumNumberOfRows > 0 && rowCount == maximumNumberOfRows)
     }
 
+    /// 复用到实际测量高度前核对末行完整片段，以及会改变 TextKit 高度行为的样式与截断配置。
+    func canReuseAtMeasuredHeight(_ height: CGFloat) -> Bool {
+        container.exclusionPaths.isEmpty && container.minimumScaleFactor >= 1 && fitsHeight(height)
+            && (!isTruncated || (container.truncationToken == nil && maximumNumberOfRows > 0 && rowCount == maximumNumberOfRows))
+            && engine.supportsMeasuredHeight(lineBreakMode: lineBreakMode, height: height - insets.top - insets.bottom)
+    }
+
     /// 只有影响排版的环境变化才放弃几何结果；颜色在绘制时按目标标签解析。
     func matchesAppearance(_ traits: UITraitCollection) -> Bool {
         guard let preparedTraits else { return true }
@@ -186,21 +304,21 @@ public final class TextForgeLayout: NSObject {
         activeBackground: TextForgeBackground?, activeForeground: UIColor?, highlightedColor: UIColor?,
         clip: CGRect, traits: UITraitCollection
     ) {
-        let samePaint = paint?.matches(traits) ?? true
-        if activeRange == nil, highlightedColor == nil, let preparedImage, samePaint,
+        let localClip = clip.offsetBy(dx: -origin.x, dy: -origin.y)
+        if activeRange == nil, highlightedColor == nil, let preparedImage, paint?.matches(traits) != false,
            preparedTraits?.displayScale == traits.displayScale,
            paint?.hasImages != true || preparedTraits == traits {
             preparedImage.draw(at: CGPoint(x: origin.x + engine.rasterOrigin.x, y: origin.y + engine.rasterOrigin.y))
             return
         }
         traits.performAsCurrent {
-            if let paint { engine.applyPaint(paint, traits: traits) }
+            if let paint { engine.applyPaint(paint, traits: traits, clip: localClip, activeBackground: activeBackground) }
             engine.draw(at: origin, active: activeRange.map {
                 TextForgeActiveStyle(
                     range: engine.storageRange(for: $0, inToken: activeInToken),
                     background: activeBackground, foreground: activeForeground
                 )
-            }, highlightedColor: highlightedColor, clip: clip.offsetBy(dx: -origin.x, dy: -origin.y))
+            }, highlightedColor: highlightedColor, clip: localClip)
         }
     }
 
@@ -230,31 +348,53 @@ public final class TextForgeLayout: NSObject {
         engine.firstVisibleCharacter(in: range, inToken: inToken)
     }
 
-    /// 每份布局最多查询一次附件基线；滚动只筛选这些已定位的视图。
-    private(set) lazy var attachmentFrames = viewAttachments()
+    private struct ViewSlot {
+        let index: Int
+        let attachment: TextForgeViewAttachment
+    }
 
-    /// 将正文和截断标记的可见字形基线与原始 UIView 配对。标记下标先换算到排版串，只在主线程读取视图。
-    private func viewAttachments() -> [(UIView, CGRect)] {
-        var scopes: [(text: NSAttributedString, range: NSRange, offset: Int)] = []
-        if let range = engine.visibleCharacterRange { scopes.append((attributedText, range, 0)) }
-        if let token = truncationToken, let tokenRange = engine.tokenRange {
-            scopes.append((token, NSRange(location: 0, length: token.length), tokenRange.location))
+    /// 仅索引视图在排版串中的位置。视图大于槽时扩大候选行，避免视图中心滚出后提早卸载。
+    private lazy var viewSlots: (entries: [ViewSlot], overhang: CGFloat) = {
+        var entries: [ViewSlot] = []
+        var overhang: CGFloat = 0
+        // 只索引可见正文或截断标记；offset 把标记内部下标换算到引擎存储。
+        func collect(_ text: NSAttributedString, range: NSRange, offset: Int) {
+            text.enumerateAttribute(.attachment, in: range) { value, segment, _ in
+                guard let attachment = value as? TextForgeViewAttachment else { return }
+                overhang = max(overhang, abs(attachment.bounds.midY) + max(attachment.viewSize.height, attachment.bounds.height))
+                entries.append(ViewSlot(index: segment.location + offset, attachment: attachment))
+            }
+        }
+        if let range = engine.visibleCharacterRange { collect(attributedText, range: range, offset: 0) }
+        if let token = truncationToken, let range = engine.tokenRange {
+            collect(token, range: NSRange(location: 0, length: min(token.length, range.length)), offset: range.location)
+        }
+        return (entries, overhang)
+    }()
+
+    var hasViewAttachments: Bool { !viewSlots.entries.isEmpty }
+
+    /// 二分找到落在可见行的第一个槽，只为候选附件读取实际字形基线，再按原生视图尺寸精确裁剪。
+    func viewAttachments(in viewport: CGRect) -> [(UIView, CGRect)] {
+        guard !viewport.isEmpty, let range = engine.characters(inVerticalBand: viewport.insetBy(dx: 0, dy: -viewSlots.overhang))
+        else { return [] }
+        let entries = viewSlots.entries
+        var lower = 0
+        var upper = entries.count
+        while lower < upper {
+            let mid = lower + (upper - lower) / 2
+            if entries[mid].index < range.location { lower = mid + 1 } else { upper = mid }
         }
         var result: [(UIView, CGRect)] = []
-        for scope in scopes {
-            scope.text.enumerateAttribute(.attachment, in: scope.range) { value, segment, _ in
-                guard let attachment = value as? TextForgeViewAttachment,
-                      let baseline = engine.baselineForAttachment(at: scope.offset + segment.location) else { return }
-                let bounds = attachment.bounds
-                let nativeSize = attachment.viewSize
-                let contentSize = nativeSize.width > 0 && nativeSize.height > 0 ? nativeSize : bounds.size
-                result.append((attachment.view, CGRect(
-                    x: baseline.x + bounds.midX - contentSize.width / 2,
-                    y: baseline.y - bounds.midY - contentSize.height / 2,
-                    width: contentSize.width,
-                    height: contentSize.height
-                )))
-            }
+        for slot in entries[lower...] {
+            if slot.index >= NSMaxRange(range) { break }
+            guard let baseline = engine.baselineForAttachment(at: slot.index) else { continue }
+            let bounds = slot.attachment.bounds
+            let native = slot.attachment.viewSize
+            let size = native.width > 0 && native.height > 0 ? native : bounds.size
+            let frame = CGRect(origin: CGPoint(x: baseline.x + bounds.midX - size.width / 2,
+                                               y: baseline.y - bounds.midY - size.height / 2), size: size)
+            if frame.intersects(viewport) { result.append((slot.attachment.view, frame)) }
         }
         return result
     }

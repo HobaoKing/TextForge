@@ -278,7 +278,10 @@
             [cache prepareItem:item size:size renderScale:2 traitCollection:traits completion:^(TextForgeLayout *layout) {
                 [cache prepareItem:item size:size renderScale:2 traitCollection:traits completion:^(TextForgeLayout *hit) {
                     NSValue *measured = [cache cachedSizeForItem:item size:size traitCollection:traits];
-                    if (hit != layout || !measured || !CGSizeEqualToSize(measured.CGSizeValue, layout.textBoundingSize)) {
+                    TextForgeLayout *geometry = [cache cachedLayoutForItem:item size:size traitCollection:traits];
+                    if (!geometry || !NSEqualRanges(geometry.visibleRange, layout.visibleRange) ||
+                        [cache cachedLayoutForItem:item size:size renderScale:2 traitCollection:traits] != layout ||
+                        hit != layout || !measured || !CGSizeEqualToSize(measured.CGSizeValue, layout.textBoundingSize)) {
                         [failures addObject:@"OC list layout or size cache miss"];
                     }
                     [self writeVerificationResult:failures];

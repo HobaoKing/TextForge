@@ -18,7 +18,7 @@ TextForge 支持 iOS 15+，使用 UIKit、Foundation、WebKit 和系统 libxml2�
 
 1. 打开消费项目的 workspace 或工程，在 Xcode 选择 **File → Add Package Dependency**。
 2. 输入仓库地址 `https://github.com/HobaoKing/TextForge.git`。
-3. 将依赖规则设为 **Exact Version**，输入 `1.0.4`。
+3. 将依赖规则设为 **Exact Version**，输入 `1.0.5`。
 4. 选择 `TextForge` 产品，添加到实际使用它的 iOS target。团队协作时提交工程配置和共享的 `Package.resolved`。
 
 ### `Package.swift`
@@ -34,7 +34,7 @@ let package = Package(
     platforms: [.iOS(.v15)],
     products: [.library(name: "MyFeature", targets: ["MyFeature"])],
     dependencies: [
-        .package(url: "https://github.com/HobaoKing/TextForge.git", exact: "1.0.4")
+        .package(url: "https://github.com/HobaoKing/TextForge.git", exact: "1.0.5")
     ],
     targets: [
         .target(name: "MyFeature", dependencies: [.product(name: "TextForge", package: "TextForge")])
@@ -311,13 +311,18 @@ let task = TextForgeLayout.prepare(
 
 每个列表持有一个 `TextForgeListLayoutCache`，每个内容版本持有一个 `TextForgeListItem`。预取、测高和 Cell 绑定传入同一项、外部尺寸和倍率。普通富文本在页面与 Cell 的字体、方向和字重环境相同时共享几何结果，绘制时采用标签当前的颜色。缓存命中也在主线程异步交付；Cell 换绑或复用时取消自己的任务，其他订阅者继续接收结果。宽度变化可复用已分离的文本样式。正文、字体、交互回调、附件或容器配置变化时创建新项。含同一个 `UIView` 的内容只能由一个标签同时挂载。
 
+同步读取接口自 1.0.5 起可用。
+
 ```swift
 let item = TextForgeListItem(attributedText: body, container: container) // 随模型保留
 // cache 随列表保留，task 随 Cell 保留。
 task?.cancel()
-label.textLayout = nil
-task = cache.prepare(item, size: rowSize, renderScale: traits.displayScale, traitCollection: traits) { layout in
-    label.textLayout = layout
+task = nil
+label.textLayout = cache.cachedLayout(for: item, size: rowSize, traitCollection: traits)
+if label.textLayout == nil {
+    task = cache.prepare(item, size: rowSize, renderScale: traits.displayScale, traitCollection: traits) { layout in
+        label.textLayout = layout
+    }
 }
 let measured = cache.cachedSize(for: item, size: rowSize, traitCollection: traits)?.cgSizeValue
 ```
@@ -325,11 +330,18 @@ let measured = cache.cachedSize(for: item, size: rowSize, traitCollection: trait
 ```objc
 TextForgeListItem *item = [[TextForgeListItem alloc] initWithAttributedText:body container:container];
 [self.task cancel];
-self.label.textLayout = nil;
-self.task = [cache prepareItem:item size:rowSize renderScale:traits.displayScale traitCollection:traits
-                    completion:^(TextForgeLayout *layout) { self.label.textLayout = layout; }];
+self.task = nil;
+self.label.textLayout = [cache cachedLayoutForItem:item size:rowSize traitCollection:traits];
+if (!self.label.textLayout) {
+    self.task = [cache prepareItem:item size:rowSize renderScale:traits.displayScale traitCollection:traits
+                        completion:^(TextForgeLayout *layout) { self.label.textLayout = layout; }];
+}
 NSValue *measured = [cache cachedSizeForItem:item size:rowSize traitCollection:traits];
 ```
+
+`cachedLayout` 只查询已完成的结果。同宽预取后，Cell 可以传回实际测得的高度；确认行数、截断及内边距允许时共享排版。需要特定预绘倍率时使用 Swift 的 `cachedLayout(for:size:renderScale:traitCollection:)` 或 ObjC 的 `cachedLayoutForItem:size:renderScale:traitCollection:`。未指定倍率时可直接显示先前仅测高的布局。同步查询返回 nil 时按示例异步准备。`prepare` 继续在主线程异步回调，复用和就地换绑都应取消上一笔请求。
+
+不限行的长文 Label 在相同排版约束下重新设置 `attributedText` 时，会比对正文和样式并校验变化段的行几何。通过校验时复用未变化段落的排版，含自定义行距或几何不一致时重新排版全文。尾部追加文字、HTML 图片批次替换都可直接通过 Swift 或 ObjC 的原属性赋值。宿主仍持有旧的 `displayedTextLayout` 时保留该快照并创建独立布局；固定截断、显式预排及复杂容器继续使用完整布局。
 
 缓存默认给预绘位图 16 MiB 的逻辑字节预算，最多保留 128 份布局和独立的 1024 条测量值；可在创建时调整渲染预算。超出预算的单条结果依然交付给当前订阅者，只缓存尺寸。长文局部重绘只处理与脏区及其外伸装饰相交的行，滚动容器中的交互附件按可见区挂载，附件对象的生命周期仍由富文本持有。
 

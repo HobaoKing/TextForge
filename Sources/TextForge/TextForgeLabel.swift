@@ -170,6 +170,7 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
 
     private var hasExplicitLinkStyle = false
     private var cachedLayouts: [TextForgeLayout] = []
+    private var previousLayouts: [TextForgeLayout.ParagraphCandidate] = []
     private var explicitTextLayout: TextForgeLayout?
     private var preparedTextLayout: TextForgeLayout?
     private var pendingLayout: TextForgeLayoutTask?
@@ -370,11 +371,16 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         return task
     }
 
-    /// 刷新 UILabel 的基础文本并清理衍生布局。内部交付不触发子类公开属性的赋值逻辑。
+    /// 换文时保留不限行正文的候选栈，下次同尺寸排版可复用未变化段；空文本和显式布局解除旧引用。
     private func storeAttributedText(_ text: NSAttributedString?) {
+        var candidates: [TextForgeLayout.ParagraphCandidate] = []
+        if text != nil, numberOfLines == 0, explicitTextLayout == nil {
+            candidates = cachedLayouts.isEmpty ? previousLayouts : cachedLayouts.compactMap(TextForgeLayout.ParagraphCandidate.init)
+        }
         preparedTextLayout = nil
         super.attributedText = text
         refreshAttributeUsage()
+        if usesCustomLayout { previousLayouts = candidates }
     }
 
     /// 首次获得宽度时也校验待交付结果。已交付的异步文本保留原文，宽度变化后重新排版。
@@ -395,6 +401,7 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
     open override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
         super.traitCollectionDidChange(previousTraitCollection)
         guard traitCollection != previousTraitCollection else { return }
+        previousLayouts.removeAll(keepingCapacity: true)
         cachedLayouts.removeAll(keepingCapacity: true)
         let previousLayoutMatched = previousTraitCollection.map { textLayout?.matchesAppearance($0) ?? true } ?? true
         if !previousLayoutMatched || textLayout?.matchesAppearance(traitCollection) == false ||
@@ -499,8 +506,9 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         if ids != observedScrolls {
             observedScrolls = ids
             scrollObservations = scrolls.flatMap { scroll in
-                [scroll.observe(\.contentOffset) { [weak self] _, _ in self?.setNeedsLayout() },
-                 scroll.observe(\.bounds) { [weak self] _, _ in self?.setNeedsLayout() }]
+                // UIKit 在主线程更改滚动几何，KVO 在写入线程同步回调，确保本轮 layoutIfNeeded 能看到新视口。
+                [scroll.observe(\.contentOffset) { [weak self] _, _ in MainActor.assumeIsolated { self?.setNeedsLayout() } },
+                 scroll.observe(\.bounds) { [weak self] _, _ in MainActor.assumeIsolated { self?.setNeedsLayout() } }]
             }
         }
         return visible
@@ -515,14 +523,13 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         }
         let result = layout(for: bounds.size)
         let origin = drawingOrigin(for: result)
-        let frames = result.attachmentFrames
         let attachments: [(UIView, CGRect)]
-        if frames.isEmpty {
+        if !result.hasViewAttachments {
             stopObservingScrolls()
             attachments = []
         } else {
             let viewport = attachmentViewport().offsetBy(dx: -origin.x, dy: -origin.y)
-            attachments = frames.filter { $0.1.intersects(viewport) }
+            attachments = result.viewAttachments(in: viewport)
         }
         removeAttachments(except: Set(attachments.map { ObjectIdentifier($0.0) }))
         for (view, frame) in attachments where view !== self && !isDescendant(of: view) {
@@ -629,7 +636,10 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         }
         if let cached = cachedLayouts.first(where: fits) { return cached }
         let original = super.attributedText ?? NSAttributedString(string: super.text ?? "")
-        let result = TextForgeLayout(container: makeContainer(size: size, rows: rows), attributedText: styledText(original))
+        let previous = previousLayouts.firstIndex { $0.box.size == size }.map { previousLayouts.remove(at: $0) }
+        let result = TextForgeLayout(container: makeContainer(size: size, rows: rows), attributedText: styledText(original),
+                                     fallbackTraits: nil, reusing: previous)
+        if rows == 0, !result.isTruncated { result.captureAttachmentMetrics() }
         if cachedLayouts.count == 2 { cachedLayouts.removeLast() }
         cachedLayouts.insert(result, at: 0)
         return result
@@ -659,7 +669,12 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         for (key, value) in defaults {
             guard let value else { continue }
             original.enumerateAttribute(key, in: range) { existing, part, _ in
-                if existing == nil { prepared.addAttribute(key, value: value, range: part) }
+                if existing == nil {
+                    prepared.addAttribute(key, value: value, range: part)
+                } else if key == .paragraphStyle, let mutable = existing as? NSMutableParagraphStyle {
+                    // 保存排版时的段落属性，宿主原地改动同一个可变样式后仍能识别首个变化段。
+                    prepared.addAttribute(key, value: mutable.copy(), range: part)
+                }
             }
         }
         return TextForgeTypography.styledText(
@@ -878,6 +893,7 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         clearSelection()
         cancelPendingLayout()
         preparedTextLayout = nil
+        previousLayouts.removeAll(keepingCapacity: true)
         cachedLayouts.removeAll(keepingCapacity: true)
         clearHighlight()
         stopObservingScrolls()

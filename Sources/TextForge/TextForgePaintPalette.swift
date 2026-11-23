@@ -10,13 +10,14 @@ final class TextForgePaintPalette {
 
     struct Variant {
         let key: NSAttributedString.Key
-        let resolve: (UITraitCollection) -> NSObject
+        let liveValue: NSObject
     }
 
     let traits: UITraitCollection
     var hasImages = false
     var requiresExactGeometry = false
     private(set) var variants: [Variant] = []
+    private(set) var variantKeys = Set<NSAttributedString.Key>()
     private var colors: [UIColor: UIColor] = [:]
     private var entries: [NSAttributedString.Key: [NSObject: Entry]] = [:]
 
@@ -32,13 +33,16 @@ final class TextForgePaintPalette {
         if let entry = entries[key]?[value] { return entry }
         let resolve: (UITraitCollection) -> NSObject
         let candidates: [UIColor]
+        let live: NSObject
         if let color = value as? UIColor {
             candidates = [color]
+            live = color
             resolve = { color.resolvedColor(with: $0) }
         } else if let shadow = value as? NSShadow {
             guard shadow.shadowColor == nil || shadow.shadowColor is UIColor else { return nil }
             let source = shadow.copy() as! NSShadow
             let color = source.shadowColor as? UIColor
+            live = source
             candidates = [color].compactMap { $0 }
             resolve = { traits in
                 let copy = source.copy() as! NSShadow
@@ -50,6 +54,7 @@ final class TextForgePaintPalette {
             source.insets = background.insets
             source.strokeWidth = background.strokeWidth
             source.strokeColor = background.strokeColor
+            live = source
             candidates = [source.fillColor, source.strokeColor].compactMap { $0 }
             resolve = { source.resolved(with: $0) }
         } else { return nil }
@@ -62,7 +67,10 @@ final class TextForgePaintPalette {
             }
         }
         let entry = Entry(resolved: resolve(traits), index: varies ? variants.count : nil)
-        if varies { variants.append(Variant(key: key, resolve: resolve)) }
+        if varies {
+            variantKeys.insert(key)
+            variants.append(Variant(key: key, liveValue: live))
+        }
         entries[key, default: [:]][value] = entry
         return entry
     }

@@ -5,19 +5,19 @@ import UIKit
 public final class TextForgeLayoutTask: NSObject, Sendable {
     private let operation: Operation
 
-    private let onCancel: (@Sendable () -> Void)?
+    private let onCancel: (@MainActor @Sendable () -> Void)?
 
-    init(operation: Operation, onCancel: (@Sendable () -> Void)? = nil) {
+    init(operation: Operation, onCancel: (@MainActor @Sendable () -> Void)? = nil) {
         self.onCancel = onCancel
         self.operation = operation
     }
 
     @objc public var isCancelled: Bool { operation.isCancelled }
 
-    /// 取消尚未完成的请求，包括等待回到主线程的结果。
+    /// 立即阻止交付（可从任意线程调用），订阅表与共享任务的清理在主线程执行。
     @objc public func cancel() {
         operation.cancel()
-        onCancel?()
+        if let onCancel { Task { @MainActor in onCancel() } }
     }
 }
 
@@ -64,20 +64,15 @@ extension TextForgeLayout {
         container.size = size
         let operation = Operation()
         let task = TextForgeLayoutTask(operation: operation)
-        let snapshot = item.snapshot(for: traitCollection)
-        guard let detachedText = snapshot.text, snapshot.supportsToken else {
-            DispatchQueue.main.async {
-                guard !operation.isCancelled else { return }
-                completion(TextForgeLayout(container: container, attributedText: original, fallbackTraits: traitCollection))
-            }
-            return task
-        }
-        let input = TextForgeRenderingInput(
-            text: detachedText, token: snapshot.token,
-            parameters: parameters(for: container), traits: traitCollection
-        )
         Task { @MainActor in
-            guard !operation.isCancelled else { return }
+            guard !operation.isCancelled, let snapshot = await item.snapshot(for: traitCollection, operation: operation),
+                  !operation.isCancelled else { return }
+            guard let detachedText = snapshot.text, snapshot.supportsToken else {
+                completion(TextForgeLayout(container: container, attributedText: original, fallbackTraits: traitCollection))
+                return
+            }
+            let input = TextForgeRenderingInput(text: detachedText, token: snapshot.token,
+                                               parameters: parameters(for: container), traits: traitCollection)
             // 原始富文本和回调保留在主线程任务中，工作队列只接收分离后的排版数据。
             let handoff = await withCheckedContinuation { (continuation: CheckedContinuation<TextForgeLayoutHandoff?, Never>) in
                 preparationQueue.addOperation {
@@ -94,9 +89,12 @@ extension TextForgeLayout {
                             return
                         }
                         engine.prepareDrawingBounds()
+                        guard !operation.isCancelled else {
+                            continuation.resume(returning: nil)
+                            return
+                        }
                         let image = engine.rasterize(
-                            scale: renderScale, traits: input.traits,
-                            viewport: input.parameters.size, insets: input.parameters.insets
+                            scale: renderScale, traits: input.traits
                         )
                         continuation.resume(returning: TextForgeLayoutHandoff(engine: engine, image: image))
                     }
@@ -120,28 +118,43 @@ extension TextForgeLayout {
         return queue
     }()
 
-    /// 在主线程分离绘制属性与交互对象。UIView 附件仅保留槽尺寸，动态颜色在当前外观下解析。
-    /// HTML 图片可能只保存在文件包装器中。常规文件按数据和文件名复制，其余无法分离的内容回到主线程排版。
-    static func detachedTextForLayout(_ text: NSAttributedString, paint: TextForgePaintPalette) -> NSAttributedString? {
-        let detached = NSMutableAttributedString(attributedString: text)
-        var supported = true
-        text.enumerateAttributes(in: NSRange(location: 0, length: text.length)) { attributes, range, stop in
-            if attributes[TextForgeHighlight.attributeName] != nil {
-                detached.removeAttribute(TextForgeHighlight.attributeName, range: range)
+    /// 按属性段冻结主线程对象。长文分批让出主线程，后台仅接收已分离的值并组装排版串。
+    static func detachedTextForLayout(_ text: NSAttributedString, container: TextForgeContainer,
+                                      paint: TextForgePaintPalette, operation: Operation) async -> NSAttributedString? {
+        var runs: [TextForgeFrozenRun] = []
+        // 相同的属性字典在多段间常被复用；仅冻结一次，保留原字典防止自定义字符串临时对象地址复用。
+        var styles: [ObjectIdentifier: (source: NSDictionary, frozen: [NSAttributedString.Key: Any])] = [:]
+        var index = 0
+        var sliceStart = CACurrentMediaTime()
+        while index < text.length {
+            guard !operation.isCancelled else { return nil }
+            if CACurrentMediaTime() - sliceStart >= 0.00075 {
+                await Task.yield()
+                sliceStart = CACurrentMediaTime()
             }
-            for (key, value) in attributes where key != TextForgeHighlight.attributeName {
+            var effective = CFRange()
+            let source = CFAttributedStringGetAttributes(text as CFAttributedString, index, &effective)! as NSDictionary
+            let range = NSRange(location: effective.location, length: effective.length)
+            index = NSMaxRange(range)
+            let identity = ObjectIdentifier(source)
+            if let cached = styles[identity] {
+                runs.append(TextForgeFrozenRun(range: range, attributes: cached.frozen))
+                continue
+            }
+            var attributes = text.attributes(at: range.location, effectiveRange: nil)
+            if attributes.removeValue(forKey: .link) != nil,
+               container.hasExplicitLinkStyle || attributes[TextForgeHTML.styledLink] == nil {
+                attributes.merge(container.linkTextAttributes) { _, override in override }
+            }
+            attributes.removeValue(forKey: TextForgeHighlight.attributeName)
+            var frozen = attributes
+            for (key, value) in attributes {
                 let copied: Any
                 switch value {
                 case is UIColor, is NSShadow, is TextForgeBackground:
-                    guard let entry = paint.entry(for: value as! NSObject, key: key) else {
-                        supported = false
-                        stop.pointee = true
-                        return
-                    }
+                    guard let entry = paint.entry(for: value as! NSObject, key: key) else { return nil }
                     copied = entry.resolved
-                    if let index = entry.index {
-                        detached.addAttribute(TextForgePaintPalette.marker(for: key), value: index, range: range)
-                    }
+                    if let index = entry.index { frozen[TextForgePaintPalette.marker(for: key)] = index }
                 case let paragraph as NSParagraphStyle:
                     copied = paragraph.copy()
                 case let attachment as TextForgeViewAttachment:
@@ -157,9 +170,7 @@ extension TextForgeLayout {
                         image.image = bitmap
                     } else if contents == nil, let wrapper = attachment.fileWrapper {
                         guard wrapper.isRegularFile, let data = wrapper.regularFileContents else {
-                            supported = false
-                            stop.pointee = true
-                            return
+                            return nil
                         }
                         let file = FileWrapper(regularFileWithContents: data)
                         file.preferredFilename = wrapper.preferredFilename ?? wrapper.filename
@@ -174,15 +185,41 @@ extension TextForgeLayout {
                 case let string as NSString:
                     copied = string.copy()
                 default:
-                    supported = false
-                    stop.pointee = true
-                    return
+                    return nil
                 }
-                if (copied as AnyObject) !== (value as AnyObject) { detached.addAttribute(key, value: copied, range: range) }
+                frozen[key] = copied
+            }
+            styles[identity] = (source, frozen)
+            runs.append(TextForgeFrozenRun(range: range, attributes: frozen))
+        }
+        let string = text.string
+        if runs.count <= 1 { return NSAttributedString(string: string, attributes: runs.first?.attributes) }
+        let frozenRuns = runs
+        let assembled = await withCheckedContinuation { (done: CheckedContinuation<TextForgeFrozenText?, Never>) in
+            preparationQueue.addOperation {
+                let result = NSMutableAttributedString(string: string)
+                result.beginEditing()
+                for run in frozenRuns {
+                    if operation.isCancelled { break }
+                    result.setAttributes(run.attributes, range: run.range)
+                }
+                result.endEditing()
+                done.resume(returning: operation.isCancelled ? nil : TextForgeFrozenText(value: result.copy() as! NSAttributedString))
             }
         }
-        return supported ? NSAttributedString(attributedString: detached) : nil
+        return assembled?.value
     }
+}
+
+/// 只携带复制后的样式、附件槽及不可变 Foundation 值，后台组装时不访问宿主视图、颜色提供者或回调。
+private struct TextForgeFrozenRun: @unchecked Sendable {
+    let range: NSRange
+    let attributes: [NSAttributedString.Key: Any]
+}
+
+/// 后台填充完毕才交接不可变富文本，属性遵循 FrozenRun 的同一隔离边界。
+private struct TextForgeFrozenText: @unchecked Sendable {
+    let value: NSAttributedString
 }
 
 /// 只承载分离后的文本、已复制的路径和 UIKit 不可变环境值，由单个后台操作读取。

@@ -151,18 +151,22 @@ final class ExampleViewController: UIViewController {
 
         failures.append(contentsOf: verifyCompositionTransactions())
         failures.append(contentsOf: verifyViewportRendering())
+        failures.append(contentsOf: verifyParagraphUpdates())
 
         verifyAsyncPreparation { asyncResults in
             self.verifyExplicitLayoutAppearance { appearanceFailures in
                 self.verifyCopyMenu { copyFailures in
                     let directory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
                     let url = directory.appendingPathComponent("result.txt")
-                    let allFailures = failures + asyncResults + appearanceFailures + copyFailures
-                    let result = allFailures.isEmpty ? "PASS" : allFailures.joined(separator: "\n")
-                    do {
-                        try result.write(to: url, atomically: true, encoding: .utf8)
-                    } catch {
-                        NSLog("TextForge Swift example could not write its result: %@", String(describing: error))
+                    Task { @MainActor in
+                        let renderingFailures = await self.verifyListRendering()
+                        let allFailures = failures + asyncResults + appearanceFailures + copyFailures + renderingFailures
+                        let result = allFailures.isEmpty ? "PASS" : allFailures.joined(separator: "\n")
+                        do {
+                            try result.write(to: url, atomically: true, encoding: .utf8)
+                        } catch {
+                            NSLog("TextForge Swift example could not write its result: %@", String(describing: error))
+                        }
                     }
                 }
             }
@@ -1146,6 +1150,185 @@ final class ExampleViewController: UIViewController {
         }
     }
 
+    /// 按新建标签逐行比对换文后的度量、基线和范围，并确认外部持有的旧快照仍可使用。
+    private func verifyParagraphUpdates() -> [String] {
+        let label = TextForgeLabel(frame: CGRect(x: 0, y: 0, width: 156, height: 2000))
+        label.numberOfLines = 0
+        label.textVerticalAlignment = .top
+        let text = NSMutableAttributedString(string: "首段 אבג 👩🏽‍💻\r\n第二段正文。\n第三段。\n第四段。\n尾段",
+                                             attributes: [.font: UIFont.systemFont(ofSize: 17)])
+        let attachment = NSTextAttachment()
+        attachment.bounds = CGRect(x: 0, y: 0, width: 16, height: 16)
+        text.append(NSAttributedString(attachment: attachment))
+        label.attributedText = text
+        let held = label.displayedTextLayout!
+        let oldString = held.attributedText.string
+        let oldSize = held.textBoundingSize
+        for step in 0..<7 {
+            switch step {
+            case 0: text.append(NSAttributedString(string: "🌱继续追加一段。"))
+            case 1:
+                let larger = NSTextAttachment()
+                larger.bounds = CGRect(x: 0, y: 0, width: 90, height: 46)
+                text.addAttribute(.attachment, value: larger, range: (text.string as NSString).range(of: "\u{FFFC}"))
+            case 2: text.addAttribute(.kern, value: 5, range: (text.string as NSString).range(of: "第二段"))
+            case 3: text.deleteCharacters(in: (text.string as NSString).range(of: "尾段"))
+            case 4:
+                let index = (text.string as NSString).range(of: "\u{FFFC}").location
+                (text.attribute(.attachment, at: index, effectiveRange: nil) as? NSTextAttachment)?.bounds.size.height = 72
+                text.append(NSAttributedString(string: "\n尾注"))
+            case 5:
+                text.append(NSAttributedString(string: "\nß última linha\nعرض 👩🏿‍💻", attributes: [.font: UIFont.systemFont(ofSize: 16.2)]))
+            default:
+                let paragraph = NSMutableParagraphStyle()
+                paragraph.paragraphSpacing = 3.3
+                text.addAttribute(.paragraphStyle, value: paragraph, range: NSRange(location: 0, length: text.length))
+            }
+            label.attributedText = text
+            let reference = TextForgeLabel(frame: label.frame)
+            reference.numberOfLines = 0
+            reference.textVerticalAlignment = .top
+            reference.attributedText = text
+            // TextKit 增量布局可能在基线上产生千分之一点的舍入差；比较实际屏幕像素，同时严格核对原文范围和行高。
+            let scale = max(1, label.traitCollection.displayScale)
+            func pixels(_ line: TextForgeLine) -> [CGFloat] {
+                [line.rect.minX, line.rect.minY, line.rect.maxX, line.rect.maxY, line.baseline].map { ($0 * scale).rounded() }
+            }
+            guard let a = label.displayedTextLayout, let b = reference.displayedTextLayout,
+                  a.textBoundingSize == b.textBoundingSize, a.lines.count == b.lines.count,
+                  zip(a.lines, b.lines).allSatisfy({ $0.range == $1.range && pixels($0) == pixels($1) })
+            else { return ["incremental paragraph geometry at step \(step)"] }
+        }
+        return held.attributedText.string == oldString && held.textBoundingSize == oldSize
+            && held.rect(forRange: NSRange(location: 0, length: 1)) != .null ? [] : ["published layout mutated"]
+    }
+
+    /// 验证预绘装饰外伸、无位图的动态前景色往返，以及自适应高度和不同倍率间的同步几何查询。
+    private func verifyListRendering() async -> [String] {
+        let label = TextForgeLabel(frame: CGRect(x: 0, y: 0, width: 200, height: 24))
+        view.addSubview(label)
+        defer { label.removeFromSuperview() }
+        var failures: [String] = []
+        let bg = TextForgeBackground(fillColor: .green)
+        bg.insets = UIEdgeInsets(top: -25, left: 0, bottom: -25, right: 0)
+        let decorated = NSAttributedString(string: "中文测试ABC", attributes: [
+            .font: UIFont.systemFont(ofSize: 16), TextForgeBackground.attributeName: bg
+        ])
+        for centered in [false, true] {
+            label.bounds.size.height = centered ? 80 : 24
+            label.textVerticalAlignment = centered ? .center : .top
+            await withCheckedContinuation { done in
+                label.setAttributedTextAsynchronously(decorated, size: label.bounds.size, rendersAsynchronously: true) { done.resume() }
+            }
+            label.bounds.size.height = 80
+            var rgba = [UInt8](repeating: 0, count: 4)
+            rgba.withUnsafeMutableBytes { bytes in
+                let ctx = CGContext(data: bytes.baseAddress, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
+                                    space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+                ctx.translateBy(x: -8, y: centered ? 15 : 32)
+                ctx.scaleBy(x: 1, y: -1)
+                UIGraphicsPushContext(ctx)
+                label.drawText(in: label.bounds)
+                UIGraphicsPopContext()
+            }
+            if rgba[1] < 150 { failures.append("missing prerender overhang, centered=\(centered)") }
+        }
+        label.overrideUserInterfaceStyle = .light
+        let color = UIColor { $0.userInterfaceStyle == .dark ? .blue : .red }
+        let body = NSAttributedString(string: String(repeating: "列表颜色渲染 ", count: 30),
+                                      attributes: [.font: UIFont.systemFont(ofSize: 16), .foregroundColor: color])
+        let box = TextForgeContainer(size: CGSize(width: 200, height: 1000))
+        box.maximumNumberOfRows = 3
+        let cache = TextForgeListLayoutCache(), item = TextForgeListItem(attributedText: body, container: box)
+        let layouts = await withCheckedContinuation { (done: CheckedContinuation<[TextForgeLayout], Never>) in
+            var received: [TextForgeLayout] = []
+            let other = UITraitCollection(traitsFrom: [label.traitCollection, UITraitCollection(userInterfaceStyle: .dark)])
+            for traits in [label.traitCollection, other] {
+                cache.prepare(item, size: box.size, renderScale: 0, traitCollection: traits) { result in
+                    received.append(result)
+                    if received.count == 2 { done.resume(returning: received) }
+                }
+            }
+        }
+        let layout = layouts[0]
+        if layout !== layouts[1] { failures.append("cold prefetch and cell did not coalesce across appearances") }
+        let row = CGSize(width: box.size.width, height: layout.textBoundingSize.height)
+        guard let hit = cache.cachedLayout(for: item, size: row, traitCollection: label.traitCollection),
+              hit.size == row, hit.visibleRange == layout.visibleRange,
+              cache.cachedLayout(for: item, size: CGSize(width: row.width, height: 10), traitCollection: label.traitCollection) == nil
+        else { return failures + ["height-compatible lookup"] }
+        // 窄列中的段间距和空段会让“测得高度”不足以重现原来的末行。目标约束应独立排版。
+        let spaced = NSMutableParagraphStyle()
+        spaced.lineSpacing = 2.6
+        spaced.paragraphSpacing = 3.25
+        spaced.firstLineHeadIndent = 4.25
+        let complexBody = NSAttributedString(string: "• Row 1\n\n\nRow 4.\n\u{2029}", attributes: [
+            .font: UIFont.systemFont(ofSize: 17.4), .paragraphStyle: spaced
+        ])
+        let complexBox = TextForgeContainer(size: CGSize(width: 42.5, height: 1_000_000),
+                                           insets: UIEdgeInsets(top: 1, left: 2, bottom: 2, right: 3))
+        complexBox.maximumNumberOfRows = 4
+        let complexItem = TextForgeListItem(attributedText: complexBody, container: complexBox)
+        let source = await withCheckedContinuation { done in
+            cache.prepare(complexItem, size: complexBox.size, renderScale: 0, traitCollection: label.traitCollection) { done.resume(returning: $0) }
+        }
+        let target = CGSize(width: complexBox.size.width, height: source.textBoundingSize.height)
+        if cache.cachedLayout(for: complexItem, size: target, traitCollection: label.traitCollection) != nil ||
+            cache.cachedSize(for: complexItem, size: target, traitCollection: label.traitCollection) != nil {
+            failures.append("complex measured height reused a wider vertical constraint")
+        }
+        let tokenBox = TextForgeContainer(size: CGSize(width: 42.5, height: 65),
+                                         insets: UIEdgeInsets(top: 1, left: 2, bottom: 2, right: 3))
+        tokenBox.maximumNumberOfRows = 2
+        tokenBox.lineBreakMode = .byTruncatingTail
+        tokenBox.truncationToken = NSAttributedString(string: "…更多", attributes: [.font: UIFont.boldSystemFont(ofSize: 12)])
+        let mixed = NSAttributedString(string: "超长中英文👨‍👩‍👧‍👦 Aaبج abc-mixed語\ndeuxième\nfinal\n",
+                                       attributes: [.font: UIFont.systemFont(ofSize: 17.4)])
+        let tokenItem = TextForgeListItem(attributedText: mixed, container: tokenBox)
+        let tokenLayout = await withCheckedContinuation { done in
+            cache.prepare(tokenItem, size: tokenBox.size, renderScale: 0, traitCollection: label.traitCollection) { done.resume(returning: $0) }
+        }
+        let tokenHeight = CGSize(width: tokenBox.size.width, height: tokenLayout.textBoundingSize.height)
+        if tokenLayout.isTruncated && tokenHeight != tokenBox.size &&
+            cache.cachedLayout(for: tokenItem, size: tokenHeight, traitCollection: label.traitCollection) != nil {
+            failures.append("custom truncation token reused a different height")
+        }
+        label.textLayout = hit
+        for style in [UIUserInterfaceStyle.dark, .light, .dark] {
+            label.overrideUserInterfaceStyle = style
+            label.setNeedsDisplay()
+            let sample = pixels(of: label)
+            if style == .dark ? sample.blue == 0 || sample.red > 0 : sample.red == 0 || sample.blue > 0 {
+                failures.append("geometry-only label color at \(style.rawValue): \(sample)")
+            }
+        }
+        // 系统背景、阴影和自有圆角背景走不同的绘制入口；都要在无位图时正确切回原配色。
+        let shadow = NSShadow()
+        shadow.shadowColor = color
+        shadow.shadowOffset = CGSize(width: 0, height: 6)
+        let decorations: [[NSAttributedString.Key: Any]] = [
+            [.backgroundColor: color], [.shadow: shadow], [TextForgeBackground.attributeName: TextForgeBackground(fillColor: color)]
+        ]
+        for style in decorations {
+            let input = NSAttributedString(string: "装饰 ABC", attributes: style.merging([.font: UIFont.boldSystemFont(ofSize: 20),
+                                                                                       .foregroundColor: UIColor.black]) { a, _ in a })
+            label.overrideUserInterfaceStyle = .light
+            label.textLayout = await withCheckedContinuation { done in
+                _ = TextForgeLayout.prepare(attributedText: input, container: box, renderScale: 0,
+                                        traitCollection: label.traitCollection) { done.resume(returning: $0) }
+            }
+            for appearance in [UIUserInterfaceStyle.dark, .light, .dark] {
+                label.overrideUserInterfaceStyle = appearance
+                label.setNeedsDisplay()
+                let sample = pixels(of: label)
+                if appearance == .dark ? sample.blue == 0 || sample.red > 0 : sample.red == 0 || sample.blue > 0 {
+                    failures.append("decoration color \(style.keys) at \(appearance.rawValue): \(sample)")
+                }
+            }
+        }
+        return failures
+    }
+
     /// 在滚动容器中核对附件移出、重新挂载，并逐像素比较带阴影和外扩背景的长文局部绘制。
     private func verifyViewportRendering() -> [String] {
         let scroll = UIScrollView(frame: CGRect(x: 0, y: 0, width: 160, height: 80))
@@ -1181,6 +1364,22 @@ final class ExampleViewController: UIViewController {
         scroll.contentOffset = .zero
         label.layoutIfNeeded()
         if initial.first?.superview !== label || views.last?.superview === label { return ["attachment remount after scrolling back"] }
+        // 槽所在行完全离开视口时，大于槽的视图仍可能露出一部分。
+        let largeBadge = UIView(frame: CGRect(x: 0, y: 0, width: 18, height: 160))
+        let withBadge = NSMutableAttributedString(string: String(repeating: "占行\n", count: 20), attributes: [.font: font])
+        let badgeIndex = withBadge.length
+        withBadge.append(TextForgeAttachment.view(largeBadge, size: CGSize(width: 12, height: 8), font: font, alignment: .center))
+        let tall = TextForgeLayout(attributedText: withBadge, size: CGSize(width: 160, height: 1500))
+        let badgeLabel = TextForgeLabel(frame: CGRect(origin: .zero, size: CGSize(width: 160, height: tall.textBoundingSize.height)))
+        scroll.addSubview(badgeLabel)
+        badgeLabel.textLayout = tall
+        scroll.contentSize = badgeLabel.bounds.size
+        let slot = tall.rect(forRange: NSRange(location: badgeIndex, length: 1))
+        scroll.contentOffset.y = slot.minY - scroll.bounds.height - 10
+        badgeLabel.layoutIfNeeded()
+        guard slot.minY > scroll.bounds.maxY, largeBadge.superview === badgeLabel else { return ["oversized view outside slot line"] }
+        badgeLabel.removeFromSuperview()
+        scroll.contentOffset = .zero
         let format = UIGraphicsImageRendererFormat()
         format.scale = 1
         let renderer = UIGraphicsImageRenderer(size: label.bounds.size, format: format)
