@@ -42,7 +42,7 @@ let package = Package(
 )
 ```
 
-版本填写 Git 标签上的号码。GitHub Release 标题的补零写法见[版本与发布规则](AGENTS.md#版本与发布)。
+SPM 安装版本以 Git 标签为准。从 1.0.6 起，GitHub Release 标题使用同一个版本号。 [版本与发布规则](AGENTS.md#版本与发布)
 
 ### Swift
 
