@@ -280,7 +280,7 @@ final class TextForgeLayoutEngine {
         var matches = true
         manager.enumerateLineFragments(forGlyphRange: tailGlyphs) { fragment, used, _, glyphs, stop in
             let line = self.manager.characterRange(forGlyphRange: glyphs, actualGlyphRange: nil)
-            let baseline = fragment.minY + self.manager.location(forGlyphAt: glyphs.location).y
+            let baseline = self.baseline(forGlyphAt: glyphs.location, in: fragment)
             if index < expected.count {
                 let target = expected[index]
                 // 两个栈的纵向原点不同，消除浮点累计误差后比较局部几何。
@@ -541,7 +541,7 @@ final class TextForgeLayoutEngine {
         var result: [CGRect] = []
         manager.enumerateLineFragments(forGlyphRange: selected) { fragment, _, _, lineGlyphs, _ in
             for part in self.visibleGlyphParts(of: NSIntersectionRange(lineGlyphs, selected)) {
-                let baseline = fragment.minY + self.manager.location(forGlyphAt: part.location).y
+                let baseline = self.baseline(forGlyphAt: part.location, in: fragment)
                 var ascent: CGFloat = 0
                 var descent: CGFloat = 0
                 let characters = self.manager.characterRange(forGlyphRange: part, actualGlyphRange: nil)
@@ -609,13 +609,26 @@ final class TextForgeLayoutEngine {
         return visible.length > 0 ? manager.characterRange(forGlyphRange: visible, actualGlyphRange: nil) : nil
     }
 
+    /// 返回字形所在行片段的真实文本基线纵坐标。TextKit 将附件字形的 location.y 置于附件底边（即基线减去 bounds.minY），
+    /// 此处加回 bounds.minY 以还原统一的行文本基线。
+    private func baseline(forGlyphAt glyph: Int, in fragment: CGRect) -> CGFloat {
+        var y = fragment.minY + manager.location(forGlyphAt: glyph).y
+        if storage.length > 0 {
+            let index = min(manager.characterIndexForGlyph(at: glyph), storage.length - 1)
+            if let attachment = storage.attribute(.attachment, at: index, effectiveRange: nil) as? NSTextAttachment {
+                y += attachment.bounds.minY
+            }
+        }
+        return y
+    }
+
     /// 返回可见附件对应的行基线坐标，不读取 UIKit 视图。
     func baselineForAttachment(at index: Int) -> CGPoint? {
         let glyph = manager.glyphIndexForCharacter(at: index)
         guard isVisible(glyph) else { return nil }
         let location = manager.location(forGlyphAt: glyph)
         let fragment = manager.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
-        return CGPoint(x: fragment.minX + location.x - shift, y: fragment.minY + location.y)
+        return CGPoint(x: fragment.minX + location.x - shift, y: baseline(forGlyphAt: glyph, in: fragment))
     }
 
     /// 逐个行片段给出可见原文的外接范围、占用矩形和基线，标记占用空间但不计入原文范围。
@@ -643,7 +656,7 @@ final class TextForgeLayoutEngine {
             let lower = min(characters.location, upper)
             result.append(TextForgeEngineLine(
                 range: NSRange(location: self.sourceOffset(lower), length: self.sourceOffset(upper) - self.sourceOffset(lower)), rect: used.offsetBy(dx: -self.shift, dy: 0),
-                baseline: fragment.minY + self.manager.location(forGlyphAt: part.location).y, row: row
+                baseline: self.baseline(forGlyphAt: part.location, in: fragment), row: row
             ))
         }
         return result

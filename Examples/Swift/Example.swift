@@ -1720,6 +1720,17 @@ final class ExampleViewController: UIViewController {
                     || image.flatMap({ Mirror(reflecting: $0.value).children.first }) == nil {
                     failures.append("background geometry or bitmap did not match expectations")
                 }
+                let slotRect = prepared.rect(forRange: NSRange(location: latest.length - 1, length: 1))
+                let unmountedLabel = TextForgeLabel(frame: CGRect(origin: .zero, size: size))
+                unmountedLabel.contentInsets = insets
+                unmountedLabel.textVerticalAlignment = .top
+                unmountedLabel.textLayout = prepared
+                badge.isHidden = true
+                let slotPixels = self.pixels(of: unmountedLabel, in: slotRect).any
+                badge.isHidden = false
+                if slotPixels != 0 {
+                    failures.append("async preparedImage baked default placeholder icon into view attachment slot: \(slotPixels)")
+                }
 
                 let annotation = NSObject()
                 let key = NSAttributedString.Key("TextForge.ExampleAnnotation")
@@ -2054,6 +2065,47 @@ final class ExampleViewController: UIViewController {
         lazyLabel.layoutIfNeeded()
         if lazyCreated == 0 || lazyCreated >= 8 {
             failures.append("lazy view attachment did not mount strictly for visible viewport: \(lazyCreated)")
+        }
+
+        let alignFont = UIFont.systemFont(ofSize: 15)
+        let slotSize = CGSize(width: 36, height: 24)
+        for alignment in [TextForgeVerticalAlignment.top, .center, .bottom] {
+            let markerView = UIView(frame: CGRect(origin: .zero, size: slotSize))
+            let pair = NSMutableAttributedString(string: "基准", attributes: [.font: alignFont])
+            pair.append(TextForgeAttachment.image(netImage, contentMode: .scaleAspectFit, size: slotSize, font: alignFont, alignment: alignment))
+            pair.append(TextForgeAttachment.view(markerView, size: slotSize, font: alignFont, alignment: alignment))
+            let pairLayout = TextForgeLayout(attributedText: pair, size: CGSize(width: 200, height: 60))
+            let pairLabel = TextForgeLabel(frame: CGRect(x: 0, y: 0, width: 200, height: 60))
+            pairLabel.textVerticalAlignment = .top
+            pairLabel.textLayout = pairLayout
+            pairLabel.layoutIfNeeded()
+            let combinedRect = pairLayout.rects(forRange: NSRange(location: 0, length: 3)).first ?? .null
+            let imageRect = pairLayout.rects(forRange: NSRange(location: 2, length: 1)).first ?? .null
+            let viewSlotRect = pairLayout.rects(forRange: NSRange(location: 3, length: 1)).first ?? .null
+            if abs(markerView.frame.minY - combinedRect.minY) > 0.5
+                || abs(markerView.frame.minY - imageRect.minY) > 0.5
+                || abs(markerView.frame.minY - viewSlotRect.minY) > 0.5 {
+                failures.append("view attachment vertical alignment mismatch for \(alignment.rawValue): view=\(markerView.frame.minY), combined=\(combinedRect.minY), image=\(imageRect.minY), slot=\(viewSlotRect.minY)")
+            }
+        }
+        let blankSlotView = UIView(frame: CGRect(origin: .zero, size: slotSize))
+        let onlyViewText = TextForgeAttachment.view(blankSlotView, size: slotSize, font: alignFont, alignment: .center)
+        let onlyViewLabel = TextForgeLabel(frame: CGRect(x: 0, y: 0, width: 60, height: 40))
+        onlyViewLabel.textVerticalAlignment = .top
+        onlyViewLabel.attributedText = onlyViewText
+        onlyViewLabel.layoutIfNeeded()
+        if pixels(of: onlyViewLabel).any != 0 {
+            failures.append("transparent view attachment drew default placeholder pixels in sync path")
+        }
+        let leadingViewText = NSMutableAttributedString()
+        leadingViewText.append(TextForgeAttachment.view(UIView(frame: CGRect(origin: .zero, size: slotSize)), size: slotSize, font: alignFont, alignment: .center))
+        leadingViewText.append(NSAttributedString(string: "同行正文", attributes: [.font: alignFont]))
+        let trailingViewText = NSMutableAttributedString(string: "同行正文", attributes: [.font: alignFont])
+        trailingViewText.append(TextForgeAttachment.view(UIView(frame: CGRect(origin: .zero, size: slotSize)), size: slotSize, font: alignFont, alignment: .center))
+        let leadingLine = TextForgeLayout(attributedText: leadingViewText, size: CGSize(width: 200, height: 60)).lines.first
+        let trailingLine = TextForgeLayout(attributedText: trailingViewText, size: CGSize(width: 200, height: 60)).lines.first
+        if let lBase = leadingLine?.baseline, let tBase = trailingLine?.baseline, abs(lBase - tBase) > 0.5 {
+            failures.append("line starting with attachment shifted baseline: leading=\(lBase), trailing=\(tBase)")
         }
 
         let linkAttr = NSMutableAttributedString(string: "点击协议", attributes: [.font: UIFont.systemFont(ofSize: 14)])

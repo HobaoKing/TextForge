@@ -211,6 +211,8 @@ public final class TextForgeAttachment: NSObject {
                     width: drawSize.width, height: drawSize.height
                 ))
             }.withRenderingMode(image.renderingMode)
+        } else {
+            attachment.image = TextForgeViewAttachment.blankImage
         }
         return NSAttributedString(attachment: attachment)
     }
@@ -255,6 +257,8 @@ public final class TextForgeAttachment: NSObject {
 }
 
 final class TextForgeViewAttachment: NSTextAttachment {
+    /// 供视图附件与后台分离占位共用，阻止 TextKit 在 image 为 nil 时绘制系统默认缺失图标。
+    static let blankImage = UIImage()
     private var cachedView: UIView?
     private let provider: (@MainActor () -> UIView)?
     private(set) var viewSize: CGSize
@@ -266,6 +270,7 @@ final class TextForgeViewAttachment: NSTextAttachment {
         provider = nil
         viewSize = view.bounds.size
         super.init(data: nil, ofType: nil)
+        image = Self.blankImage
     }
 
     /// 仅记录占位尺寸与主线程构造闭包，在视口真正需要挂载时才创建 UIView。
@@ -278,6 +283,7 @@ final class TextForgeViewAttachment: NSTextAttachment {
             height: size.height.isFinite ? max(0, size.height) : 0
         )
         super.init(data: nil, ofType: nil)
+        image = Self.blankImage
     }
 
     /// 在主线程返回已缓存或按需创建的视图，首次实例化后若视图自带非零尺寸则同步记录。

@@ -159,6 +159,7 @@ extension TextForgeLayout {
                     copied = paragraph.copy()
                 case let attachment as TextForgeViewAttachment:
                     let slot = NSTextAttachment()
+                    slot.image = TextForgeViewAttachment.blankImage
                     slot.bounds = attachment.bounds
                     copied = slot
                 case let attachment as NSTextAttachment where type(of: attachment) == NSTextAttachment.self:

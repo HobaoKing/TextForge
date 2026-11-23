@@ -362,10 +362,18 @@
     if (lazyBuilt != 0) {
         [failures addObject:@"Objective-C lazy attachment instantiated during layout"];
     }
+    label.textVerticalAlignment = TextForgeVerticalAlignmentTop;
     label.textLayout = lazyLayout;
     [label layoutIfNeeded];
     if (lazyBuilt != 1) {
         [failures addObject:@"Objective-C lazy attachment did not mount on layout"];
+    }
+    CGRect lazySlotRect = [lazyLayout rectsForRange:NSMakeRange(0, 1)].firstObject.CGRectValue;
+    UIView *mountedLazyView = label.subviews.firstObject;
+    if (!mountedLazyView
+        || fabs(CGRectGetMinY(mountedLazyView.frame)) > 0.5
+        || fabs(CGRectGetMinY(mountedLazyView.frame) - CGRectGetMinY(lazySlotRect)) > 0.5) {
+        [failures addObject:@"Objective-C mounted lazy view vertical alignment mismatch"];
     }
     self.input.text = @"#话题# 正文";
     self.input.selectedRange = NSMakeRange(1, 2);

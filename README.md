@@ -2,18 +2,32 @@
 
 Reusable iOS text rendering and input components for Swift and Objective-C.
 
-TextForge 支持 iOS 15+，使用 UIKit、Foundation、WebKit 和系统 libxml2，为 Swift 与 Objective-C 提供一致的富文本排版、异步预渲染、行内装饰、交互附件、HTML 导入与输入增强能力。
+TextForge 支持 iOS 15+，基于 UIKit、Foundation、WebKit 与系统 libxml2，为 Swift 与 Objective-C 提供从基础 `UILabel` 替换到富文本混排、交互选区、异步列表缓存、HTML 导入与编辑输入的渐进式解决方案。
 
-## 核心能力概览
+> 在主线程创建和更新控件。业务侧的输入规则、字数上限、键盘避让与提交策略由宿主决定。
 
-- **`TextForgeLabel`**：继承 `UILabel`，支持纯文本与富文本共用排版引擎，提供字距 / 行距 / 段距、固定行高基线锁定（`fixedLineHeight`）、内边距（`contentInsets`）、纵向对齐（`textVerticalAlignment`）、单行自动缩字、绕排路径（`exclusionPaths`）、自定义截断标记（`truncationToken`）、触摸热区外扩（`highlightTouchExtensionRadius`）、按词拖选与复制（`isSelectable` / `allowsCopy`）、VoiceOver 高亮操作与附件替代文本。
-- **`TextForgeContainer` & `TextForgeLayout`**：将边界、内边距、最大行数、截断策略、固定行高、绕排路径和链接外观集中配置，支持同步与后台预排版；输出精确的 `textBoundingSize`、逐行 `TextForgeLine`（范围 / 矩形 / 基线 / 视觉行）、可见范围、截断状态与双向混排几何查询（点到字符下标、范围到视觉片段矩形）。
-- **`TextForgeHighlight` / `TextForgeBackground` / `TextForgeAttachment`**：提供点击与长按分段交互（含圆角按压态与前景色切换）、行内圆角描边/填充标签（`horizontalMargin` 自动在双向文字边界预留水平间隔，不改 UTF-16 下标）、按内容模式裁切图片附件、立即及**按可见视口惰性实例化**的 `UIView` 附件，以及独立可控的复制/朗读替代文本。
-- **`TextForgeListLayoutCache` & `TextForgeListItem`**：专为表格/瀑布流等滚动列表打造，预取与 Cell 绑定共享后台排版；基于值语义内容指纹实现等价 `TextForgeListItem` 跨实例共享度量、几何引擎与位图（各自保留独立交互回调），并将纯几何结果与位图缓存预算分离。
-- **`TextForgeHTML` & `TextForgeHTMLReadingStyle`**：通过系统 WebKit 异步解析 HTML 为 `NSAttributedString`，支持阅读样式默认规则（字号、颜色、链接样式）、宿主图片缓存接管、同 URL 请求去重、多图合批回调（`TextForgeHTMLImageUpdate`）与任务取消。
-- **`TextForgeTextView`**：继承 `UITextView` 并保持可继续继承与原生 delegate / 通知兼容，补齐纯文本与富文本占位、精确过滤中文 IME 组字中间态（兼顾候选上屏、代理同步裁剪存储及粘贴/剪切）的 `onTextChange` 回调，以及支持在编辑回调内安全执行的就地属性刷新（`updateTextAttributes`）。
+---
 
-在主线程创建和更新控件。输入内容、字数规则、键盘避让和提交动作由宿主负责。
+## 按场景速查功能
+
+| 常见需求 | 对应能力 / 核心 API | 查看章节 |
+| :--- | :--- | :--- |
+| 替换 `UILabel`，控制内边距与字/行/段距 | `TextForgeLabel`、`contentInsets`、`characterSpacing`、`lineSpacing`、`paragraphSpacing` | [1.1 基础间距与内边距](#11-基础间距与内边距) |
+| 多字体/表情混排锁死行高、内容垂直对齐、单行自动缩字 | `fixedLineHeight`、`textVerticalAlignment`、`minimumScaleFactor` | [1.2 固定行高对齐与单行缩字](#12-固定行高对齐与单行缩字) |
+| 正文里嵌入图标、徽章、头像并保持比例裁切 | `TextForgeAttachment.image(_:contentMode:size:font:alignment:)` | [2.1 图片附件与内容模式裁切](#21-图片附件与内容模式裁切) |
+| 行内嵌入真实按钮/控件，仅进入屏幕时再创建视图 | `TextForgeAttachment.view`、`view(size:font:alignment:provider:)` | [2.2 行内嵌入式视图与惰性加载](#22-行内嵌入式视图与惰性加载) |
+| 让附件在复制和 VoiceOver 朗读时转成有意义的文本 | `TextForgeAttachment.withTextAlternatives(_:copyText:accessibilityText:)` | [2.3 附件复制与朗读替代文本](#23-附件复制与朗读替代文本) |
+| 生成行内圆角描边标签，自动隔离中英/阿语等双向边界间距 | `TextForgeBackground`、`horizontalMargin`、`apply(to:range:horizontalMargin:)` | [2.4 行内圆角标签与双向间距](#24-行内圆角标签与双向间距) |
+| 局部片段点击/长按，扩大过小链接触控热区 | `TextForgeHighlight`、`highlightTapAction`、`highlightTouchExtensionRadius` | [3.1 局部高亮点击与热区扩大](#31-局部高亮点击与热区扩大) |
+| 长按拖选文本、按词/指定区间选中、联动系统复制菜单与无障碍 | `isSelectable`、`allowsCopy`、`selectWord(at:)`、`copyMenuVisibilityHandler` | [3.2 自由拖选与系统复制菜单](#32-自由拖选与系统复制菜单) |
+| 自定义可点击「…展开全文」尾巴并探测是否发生截断 | `truncationToken`、`TextForgeContainer.readMoreToken`、`isTruncated` | [4.1 自定义截断展开标记](#41-自定义截断展开标记) |
+| 头像、角标或浮层旁让正文自动文字环绕避让 | `exclusionPaths` | [4.2 文字环绕避让路径](#42-文字环绕避让路径) |
+| 离线算高、查逐行基线与字符位置、高亮搜索词视觉片段框 | `TextForgeContainer`、`TextForgeLayout`、`lines`、`characterIndex(at:)`、`rects(forRange:)` | [4.3 容器预排版与几何查询](#43-容器预排版与几何查询) |
+| 长文单标签后台预排版与异步光栅化 | `setAttributedTextAsynchronously`、`TextForgeLayout.prepare`、`TextForgeLayoutTask` | [5.1 单控件异步预排版与取消](#51-单控件异步预排版与取消) |
+| 滚动列表跨 Cell 复用缓存、冷启动合并与位图/几何预算分离 | `TextForgeListItem`、`TextForgeListLayoutCache` | [5.2 滚动列表跨单元复用缓存](#52-滚动列表跨单元复用缓存) |
+| 轻量把 HTML 片段转为 `NSAttributedString` | `TextForgeHTML.attributedString(from:baseURL:completion:)` | [6.1 HTML 轻量异步转换](#61-html-轻量异步转换) |
+| HTML 阅读默认样式、作者样式覆盖、宿主图片接管与多图合批刷新 | `TextForgeHTMLReadingStyle`、`TextForgeHTML.importHTML`、`TextForgeHTMLImageUpdate` | [6.2 阅读样式与多图合批导入](#62-阅读样式与多图合批导入) |
+| 输入框富文本占位、过滤输入法组字回调与安全就地语法高亮 | `TextForgeTextView`、`placeholderAttributedText`、`onTextChange`、`updateTextAttributes` | [6.3 输入框占位与就地高亮](#63-输入框占位与就地高亮) |
 
 ---
 
@@ -27,12 +41,12 @@ TextForge 支持 iOS 15+，使用 UIKit、Foundation、WebKit 和系统 libxml2�
    https://github.com/HobaoKing/TextForge.git
    ```
 3. 选择依赖规则（Dependency Rule）：
-   - **生产/团队锁版本（推荐）**：选择 **Exact Version**，填入 `1.0.6`。
-   - **自动跟随向后兼容补丁**：选择 **Up to Next Minor Version**，起始版本 `1.0.6`（即 `1.0.6 ..< 1.1.0`）。
+   - **生产/团队锁版本（推荐）**：选择 **Exact Version**，填入 `1.0.7`。
+   - **自动跟随向后兼容补丁**：选择 **Up to Next Minor Version**，起始版本 `1.0.7`（即 `1.0.7 ..< 1.1.0`）。
    - **特性分支联调**：选择 **Branch**（例如 `master`）。
-   - **本地源码联调**：将本地克隆的 `TextForge` 文件夹直接拖入 Xcode workspace，或通过 **Add Local…** 引入，可直接覆盖同名远程包依赖。
+   - **本地源码联调**：将本地克隆的 `TextForge` 文件夹拖入 Xcode workspace，或通过 **Add Local…** 引入，可直接覆盖同名远程包依赖。
 4. 在产品选择页将 **`TextForge`** 添加到实际使用它的 App、Framework 或 Extension target。
-5. 团队协作时建议将 `.xcodeproj` / `.xcworkspace` 与 `Package.resolved` 一并纳入版本控制；若 Xcode 解析缓存异常，可执行 **File → Packages → Reset Package Caches** 后再 **Resolve Package Versions**。
+5. 建议将 `.xcodeproj` / `.xcworkspace` 与 `Package.resolved` 一并纳入版本控制；若 Xcode 解析缓存异常，可执行 **File → Packages → Reset Package Caches** 后再 **Resolve Package Versions**。
 
 ### 2. 在 `Package.swift` 中接入
 
@@ -50,9 +64,9 @@ let package = Package(
     ],
     dependencies: [
         // 精确锁定版本：
-        .package(url: "https://github.com/HobaoKing/TextForge.git", exact: "1.0.6")
+        .package(url: "https://github.com/HobaoKing/TextForge.git", exact: "1.0.7")
         // 或跟随同一主版本内的次版本兼容更新：
-        // .package(url: "https://github.com/HobaoKing/TextForge.git", from: "1.0.6")
+        // .package(url: "https://github.com/HobaoKing/TextForge.git", from: "1.0.7")
         // 或本地联调：
         // .package(path: "../TextForge")
     ],
@@ -70,533 +84,1113 @@ let package = Package(
 ### 3. 构建环境与链接说明
 
 - **最低部署版本**：iOS 15.0+。
-- **系统依赖**：`TextForge` 的 `Package.swift` 已自动链接系统 `WebKit.framework` 与 `libxml2.tbd`（并会在 `TextForgeHTML` 调用前显式加载 `WKWebView` bundle，兼容开启 `-dead_strip_dylibs` 的宿主），宿主无需手动补添系统库。
-- **Objective-C 宿主**：需要在对应 target 的 Build Settings 开启 **Enable Modules (C and Objective-C)**（`CLANG_ENABLE_MODULES = YES`），在 `.m` / `.mm` 文件中使用 `@import TextForge;` 导入；请勿关闭 Swift 头文件导出。
-- **版本规则**：SPM 安装版本以 Git 标签为准。从 `1.0.6` 起，Git 标签和 SwiftPM 版本使用同一个 SemVer 版本号，GitHub Release 标题为 `TextForge <版本号>`。[版本与发布规则](AGENTS.md#版本与发布)
+- **系统依赖**：`Package.swift` 已自动链接系统 `WebKit.framework` 与 `libxml2.tbd`（`TextForgeHTML` 并在运行期主动引用 `WebKit` 类以兼容开启 `-dead_strip_dylibs` 的宿主），集成方无需手动添加系统库。
+- **Objective-C 宿主**：需要在对应 target 的 Build Settings 开启 **Enable Modules (C and Objective-C)**（`CLANG_ENABLE_MODULES = YES`），在 `.m` / `.mm` 文件中通过 `@import TextForge;` 导入，切勿关闭 Swift 头文件导出。
+- **版本与发布规则**：SPM 安装版本以 Git 标签为准。自 `1.0.6` 起 Git 标签与 SemVer 版本号一致，Release 标题为 `TextForge <版本号>`。
 
 ---
 
-## 快速开始
+## 阶段一：从零替换 UILabel
 
-### Swift
+仅用几行配置，把原生 `UILabel` 缺少的内边距、统一字/行/段距、固定行高与自动缩字补齐，纯文本与富文本直接共用一套引擎。
+
+### 1.1 基础间距与内边距
+
+- **解决什么问题**：原生 `UILabel` 没有内置 `contentInsets`，纯文本设字距/行距/段距也常常要手拼 `NSMutableParagraphStyle`；`TextForgeLabel` 直接提供统一属性，纯文本和现有 `NSAttributedString` 都能无缝继承。
+
+#### Swift
 
 ```swift
-import TextForge
 import UIKit
+import TextForge
 
-let label = TextForgeLabel()
-label.font = .systemFont(ofSize: 15)
-label.textColor = .label
-label.numberOfLines = 0
-label.lineBreakMode = .byTruncatingTail
-label.contentInsets = UIEdgeInsets(top: 8, left: 12, bottom: 8, right: 12)
-label.characterSpacing = 0.5
-label.lineSpacing = 4
-label.paragraphSpacing = 6
-label.textVerticalAlignment = .top
-label.text = "正文第一段\n正文第二段"
+func makeBasicLabel() -> TextForgeLabel {
+    let label = TextForgeLabel()
+    label.font = .systemFont(ofSize: 15)
+    label.textColor = .label
+    label.numberOfLines = 0
+    label.contentInsets = UIEdgeInsets(top: 12, left: 16, bottom: 12, right: 16)
+    label.characterSpacing = 0.5
+    label.lineSpacing = 6
+    label.paragraphSpacing = 10
+    label.text = "第一段展示内边距、字距与行距的均衡呼吸感。\n第二段通过 paragraphSpacing 自动拉开段间距离。"
+    return label
+}
 
-let input = TextForgeTextView()
-input.placeholder = "请输入评论…"
-input.placeholderFont = .systemFont(ofSize: 15)
-input.placeholderColor = .secondaryLabel
-input.onTextChange = { committedText in
-    print("已提交正文：", committedText)
+// 如需直接产出包含间距的纯正 NSAttributedString 供第三方控件或离线计算使用：
+func makeStyledAttributedText() -> NSAttributedString {
+    let raw = NSAttributedString(string: "离线复用同一套字距、行距与段距规则。")
+    return TextForgeTypography.styledText(
+        raw,
+        characterSpacing: 0.5,
+        lineSpacing: 6,
+        paragraphSpacing: 10
+    )
 }
 ```
 
-### Objective-C
-
-在 `.m` 或 `.mm` 文件中通过模块导入（需开启 **Enable Modules (C and Objective-C)**）：
+#### Objective-C
 
 ```objc
 @import UIKit;
 @import TextForge;
 
-TextForgeLabel *label = [[TextForgeLabel alloc] initWithFrame:CGRectZero];
-label.font = [UIFont systemFontOfSize:15];
-label.textColor = UIColor.labelColor;
-label.numberOfLines = 0;
-label.lineBreakMode = NSLineBreakByTruncatingTail;
-label.contentInsets = UIEdgeInsetsMake(8, 12, 8, 12);
-label.characterSpacing = 0.5;
-label.lineSpacing = 4;
-label.paragraphSpacing = 6;
-label.textVerticalAlignment = TextForgeVerticalAlignmentTop;
-label.text = @"正文第一段\n正文第二段";
+static TextForgeLabel *MakeBasicLabel(void) {
+    TextForgeLabel *label = [[TextForgeLabel alloc] init];
+    label.font = [UIFont systemFontOfSize:15];
+    label.textColor = UIColor.labelColor;
+    label.numberOfLines = 0;
+    label.contentInsets = UIEdgeInsetsMake(12, 16, 12, 16);
+    label.characterSpacing = 0.5;
+    label.lineSpacing = 6;
+    label.paragraphSpacing = 10;
+    label.text = @"第一段展示内边距、字距与行距的均衡呼吸感。\n第二段通过 paragraphSpacing 自动拉开段间距离。";
+    return label;
+}
 
-TextForgeTextView *input = [[TextForgeTextView alloc] initWithFrame:CGRectZero textContainer:nil];
-input.placeholder = @"请输入评论…";
-input.placeholderFont = [UIFont systemFontOfSize:15];
-input.placeholderColor = UIColor.secondaryLabelColor;
-input.onTextChange = ^(NSString *committedText) {
-    NSLog(@"已提交正文：%@", committedText);
-};
+static NSAttributedString *MakeStyledAttributedText(void) {
+    NSAttributedString *raw = [[NSAttributedString alloc] initWithString:@"离线复用同一套字距、行距与段距规则。"];
+    return [TextForgeTypography styledText:raw
+                          characterSpacing:@(0.5)
+                               lineSpacing:@(6)
+                          paragraphSpacing:@(10)];
+}
 ```
+
+- **注意事项**：
+  - `contentInsets` 同时影响绘制区域、`intrinsicContentSize` 与 `sizeThatFits(_:)`，并与 `textContainerInset` 等价同步。
+  - 若 `attributedText` 本身已设置圆角背景 `horizontalMargin`，`TextForgeTypography.styledText` 会在叠加 `characterSpacing` 时保留该水平留白不被覆盖。
 
 ---
 
-## 核心功能详细示例
+### 1.2 固定行高对齐与单行缩字
 
-### 1. 固定行高、局部高亮、行内圆角标签与图文/惰性视图混排
-
-- `fixedLineHeight`：行内存在高于行高的图标、表情或回退字体时，统一锁定每行高度并按该行字体升/降部居中基线。
-- `TextForgeBackground` + `horizontalMargin`：在不插空格、不改变原文 UTF-16 下标的前提下，在胶囊两侧自动预留水平留白（含双向混排与 `characterSpacing` 叠加场景）。
-- `TextForgeHighlight`：支持段内高亮色、按压变色（`highlightedTextColor`）、圆角按压底色、自定义 `userInfo`，并可搭配 `highlightTouchExtensionRadius` 扩大极短链接的手指可点区域。
-- `TextForgeAttachment`：支持图片内容模式（Retina 倍率保真）、立即传入的 `UIView` 以及**按可见视口惰性实例化**的 `UIView` 提供者闭包，并支持分别定制拷贝纯文本与 VoiceOver 朗读名称。
+- **解决什么问题**：混排不同字号、大号 Emoji 或多语言文字时，默认行高会被更高字体撑开导致列表视觉参差不齐；`fixedLineHeight` 将每行几何高度锁死为固定点数并按该行字体居中基线。结合 `textVerticalAlignment` 可控制短文本在固定高度控件内的上下位置，`adjustsFontSizeToFitWidth` + `minimumScaleFactor` 则处理单行超长文本自动缩字。
 
 #### Swift
 
 ```swift
-let bodyFont = UIFont.systemFont(ofSize: 15)
-let content = NSMutableAttributedString(string: "置顶公告 #创业圈# 点击详情 ", attributes: [
-    .font: bodyFont,
-    .foregroundColor: UIColor.label
-])
+import UIKit
+import TextForge
 
-// 1) 行内圆角胶囊标签：不插入空格即可与前后文自动保持间距
-let pillRange = (content.string as NSString).range(of: "置顶公告")
-let pill = TextForgeBackground(fillColor: .systemYellow.withAlphaComponent(0.25), cornerRadius: 4)
-pill.strokeColor = .systemOrange
-pill.strokeWidth = 0.5
-pill.insets = UIEdgeInsets(top: -1, left: -4, bottom: -1, right: -4)
-pill.apply(to: content, range: pillRange, horizontalMargin: 4)
+func makeFixedLineHeightLabel() -> TextForgeLabel {
+    let label = TextForgeLabel()
+    label.numberOfLines = 0
+    label.fixedLineHeight = 26
+    label.textVerticalAlignment = .top
+    label.contentInsets = UIEdgeInsets(top: 10, left: 12, bottom: 10, right: 12)
 
-// 2) 分段点击 / 长按交互 + 按压底色反馈
-let topicRange = (content.string as NSString).range(of: "#创业圈#")
-let topicHighlight = TextForgeHighlight(color: .systemBlue, backgroundColor: .systemBlue.withAlphaComponent(0.15))
-topicHighlight.highlightedTextColor = .systemIndigo
-topicHighlight.cornerRadius = 4
-topicHighlight.backgroundInsets = UIEdgeInsets(top: -1, left: -2, bottom: -1, right: -2)
-topicHighlight.userInfo = ["topic": "创业圈"]
-topicHighlight.tapAction = { view, text, range, rect in
-    if let info = TextForgeHighlight.highlight(in: text, at: range.location)?.userInfo {
-        print("点击话题：", info, "位置：", rect)
-    }
+    let text = NSMutableAttributedString(
+        string: "26pt 固定行高混排：",
+        attributes: [.font: UIFont.systemFont(ofSize: 15)]
+    )
+    text.append(NSAttributedString(
+        string: "22pt 大号标题",
+        attributes: [.font: UIFont.boldSystemFont(ofSize: 22), .foregroundColor: UIColor.systemBlue]
+    ))
+    text.append(NSAttributedString(
+        string: " 🎉 也不会把整行撑塌或贴底。",
+        attributes: [.font: UIFont.systemFont(ofSize: 15)]
+    ))
+    label.attributedText = text
+    return label
 }
-topicHighlight.longPressAction = { _, _, range, _ in
-    print("长按话题范围：", range)
-}
-topicHighlight.apply(to: content, range: topicRange)
 
-// 3) 图片附件：支持按内容模式缩放并保持 Retina 清晰度
-if let icon = UIImage(systemName: "checkmark.seal.fill") {
-    let iconText = TextForgeAttachment.image(
+func makeAutoShrinkSingleLineLabel() -> TextForgeLabel {
+    let label = TextForgeLabel()
+    label.numberOfLines = 1
+    label.font = .boldSystemFont(ofSize: 18)
+    label.adjustsFontSizeToFitWidth = true
+    label.minimumScaleFactor = 0.55
+    label.textVerticalAlignment = .center
+    label.text = "很长的标题会自动按比例缩小字号以完整展示在同一行内"
+    return label
+}
+```
+
+#### Objective-C
+
+```objc
+@import UIKit;
+@import TextForge;
+
+static TextForgeLabel *MakeFixedLineHeightLabel(void) {
+    TextForgeLabel *label = [[TextForgeLabel alloc] init];
+    label.numberOfLines = 0;
+    label.fixedLineHeight = 26.0;
+    label.textVerticalAlignment = TextForgeVerticalAlignmentTop;
+    label.contentInsets = UIEdgeInsetsMake(10, 12, 10, 12);
+
+    NSMutableAttributedString *text = [[NSMutableAttributedString alloc]
+        initWithString:@"26pt 固定行高混排："
+            attributes:@{ NSFontAttributeName: [UIFont systemFontOfSize:15] }];
+    [text appendAttributedString:[[NSAttributedString alloc]
+        initWithString:@"22pt 大号标题"
+            attributes:@{ NSFontAttributeName: [UIFont boldSystemFontOfSize:22],
+                          NSForegroundColorAttributeName: UIColor.systemBlueColor }]];
+    [text appendAttributedString:[[NSAttributedString alloc]
+        initWithString:@" 🎉 也不会把整行撑塌或贴底。"
+            attributes:@{ NSFontAttributeName: [UIFont systemFontOfSize:15] }]];
+    label.attributedText = text;
+    return label;
+}
+
+static TextForgeLabel *MakeAutoShrinkSingleLineLabel(void) {
+    TextForgeLabel *label = [[TextForgeLabel alloc] init];
+    label.numberOfLines = 1;
+    label.font = [UIFont boldSystemFontOfSize:18];
+    label.adjustsFontSizeToFitWidth = YES;
+    label.minimumScaleFactor = 0.55;
+    label.textVerticalAlignment = TextForgeVerticalAlignmentCenter;
+    label.text = @"很长的标题会自动按比例缩小字号以完整展示在同一行内";
+    return label;
+}
+```
+
+![基础内边距、固定行高与单行自动缩字实机截图](docs/images/01-spacing-and-line-height.png)
+
+- **注意事项**：
+  - `fixedLineHeight` 在 `TextForgeLabel` 与 `TextForgeContainer` 上均设为 `> 0` 时生效，设为 `0` 恢复自然行高。
+  - 单行自动缩字仅在 `numberOfLines == 1`、`adjustsFontSizeToFitWidth == true` 且 `0 < minimumScaleFactor < 1` 时触发。
+
+---
+
+## 阶段二：图文混排与行内标签
+
+当卡片里需要在文字流中穿插图标、真实可交互按钮，或者把「置顶」「精选」渲染成不破坏字符串下标的圆角胶囊标签时，这一组能力可以开箱完成。
+
+### 2.1 图片附件与内容模式裁切
+
+- **解决什么问题**：系统 `NSTextAttachment` 默认直接拉伸或按原图尺寸排版，容易失真且难以对齐文字中心线；`TextForgeAttachment.image` 支持 `.scaleToFill`、`.scaleAspectFit`、`.scaleAspectFill`、`.center` 裁切绘制，并按给定字体基线对齐顶部 / 中心 / 底部。
+
+#### Swift
+
+```swift
+import UIKit
+import TextForge
+
+@MainActor
+func makeImageAttachmentText(icon: UIImage, font: UIFont) -> NSAttributedString {
+    let text = NSMutableAttributedString()
+    text.append(TextForgeAttachment.image(
         icon,
-        contentMode: .scaleAspectFit,
-        size: CGSize(width: 16, height: 16),
-        font: bodyFont,
+        contentMode: .scaleAspectFill,
+        size: CGSize(width: 24, height: 18),
+        font: font,
+        alignment: .center
+    ))
+    text.append(NSAttributedString(string: " 保持 24×18 槽位中心对齐与高分屏清晰度", attributes: [.font: font]))
+    return text
+}
+```
+
+#### Objective-C
+
+```objc
+@import UIKit;
+@import TextForge;
+
+static NSAttributedString *MakeImageAttachmentText(UIImage *icon, UIFont *font) {
+    NSMutableAttributedString *text = [[NSMutableAttributedString alloc] init];
+    [text appendAttributedString:[TextForgeAttachment image:icon
+                                                contentMode:UIViewContentModeScaleAspectFill
+                                                       size:CGSizeMake(24, 18)
+                                                       font:font
+                                                  alignment:TextForgeVerticalAlignmentCenter]];
+    [text appendAttributedString:[[NSAttributedString alloc]
+        initWithString:@" 保持 24×18 槽位中心对齐与高分屏清晰度"
+            attributes:@{ NSFontAttributeName: font }]];
+    return text;
+}
+```
+
+- **注意事项**：除 `scaleToFill`、`scaleAspectFit`、`scaleAspectFill`、`center` 外，其它 `UIView.ContentMode` 统一按 `center` 处理；槽位内绘制会自动选取当前屏幕及图片最高倍率。
+
+---
+
+### 2.2 行内嵌入式视图与惰性加载
+
+- **解决什么问题**：某些富文本节点不只是静态图标，而是行内可点击的真按钮、动画图标或复选控件，同时长文本里滚出视口外的控件不希望提前分配；`TextForgeAttachment.view` 支持立即传入已有 `UIView`，也支持通过 `provider` 在进入标签可见区域时再按需创建。
+
+#### Swift
+
+```swift
+import UIKit
+import TextForge
+
+@MainActor
+func makeViewAttachmentText(followButton: UIButton, font: UIFont) -> NSAttributedString {
+    let text = NSMutableAttributedString(string: "推荐作者 ", attributes: [.font: font])
+
+    // 方式 1：直接嵌入已创建的 UIView
+    text.append(TextForgeAttachment.view(
+        followButton,
+        size: CGSize(width: 58, height: 22),
+        font: font,
+        alignment: .center
+    ))
+
+    text.append(NSAttributedString(string: " 或惰性按视口实例化 ", attributes: [.font: font]))
+
+    // 方式 2：仅当附件滚入标签可见视口时在主线程调用 provider
+    text.append(TextForgeAttachment.view(
+        size: CGSize(width: 44, height: 20),
+        font: font,
+        alignment: .center
+    ) {
+        let badge = UILabel()
+        badge.text = "NEW"
+        badge.font = .boldSystemFont(ofSize: 11)
+        badge.textColor = .white
+        badge.backgroundColor = .systemOrange
+        badge.textAlignment = .center
+        badge.layer.cornerRadius = 4
+        badge.layer.masksToBounds = true
+        return badge
+    })
+    return text
+}
+```
+
+#### Objective-C
+
+```objc
+@import UIKit;
+@import TextForge;
+
+static NSAttributedString *MakeViewAttachmentText(UIButton *followButton, UIFont *font) {
+    NSMutableAttributedString *text = [[NSMutableAttributedString alloc]
+        initWithString:@"推荐作者 "
+            attributes:@{ NSFontAttributeName: font }];
+
+    [text appendAttributedString:[TextForgeAttachment view:followButton
+                                                      size:CGSizeMake(58, 22)
+                                                      font:font
+                                                 alignment:TextForgeVerticalAlignmentCenter]];
+
+    [text appendAttributedString:[[NSAttributedString alloc]
+        initWithString:@" 或惰性按视口实例化 "
+            attributes:@{ NSFontAttributeName: font }]];
+
+    [text appendAttributedString:[TextForgeAttachment viewWithSize:CGSizeMake(44, 20)
+                                                              font:font
+                                                         alignment:TextForgeVerticalAlignmentCenter
+                                                          provider:^UIView *{
+        UILabel *badge = [[UILabel alloc] init];
+        badge.text = @"NEW";
+        badge.font = [UIFont boldSystemFontOfSize:11];
+        badge.textColor = UIColor.whiteColor;
+        badge.backgroundColor = UIColor.systemOrangeColor;
+        badge.textAlignment = NSTextAlignmentCenter;
+        badge.layer.cornerRadius = 4;
+        badge.layer.masksToBounds = YES;
+        return badge;
+    }]];
+    return text;
+}
+```
+
+- **注意事项**：
+  - 立即绑定的单个 `UIView` 同一时刻由当前显示的 `TextForgeLabel` 持有；滚出或迁移复用请优先使用 `provider` 惰性创建。
+  - 若富文本含实时 `UIView` 或惰性 `provider`，后台排版与列表缓存会自动安全回退或按条目保留状态，切勿在不同数据条目间共享同一个 `UIView` 实例。
+
+---
+
+### 2.3 附件复制与朗读替代文本
+
+- **解决什么问题**：图文混排内容被用户全选复制到剪切板或由 VoiceOver 朗读时，默认附件位置会变成无意义的 `\u{FFFC}`；`withTextAlternatives` 允许为附件单独指定复制纯文本和无障碍读屏文案。
+
+#### Swift
+
+```swift
+import UIKit
+import TextForge
+
+@MainActor
+func makeAccessibleAttachmentText(icon: UIImage, font: UIFont) -> NSAttributedString {
+    let rawBadge = TextForgeAttachment.image(
+        icon,
+        size: CGSize(width: 18, height: 18),
+        font: font,
         alignment: .center
     )
-    content.append(TextForgeAttachment.withTextAlternatives(iconText, copyText: "[认证]", accessibilityText: "官方认证"))
-}
+    let badge = TextForgeAttachment.withTextAlternatives(
+        rawBadge,
+        copyText: "[官方认证]",
+        accessibilityText: "官方认证徽章"
+    )
 
-// 4) 惰性视图附件：排版与后台预热零 UIView 分配，仅当滚入可视区域时首次创建
-let lazyBadge = TextForgeAttachment.view(
-    size: CGSize(width: 44, height: 18),
-    font: bodyFont,
-    alignment: .center
-) {
-    let button = UIButton(type: .system)
-    button.setTitle("关注", for: .normal)
-    button.titleLabel?.font = .systemFont(ofSize: 12, weight: .medium)
-    return button
-}
-content.append(TextForgeAttachment.withTextAlternatives(lazyBadge, copyText: "", accessibilityText: "关注按钮"))
+    let text = NSMutableAttributedString()
+    text.append(badge)
+    text.append(NSAttributedString(string: " 产品发布公告", attributes: [.font: font]))
 
-let label = TextForgeLabel()
-label.numberOfLines = 0
-label.fixedLineHeight = 24                  // 锁定每行 24pt，混排高附件不撑高单行
-label.highlightTouchExtensionRadius = 8     // 扩大局部高亮热区，不挤占布局
-label.attributedText = content
-label.textTapAction = { _, text, range, _ in
-    print("整标签点击字符：", (text.string as NSString).substring(with: range))
+    // 任意时刻可提取整段纯文本用于分享或埋点上报：
+    let plainCopy = TextForgeAttachment.copyText(for: text) // "[官方认证] 产品发布公告"
+    let spoken = TextForgeAttachment.accessibilityText(for: text) // "官方认证徽章 产品发布公告"
+    _ = (plainCopy, spoken)
+    return text
 }
 ```
 
 #### Objective-C
 
 ```objc
-UIFont *bodyFont = [UIFont systemFontOfSize:15];
-NSMutableAttributedString *content = [[NSMutableAttributedString alloc]
-    initWithString:@"置顶公告 #创业圈# 点击详情 "
-        attributes:@{NSFontAttributeName: bodyFont, NSForegroundColorAttributeName: UIColor.labelColor}];
+@import UIKit;
+@import TextForge;
 
-// 1) 行内圆角胶囊标签与水平外边距
-NSRange pillRange = [content.string rangeOfString:@"置顶公告"];
-TextForgeBackground *pill = [[TextForgeBackground alloc] initWithFillColor:UIColor.systemYellowColor cornerRadius:4];
-pill.strokeColor = UIColor.systemOrangeColor;
-pill.strokeWidth = 0.5;
-pill.insets = UIEdgeInsetsMake(-1, -4, -1, -4);
-[pill applyTo:content range:pillRange horizontalMargin:4];
+static NSAttributedString *MakeAccessibleAttachmentText(UIImage *icon, UIFont *font) {
+    NSAttributedString *rawBadge = [TextForgeAttachment image:icon
+                                                         size:CGSizeMake(18, 18)
+                                                         font:font
+                                                    alignment:TextForgeVerticalAlignmentCenter];
+    NSAttributedString *badge = [TextForgeAttachment attachmentString:rawBadge
+                                                             copyText:@"[官方认证]"
+                                                    accessibilityText:@"官方认证徽章"];
 
-// 2) 高亮点击与长按交互
-NSRange topicRange = [content.string rangeOfString:@"#创业圈#"];
-TextForgeHighlight *highlight = [[TextForgeHighlight alloc] initWithColor:UIColor.systemBlueColor
-                                                          backgroundColor:[UIColor.systemBlueColor colorWithAlphaComponent:0.15]];
-highlight.highlightedTextColor = UIColor.systemIndigoColor;
-highlight.cornerRadius = 4;
-highlight.backgroundInsets = UIEdgeInsetsMake(-1, -2, -1, -2);
-highlight.userInfo = @{@"topic": @"创业圈"};
-highlight.tapAction = ^(UIView *view, NSAttributedString *text, NSRange range, CGRect rect) {
-    TextForgeHighlight *item = [TextForgeHighlight highlightIn:text at:range.location];
-    NSLog(@"点击话题：%@ rect=%@", item.userInfo, NSStringFromCGRect(rect));
-};
-[highlight applyTo:content range:topicRange];
+    NSMutableAttributedString *text = [[NSMutableAttributedString alloc] init];
+    [text appendAttributedString:badge];
+    [text appendAttributedString:[[NSAttributedString alloc]
+        initWithString:@" 产品发布公告"
+            attributes:@{ NSFontAttributeName: font }]];
 
-// 3) 惰性 UIView 附件（仅滚入视口时在主线程创建）
-NSAttributedString *lazySlot = [TextForgeAttachment viewWithSize:CGSizeMake(44, 18)
-                                                            font:bodyFont
-                                                       alignment:TextForgeVerticalAlignmentCenter
-                                                        provider:^UIView * _Nonnull {
-    UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-    [btn setTitle:@"关注" forState:UIControlStateNormal];
-    return btn;
-}];
-[content appendAttributedString:[TextForgeAttachment attachmentString:lazySlot
-                                                            copyText:@""
-                                                   accessibilityText:@"关注按钮"]];
-
-TextForgeLabel *label = [[TextForgeLabel alloc] initWithFrame:CGRectZero];
-label.numberOfLines = 0;
-label.fixedLineHeight = 24;
-label.highlightTouchExtensionRadius = 8;
-label.attributedText = content;
+    NSString *plainCopy = [TextForgeAttachment copyTextForAttributedString:text];
+    NSString *spoken = [TextForgeAttachment accessibilityTextForAttributedString:text];
+    (void)plainCopy;
+    (void)spoken;
+    return text;
+}
 ```
 
-- 全局修改已有富文本间距可使用 `TextForgeTypography.styledText(_:characterSpacing:lineSpacing:paragraphSpacing:)`（传 `nil` 保留原属性、传 `0` 清除、并会叠加 `TextForgeBackground` 预留的边距字距）；对单行标签开启 `adjustsFontSizeToFitWidth = true` 与 `minimumScaleFactor < 1` 时，自定义排版同样执行精确二分缩字并保持点击命中坐标准确。
+- **注意事项**：`TextForgeLabel` 复制与 `TextForgeTextView.accessibilityValue` 会自动读取这些替代文案。
 
 ---
 
-### 2. 单个标签内选词、全标签复制与菜单联动
+### 2.4 行内圆角标签与双向间距
 
-给文章或聊天气泡开启 `isSelectable`，长按正文按系统分词选中，继续拖动可跨行扩选，松手后可拖两端手柄并复制选区（附件自动替换为复制文案，组合表情保持完整字素）。`allowsCopy` 用于未开启局部选区时直接长按复制全文；两者互不冲突。
-
-```swift
-label.isSelectable = true
-label.allowsCopy = true
-label.copyMenuVisibilityHandler = { [weak label] visible in
-    label?.backgroundColor = visible ? .secondarySystemFill : .clear
-}
-
-// 也可由业务代码主动选中可见范围或指定点分词
-if label.selectText(in: targetRange) {
-    let excerpt = label.selectedText
-    print("当前选区：", label.selectedRange, excerpt ?? "")
-}
-_ = label.selectWord(at: touchPoint)
-label.clearSelection()
-```
-
-```objc
-label.isSelectable = YES;
-label.allowsCopy = YES;
-__weak typeof(label) weakLabel = label;
-label.copyMenuVisibilityHandler = ^(BOOL visible) {
-    weakLabel.backgroundColor = visible ? UIColor.secondarySystemFillColor : UIColor.clearColor;
-};
-
-if ([label selectTextInRange:targetRange]) {
-    NSString *excerpt = label.selectedText;
-    NSLog(@"当前选区：%@ %@", NSStringFromRange(label.selectedRange), excerpt);
-}
-[label selectWordAtPoint:touchPoint];
-[label clearSelection];
-```
-
----
-
-### 3. 容器预排版、自定义截断标记、绕排路径与几何查询
-
-`TextForgeContainer` 与 `TextForgeLayout` 负责纯模型层度量与离线排版，坐标均以布局外部边界（包含 `insets`）左上角为原点，范围均使用原文的 UTF-16 下标；标签上的 `displayedTextLayout`、`isTruncated`、`showsTruncationToken`、`truncationTokenRect`、`characterIndex(at:)` 和 `rect(forRange:)` 则会自动换算到控件坐标系。
+- **解决什么问题**：把正文中的「置顶」「精选」变成圆角填充+描边胶囊时，传统做法往字符串里塞空格会污染复制结果、破坏后端下发下标，在双向混排（如 `ABC אבגד DEF`）边界还容易错位。`TextForgeBackground` 的 `horizontalMargin` 仅在渲染层与双向边界自动保留水平间隔，不增加字符长度。
 
 #### Swift
 
 ```swift
-// 构造自带点击反馈的「…全文」标记；也可自定义任意 NSAttributedString
-let readMore = TextForgeContainer.readMoreToken(title: "…展开全文") { [weak label] _, _, _, _ in
-    label?.numberOfLines = 0
+import UIKit
+import TextForge
+
+func makePillAttributedText() -> NSAttributedString {
+    let text = NSMutableAttributedString(
+        string: "置顶精选 ABC אבגד DEF",
+        attributes: [.font: UIFont.systemFont(ofSize: 15)]
+    )
+
+    let topTag = TextForgeBackground(fillColor: UIColor.systemBlue.withAlphaComponent(0.12), cornerRadius: 5)
+    topTag.strokeColor = .systemBlue
+    topTag.strokeWidth = 1
+    topTag.insets = UIEdgeInsets(top: 1, left: 5, bottom: 1, right: 5)
+    // horizontalMargin 自动在相邻文字边界留出 6pt 外边距，不改 UTF-16 下标
+    topTag.apply(to: text, range: NSRange(location: 0, length: 2), horizontalMargin: 6)
+
+    let rtlWord = TextForgeBackground(fillColor: UIColor.systemPurple.withAlphaComponent(0.12), cornerRadius: 4)
+    rtlWord.insets = UIEdgeInsets(top: 1, left: 4, bottom: 1, right: 4)
+    rtlWord.apply(to: text, range: NSRange(location: 9, length: 4), horizontalMargin: 4)
+    return text
 }
-
-let container = TextForgeContainer(
-    size: CGSize(width: availableWidth, height: .greatestFiniteMagnitude),
-    insets: UIEdgeInsets(top: 6, left: 10, bottom: 6, right: 10)
-)
-container.maximumNumberOfRows = 3
-container.lineBreakMode = .byTruncatingTail
-container.truncationToken = readMore
-container.fixedLineHeight = 22
-container.exclusionPaths = [UIBezierPath(rect: CGRect(x: 0, y: 0, width: 48, height: 48))] // 扣除 insets 后的相对坐标
-container.linkTextAttributes = [:] // 传入空字典保留文本自带链接色；默认使用系统链接色
-
-let layout = TextForgeLayout(container: container, attributedText: content)
-let rowHeight = layout.textBoundingSize.height
-
-// 几何与状态查询
-let rows = layout.rowCount
-let truncated = layout.isTruncated
-let tokenVisible = layout.showsTruncationToken
-let tokenRect = layout.truncationTokenRect
-let visibleRange = layout.visibleRange
-for line in layout.lines {
-    print("row=\(line.row), range=\(line.range), rect=\(line.rect), baseline=\(line.baseline)")
-}
-let charIndex = layout.characterIndex(at: tapPoint)
-let runRects = layout.rects(forRange: topicRange) // 双向文字同行多段视觉矩形，适合画背景
-
-// 赋给 Cell 内标签直接绘制与交互；设为 nil 恢复控件自有 text/attributedText
-label.textLayout = layout
 ```
 
 #### Objective-C
 
 ```objc
-__weak TextForgeLabel *weakLabel = label;
-NSAttributedString *readMore = [TextForgeContainer readMoreTokenWithTitle:@"…展开全文"
-    action:^(UIView *view, NSAttributedString *token, NSRange range, CGRect rect) {
-        weakLabel.numberOfLines = 0;
-    }];
+@import UIKit;
+@import TextForge;
 
-TextForgeContainer *container = [[TextForgeContainer alloc] initWithSize:CGSizeMake(availableWidth, CGFLOAT_MAX)
-                                                                  insets:UIEdgeInsetsMake(6, 10, 6, 10)];
-container.maximumNumberOfRows = 3;
-container.lineBreakMode = NSLineBreakByTruncatingTail;
-container.truncationToken = readMore;
-container.fixedLineHeight = 22;
-container.exclusionPaths = @[[UIBezierPath bezierPathWithRect:CGRectMake(0, 0, 48, 48)]];
-container.linkTextAttributes = @{};
+static NSAttributedString *MakePillAttributedText(void) {
+    NSMutableAttributedString *text = [[NSMutableAttributedString alloc]
+        initWithString:@"置顶精选 ABC אבגד DEF"
+            attributes:@{ NSFontAttributeName: [UIFont systemFontOfSize:15] }];
 
-TextForgeLayout *layout = [[TextForgeLayout alloc] initWithContainer:container attributedText:content];
-CGFloat rowHeight = layout.textBoundingSize.height;
-NSArray<NSValue *> *runRectValues = [layout rectsForRange:topicRange];
-NSInteger charIndex = [layout characterIndexAtPoint:tapPoint];
-label.textLayout = layout;
+    TextForgeBackground *topTag = [[TextForgeBackground alloc]
+        initWithFillColor:[UIColor.systemBlueColor colorWithAlphaComponent:0.12]
+             cornerRadius:5];
+    topTag.strokeColor = UIColor.systemBlueColor;
+    topTag.strokeWidth = 1.0;
+    topTag.insets = UIEdgeInsetsMake(1, 5, 1, 5);
+    [topTag applyTo:text range:NSMakeRange(0, 2) horizontalMargin:6.0];
+
+    TextForgeBackground *rtlWord = [[TextForgeBackground alloc]
+        initWithFillColor:[UIColor.systemPurpleColor colorWithAlphaComponent:0.12]
+             cornerRadius:4];
+    rtlWord.insets = UIEdgeInsetsMake(1, 4, 1, 4);
+    [rtlWord applyTo:text range:NSMakeRange(9, 4) horizontalMargin:4.0];
+    return text;
+}
 ```
+
+![行内圆角标签、双向字距与图文/视图附件混排实机截图](docs/images/02-pill-and-attachments.png)
+
+- **注意事项**：
+  - `insets` 控制背景/边框相对字形本身的上下左右扩展；`horizontalMargin` 控制背景外沿与前后相邻非同背景字形之间的隔离距离。
+  - 若需要描边，`strokeWidth` 与 `strokeColor` 须同时设置。
 
 ---
 
-### 4. 单控件异步准备与滚动列表跨 Cell 复用缓存
+## 阶段三：交互与选区
 
-#### 4.1 单个标签 / 后台预排版
+在可视化富文本上补全点击、长按按压反馈、微链接热区扩增、按词/拖选高亮手柄、系统复制菜单与 VoiceOver 无障碍自定义动作。
 
-对于独立卡片，可使用 `TextForgeLayout.prepare`（`renderScale: 0` 仅排版，传屏幕 `displayScale` 同步预绘透明位图），或直接调用标签上的 `setAttributedTextAsynchronously`（宽变更或更换内容自动取消旧请求）：
+### 3.1 局部高亮点击与热区扩大
 
-```swift
-// 方式 A：独立后台预排版
-let task = TextForgeLayout.prepare(
-    attributedText: content,
-    container: container,
-    renderScale: label.traitCollection.displayScale,
-    traitCollection: label.traitCollection
-) { [weak label] layout in
-    label?.textLayout = layout
-}
-// 页面关闭或模型淘汰时：task.cancel()
+- **解决什么问题**：新闻摘要、协议条款里的短链接区域很小，手指容易点空；并且点击时常需要背景高亮、文字变色以及按压圆角，外加区分普通区域点击与具体片段回调。
 
-// 方式 B：直接在标签上发起异步替换
-let labelTask = label.setAttributedTextAsynchronously(
-    content,
-    size: CGSize(width: availableWidth, height: .greatestFiniteMagnitude),
-    rendersAsynchronously: true
-) {
-    print("异步排版交付完成")
-}
-```
-
-#### 4.2 列表缓存 `TextForgeListLayoutCache`
-
-每个列表持有一个 `TextForgeListLayoutCache`（默认位图缓存上限 16 MiB、布局条数上限 128、尺寸上限 1024），每个条目版本创建一个 `TextForgeListItem`。
-
-- **跨实例内容去重**：不同列表模型或重新拼装的 `TextForgeListItem`，只要文本、视觉样式、附件与容器配置等价，即可跨实例共享测量尺寸、几何排版引擎与预绘位图，并自动绑定各自条目自身的 `attributedText` 与高亮点击闭包。
-- **双级预算隔离**：单条大图超出 `bitmapByteLimit` 或位图被淘汰后，`geometryLayouts` 与 `sizes` 仍保留纯几何布局与行高结果，热滑时仍可同步命中。
+#### Swift
 
 ```swift
-// 1) 列表页持有一个缓存实例；模型持有 item
-let layoutCache = TextForgeListLayoutCache(bitmapByteLimit: 16 * 1024 * 1024, layoutCountLimit: 128)
-let item = TextForgeListItem(attributedText: content, container: container)
+import UIKit
+import TextForge
 
-// 2) tableView(_:heightForRowAt:) / prefetchRowsAt 查询高度与预热
-if let cachedSize = layoutCache.cachedSize(for: item, size: constraintSize, traitCollection: traits)?.cgSizeValue {
-    return cachedSize.height
-}
+func configureInteractiveHighlight(on label: TextForgeLabel) {
+    let raw = "请阅读 《用户协议》 后继续操作"
+    let text = NSMutableAttributedString(string: raw, attributes: [
+        .font: UIFont.systemFont(ofSize: 15),
+        .foregroundColor: UIColor.label
+    ])
+    let range = (raw as NSString).range(of: "《用户协议》")
 
-// 3) Cell 绑定（cell 内保存 var layoutTask: TextForgeLayoutTask?）
-layoutTask?.cancel()
-layoutTask = nil
-
-// 优先同步读取完整位图布局；若位图已淘汰或仅做过测高，也可回退 cachedLayout(for:size:traitCollection:) 取纯几何布局
-if let resident = layoutCache.cachedLayout(for: item, size: rowSize, renderScale: traits.displayScale, traitCollection: traits)
-    ?? layoutCache.cachedLayout(for: item, size: rowSize, traitCollection: traits) {
-    cell.titleLabel.textLayout = resident
-} else {
-    layoutTask = layoutCache.prepare(
-        item,
-        size: rowSize,
-        renderScale: traits.displayScale,
-        traitCollection: traits
-    ) { [weak cell] layout in
-        cell?.titleLabel.textLayout = layout
+    let highlight = TextForgeHighlight(
+        color: .systemBlue,
+        backgroundColor: UIColor.systemBlue.withAlphaComponent(0.18)
+    )
+    highlight.highlightedTextColor = .systemIndigo
+    highlight.cornerRadius = 5
+    highlight.backgroundInsets = UIEdgeInsets(top: -2, left: -3, bottom: -2, right: -3)
+    highlight.userInfo = ["route": "terms"]
+    highlight.tapAction = { _, attrText, hitRange, _ in
+        print("点击协议：", attrText.attributedSubstring(from: hitRange).string)
     }
-}
-```
+    highlight.apply(to: text, range: range)
 
-```objc
-// Objective-C Cell 绑定与列表缓存读取
-[self.layoutTask cancel];
-self.layoutTask = nil;
-
-TextForgeLayout *resident = [cache cachedLayoutForItem:item size:rowSize renderScale:traits.displayScale traitCollection:traits]
-    ?: [cache cachedLayoutForItem:item size:rowSize traitCollection:traits];
-if (resident) {
-    self.titleLabel.textLayout = resident;
-} else {
-    __weak typeof(self) weakSelf = self;
-    self.layoutTask = [cache prepareItem:item size:rowSize renderScale:traits.displayScale traitCollection:traits
-                              completion:^(TextForgeLayout *layout) {
-        weakSelf.titleLabel.textLayout = layout;
-    }];
-}
-```
-
-- 长文不限行更新（如分段追加消息、HTML 图片分批回填）直接赋值 `label.attributedText` 即可：同宽无自定义行距时引擎自动校验变化段几何并仅增量重排变化段落及其后内容。
-
----
-
-### 5. HTML 富文本异步导入与多图合并更新
-
-HTML 字符串由系统 [WebKit 的 HTML 导入接口](https://developer.apple.com/documentation/foundation/nsattributedstring/loadfromhtml(string:options:completionhandler:)) 在主线程完成转换，可直接使用或配合 `TextForgeHTMLReadingStyle` 接管默认字体、颜色、最大图宽与宿主图片下载缓存。
-
-#### 5.1 轻量导入（使用系统默认转换与加载）
-
-```swift
-let html = "<p><strong>服务说明</strong> &amp; <a href='terms'>使用条款</a></p>"
-let base = URL(string: "https://example.com/help/")
-TextForgeHTML.attributedString(from: html, baseURL: base) { text, error in
-    guard let text else {
-        label.text = error?.localizedDescription
-        return
-    }
     label.attributedText = text
-    input.attributedText = text
+    // 将链接附近可响应点击的热区向四周扩宽 10pt（含贴边窄按钮场景）
+    label.highlightTouchExtensionRadius = 10
+    label.highlightLongPressAction = { _, attrText, hitRange, rect in
+        print("长按高亮：", attrText.attributedSubstring(from: hitRange).string, rect)
+    }
+    label.textTapAction = { _, _, _, _ in
+        print("点击了非高亮区域")
+    }
 }
 ```
 
+#### Objective-C
+
 ```objc
-[TextForgeHTML attributedStringFromHTML:@"<p><b>服务说明</b> &amp; <a href='terms'>使用条款</a></p>"
-                               baseURL:[NSURL URLWithString:@"https://example.com/help/"]
-                            completion:^(NSAttributedString *text, NSError *error) {
-    if (error) {
-        label.text = error.localizedDescription;
-        return;
-    }
+@import UIKit;
+@import TextForge;
+
+static void ConfigureInteractiveHighlight(TextForgeLabel *label) {
+    NSString *raw = @"请阅读 《用户协议》 后继续操作";
+    NSMutableAttributedString *text = [[NSMutableAttributedString alloc]
+        initWithString:raw
+            attributes:@{ NSFontAttributeName: [UIFont systemFontOfSize:15],
+                          NSForegroundColorAttributeName: UIColor.labelColor }];
+    NSRange range = [raw rangeOfString:@"《用户协议》"];
+
+    TextForgeHighlight *highlight = [[TextForgeHighlight alloc]
+        initWithColor:UIColor.systemBlueColor
+      backgroundColor:[UIColor.systemBlueColor colorWithAlphaComponent:0.18]];
+    highlight.highlightedTextColor = UIColor.systemIndigoColor;
+    highlight.cornerRadius = 5;
+    highlight.backgroundInsets = UIEdgeInsetsMake(-2, -3, -2, -3);
+    highlight.userInfo = @{ @"route": @"terms" };
+    highlight.tapAction = ^(UIView *container, NSAttributedString *attrText, NSRange hitRange, CGRect rect) {
+        NSLog(@"点击协议：%@", [attrText attributedSubstringFromRange:hitRange].string);
+    };
+    [highlight applyTo:text range:range];
+
     label.attributedText = text;
-    input.attributedText = text;
-}];
+    label.highlightTouchExtensionRadius = 10.0;
+    label.highlightLongPressAction = ^(UIView *container, NSAttributedString *attrText, NSRange hitRange, CGRect rect) {
+        NSLog(@"长按高亮：%@", [attrText attributedSubstringFromRange:hitRange].string);
+    };
+    label.textTapAction = ^(UIView *container, NSAttributedString *attrText, NSRange hitRange, CGRect rect) {
+        NSLog(@"点击了非高亮区域");
+    };
+}
 ```
 
-#### 5.2 阅读样式、宿主图片缓存与多图合并回调（`TextForgeHTMLImageUpdate`）
-
-```swift
-let style = TextForgeHTMLReadingStyle()
-style.defaultFont = .preferredFont(forTextStyle: .body)
-style.textColor = .label
-style.linkColor = .systemIndigo
-style.underlinesLinks = false
-style.maximumImageWidth = availableWidth
-style.placeholderSize = CGSize(width: 48, height: 32)
-style.placeholderImage = placeholderImage
-
-articleTask?.cancel()
-articleTask = TextForgeHTML.importHTML(
-    html,
-    baseURL: base,
-    readingStyle: style,
-    imageLoader: { url, reply in
-        let download = URLSession.shared.dataTask(with: url) { data, _, _ in
-            reply(data.flatMap { UIImage(data: $0) })
-        }
-        download.resume()
-        return { download.cancel() }
-    },
-    imageUpdate: { [weak self] batch in
-        // batch.isInitial：首次占位快照；batch.didChangeSize：图片回填导致尺寸变化，需重算行高
-        self?.label.attributedText = batch.attributedText
-        if batch.didChangeSize { self?.invalidateCellHeight() }
-    },
-    completion: { [weak self] finalText, error in
-        if let finalText { self?.label.attributedText = finalText }
-        else if let error { self?.label.text = error.localizedDescription }
-    }
-)
-```
-
-```objc
-TextForgeHTMLReadingStyle *style = [TextForgeHTMLReadingStyle new];
-style.defaultFont = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
-style.textColor = UIColor.labelColor;
-style.linkColor = UIColor.systemIndigoColor;
-style.underlinesLinks = @NO;
-style.maximumImageWidth = availableWidth;
-style.placeholderSize = CGSizeMake(48, 32);
-
-[self.articleTask cancel];
-__weak typeof(self) weakSelf = self;
-self.articleTask = [TextForgeHTML importHTML:html baseURL:base readingStyle:style
-    imageLoader:^dispatch_block_t(NSURL *url, void (^reply)(UIImage *)) {
-        NSURLSessionDataTask *download = [NSURLSession.sharedSession dataTaskWithURL:url
-            completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-                reply(data ? [UIImage imageWithData:data] : nil);
-            }];
-        [download resume];
-        return ^{ [download cancel]; };
-    } imageUpdate:^(TextForgeHTMLImageUpdate *batch) {
-        weakSelf.label.attributedText = batch.attributedText;
-        if (batch.didChangeSize) { [weakSelf invalidateCellHeight]; }
-    } completion:^(NSAttributedString *finalText, NSError *error) {
-        if (finalText) { weakSelf.label.attributedText = finalText; }
-        else if (error) { weakSelf.label.text = error.localizedDescription; }
-    }];
-```
-
-- **样式优先级与图片策略**：`TextForgeHTMLReadingStyle` 仅注入 `:where(...)` 零权重默认规则，HTML 作者内联样式或 `<style>` 始终优先；相同图片 URL 仅请求一次，响应式 `<picture>` 回退取 `img src`，`data:` 图片本地解码；`imageLoader` 为空时走 WebKit 默认加载。
-- **Cell 生命周期清理**：在 `prepareForReuse()` 与同一 Cell 就地换文时先调用 `articleTask?.cancel()` 再清空正文并绑定新任务，取消会立即撤销在途下载并丢弃未交付结果。
+- **注意事项**：
+  - 优先派发命中的 `highlight.tapAction`（若为 `nil` 则走标签统一的 `highlightTapAction`），否则当落点命中文本外沿或普通文字时走 `textTapAction`。
+  - 系统 `.link` 属性会自动使用 `linkTextAttributes` 渲染并同样被识别为高亮，同时暴露给 VoiceOver 的 `accessibilityCustomActions`。
 
 ---
 
-### 6. `TextForgeTextView` 输入框、IME 组字回调与就地样式高亮
+### 3.2 自由拖选与系统复制菜单
 
-`TextForgeTextView` 完整保留原生 `UITextViewDelegate` 与通知链路。`onTextChange` 会跳过中文拼音等 `markedTextRange != nil` 的组字阶段，无论候选字上屏、经由 `replace` / `unmarkText` 提交、取消恢复原文，还是在 `UITextViewDelegate.textViewDidChange(_:)` 内对 `text` 或 `textStorage` 做同步字数裁剪 / 粘贴剪切，均精确按已提交正文的真实净变化回调。
+- **解决什么问题**：评论或动态文本常允许用户长按选词、拖动左右手柄自由扩选并弹出系统「拷贝」菜单；业务端也可能需要通过代码直接选中某词（如检索定位）或感知复制菜单的显隐状态。
 
-需要实时渲染 `@提及`、`#话题#` 或敏感词颜色时，使用 `updateTextAttributes(_:)`（仅在非组字态写入变化的属性段，**保持光标 `selectedRange`、`typingAttributes` 及滚动位置不跳动，也不额外重入 `onTextChange`**）：
+#### Swift
 
 ```swift
-final class CommentComposerController: UIViewController, UITextViewDelegate {
+import UIKit
+import TextForge
+
+func configureSelectableLabel(_ label: TextForgeLabel) {
+    label.font = .systemFont(ofSize: 15)
+    label.numberOfLines = 0
+    label.text = "支持长按按词选中、拖动手柄微调选区，以及弹出系统复制菜单。"
+    label.isSelectable = true
+    label.allowsCopy = true
+    label.copyMenuVisibilityHandler = { visible in
+        print("复制菜单状态：", visible ? "已展示" : "已隐藏")
+    }
+}
+
+func programmaticSelect(_ label: TextForgeLabel) {
+    // 1) 按指定 UTF-16 范围选中并弹起手柄
+    label.selectText(in: NSRange(location: 4, length: 4))
+    // 2) 或者按触摸坐标按词选中：
+    // label.selectWord(at: CGPoint(x: 80, y: 20))
+    print("当前选中文案：", label.selectedText ?? "")
+    // 清空选区：label.clearSelection()
+}
+```
+
+#### Objective-C
+
+```objc
+@import UIKit;
+@import TextForge;
+
+static void ConfigureSelectableLabel(TextForgeLabel *label) {
+    label.font = [UIFont systemFontOfSize:15];
+    label.numberOfLines = 0;
+    label.text = @"支持长按按词选中、拖动手柄微调选区，以及弹出系统复制菜单。";
+    label.isSelectable = YES;
+    label.allowsCopy = YES;
+    label.copyMenuVisibilityHandler = ^(BOOL visible) {
+        NSLog(@"复制菜单状态：%@", visible ? @"已展示" : @"已隐藏");
+    };
+}
+
+static void ProgrammaticSelect(TextForgeLabel *label) {
+    [label selectTextInRange:NSMakeRange(4, 4)];
+    NSLog(@"当前选中文案：%@", label.selectedText ?: @"");
+    // 按坐标选词：[label selectWordAtPoint:CGPointMake(80, 20)];
+    // 清空选区：[label clearSelection];
+}
+```
+
+![高亮热区扩大、按压反馈与选区拖选手柄实机截图](docs/images/03-highlight-and-selection.png)
+
+- **注意事项**：
+  - `allowsCopy` 独立控制是否响应整段长按拷贝；开启 `isSelectable = true` 后，即使未单独设置 `allowsCopy`，也可通过手柄选区弹出复制菜单。
+  - 若选中范围跨越了附件，复制内容自动使用 `withTextAlternatives` 指定的 `copyText`。
+
+---
+
+## 阶段四：复杂排版
+
+用于解决截断展开、异形文字绕排、以及算高 / 逐行基线 / 搜索词边框等精准排版控制。
+
+### 4.1 自定义截断展开标记
+
+- **解决什么问题**：系统 `UILabel` 的省略号只是一段静态字符；而实际 Feeds 流经常要求末行显示高对比的 `…展开全文` 按钮，点击后立即切换到完整正文，并能准确判断当前内容是否真的被截断。
+
+#### Swift
+
+```swift
+import UIKit
+import TextForge
+
+func configureReadMoreLabel(_ label: TextForgeLabel, onExpand: @escaping () -> Void) {
+    label.numberOfLines = 3
+    label.lineBreakMode = .byTruncatingTail
+    label.truncationToken = TextForgeContainer.readMoreToken(title: "…展开全文") { _, _, _, _ in
+        onExpand()
+    }
+    label.text = "这是一段用于演示多行收起与展开的长文本内容，当超过三行高度时，末行末尾会自动替换为可点击的「…展开全文」标记。"
+
+    // 布局完成后可直接核查：
+    // label.isTruncated / label.showsTruncationToken / label.truncationTokenRect
+}
+```
+
+#### Objective-C
+
+```objc
+@import UIKit;
+@import TextForge;
+
+static void ConfigureReadMoreLabel(TextForgeLabel *label, dispatch_block_t onExpand) {
+    label.numberOfLines = 3;
+    label.lineBreakMode = NSLineBreakByTruncatingTail;
+    label.truncationToken = [TextForgeContainer readMoreTokenWithTitle:@"…展开全文"
+                                                                action:^(UIView *view, NSAttributedString *text, NSRange range, CGRect rect) {
+        if (onExpand) { onExpand(); }
+    }];
+    label.text = @"这是一段用于演示多行收起与展开的长文本内容，当超过三行高度时，末行末尾会自动替换为可点击的「…展开全文」标记。";
+}
+```
+
+- **注意事项**：`truncationToken` 需配合 `numberOfLines > 0`（或 `TextForgeContainer.maximumNumberOfRows > 0`）及会产生尾部截断的 `lineBreakMode`（如 `.byTruncatingTail`）使用。
+
+---
+
+### 4.2 文字环绕避让路径
+
+- **解决什么问题**：卡片左上角放头像、右上角放推荐徽章或浮层角标时，正文不能盖住元素，而是沿着指定矩形/圆角路径自然避让排版。
+
+#### Swift
+
+```swift
+import UIKit
+import TextForge
+
+func configureExclusionLabel(_ label: TextForgeLabel) {
+    label.numberOfLines = 0
+    label.font = .systemFont(ofSize: 15)
+    label.contentInsets = UIEdgeInsets(top: 10, left: 12, bottom: 10, right: 12)
+    // 预留左上角 64×64 圆角头像占位区域（坐标相对于标签布局区）
+    let avatarHole = UIBezierPath(roundedRect: CGRect(x: 12, y: 10, width: 64, height: 64), cornerRadius: 12)
+    label.exclusionPaths = [avatarHole]
+    label.text = "文本流在避让左上角 64×64 圆角区域后会自动绕排其右侧空间，超出头像底部后再恢复整行宽排布。"
+}
+```
+
+#### Objective-C
+
+```objc
+@import UIKit;
+@import TextForge;
+
+static void ConfigureExclusionLabel(TextForgeLabel *label) {
+    label.numberOfLines = 0;
+    label.font = [UIFont systemFontOfSize:15];
+    label.contentInsets = UIEdgeInsetsMake(10, 12, 10, 12);
+    UIBezierPath *avatarHole = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(12, 10, 64, 64)
+                                                          cornerRadius:12];
+    label.exclusionPaths = @[avatarHole];
+    label.text = @"文本流在避让左上角 64×64 圆角区域后会自动绕排其右侧空间，超出头像底部后再恢复整行宽排布。";
+}
+```
+
+- **注意事项**：若同时配置了 `truncationToken` 且末尾行被 `exclusionPaths` 收窄，引擎仍会结合剩余行宽安全保留截断标记，不会退化回流。
+
+---
+
+### 4.3 容器预排版与几何查询
+
+- **解决什么问题**：需要把高度计算从 UI 控件里抽离出来做数据源预先算高，或者定位某个关键词在界面中的跨行矩形、查询用户点中的字符下标、`lines` 每行范围和基线位置。
+
+#### Swift
+
+```swift
+import UIKit
+import TextForge
+
+@MainActor
+func precomputeLayoutAndInspect(attributedText: NSAttributedString, maxWidth: CGFloat) -> TextForgeLayout {
+    let container = TextForgeContainer(size: CGSize(width: maxWidth, height: 400))
+    container.insets = UIEdgeInsets(top: 10, left: 12, bottom: 10, right: 12)
+    container.maximumNumberOfRows = 4
+    container.fixedLineHeight = 22
+
+    let layout = TextForgeLayout(container: container, attributedText: attributedText)
+    print("文本总尺寸：", layout.textBoundingSize, "行数：", layout.rowCount)
+
+    for line in layout.lines {
+        print("第 \(line.row) 行 range=\(line.range) rect=\(line.rect) baseline=\(line.baseline)")
+    }
+
+    // 查询关键词视觉碎片边框（跨行或双向混排会拆为多个矩形）
+    let keywordRange = (attributedText.string as NSString).range(of: "TextForge")
+    if keywordRange.location != NSNotFound {
+        let fragmentRects = layout.rects(forRange: keywordRange)
+        print("关键词碎片矩形：", fragmentRects)
+    }
+
+    // 把点击坐标映射回原文 UTF-16 下标
+    let index = layout.characterIndex(at: CGPoint(x: 40, y: 20))
+    _ = index
+    return layout
+}
+```
+
+#### Objective-C
+
+```objc
+@import UIKit;
+@import TextForge;
+
+static TextForgeLayout *PrecomputeLayoutAndInspect(NSAttributedString *attributedText, CGFloat maxWidth) {
+    TextForgeContainer *container = [[TextForgeContainer alloc] initWithSize:CGSizeMake(maxWidth, 400)];
+    container.insets = UIEdgeInsetsMake(10, 12, 10, 12);
+    container.maximumNumberOfRows = 4;
+    container.fixedLineHeight = 22.0;
+
+    TextForgeLayout *layout = [[TextForgeLayout alloc] initWithContainer:container attributedText:attributedText];
+    NSLog(@"文本总尺寸：%@ 行数：%ld", NSStringFromCGSize(layout.textBoundingSize), (long)layout.rowCount);
+
+    for (TextForgeLine *line in layout.lines) {
+        NSLog(@"第 %ld 行 range=%@ rect=%@ baseline=%.2f",
+              (long)line.row, NSStringFromRange(line.range), NSStringFromCGRect(line.rect), line.baseline);
+    }
+
+    NSRange keywordRange = [attributedText.string rangeOfString:@"TextForge"];
+    if (keywordRange.location != NSNotFound) {
+        NSArray<NSValue *> *fragmentRects = [layout rectsForRange:keywordRange];
+        NSLog(@"关键词碎片矩形数：%lu", (unsigned long)fragmentRects.count);
+    }
+
+    NSInteger index = [layout characterIndexAtPoint:CGPointMake(40, 20)];
+    (void)index;
+    return layout;
+}
+```
+
+![自定义截断展开、绕排路径与逐行/区间几何调试截图](docs/images/04-truncation-and-exclusion.png)
+
+- **注意事项**：生成完 `TextForgeLayout` 后，直接赋给 `label.textLayout = layout` 可跳过控件内部二次排版；设为 `nil` 则重新使用控件自身属性。
+
+---
+
+## 阶段五：异步绘制与列表缓存
+
+针对包含长文本与高频快速滑动的 Feed 流，提供后台分离预排版与跨 Cell/跨等价内容的缓存管理。
+
+### 5.1 单控件异步预排版与取消
+
+- **解决什么问题**：详情页或公告卡片如果正文很长，直接在主线程同步计算与光栅化易引发掉帧；`setAttributedTextAsynchronously` / `TextForgeLayout.prepare` 将可后台化的排版及预渲染推入后台队列，返回 `TextForgeLayoutTask` 以便重用或滑出时立刻取消。
+
+#### Swift
+
+```swift
+import UIKit
+import TextForge
+
+final class FeedCardCell: UITableViewCell {
+    private let contentLabel = TextForgeLabel()
+    private var currentTask: TextForgeLayoutTask?
+
+    override func prepareForReuse() {
+        super.prepareForReuse()
+        currentTask?.cancel()
+        currentTask = nil
+    }
+
+    func bind(attributedText: NSAttributedString, targetWidth: CGFloat) {
+        currentTask?.cancel()
+        contentLabel.numberOfLines = 0
+        currentTask = contentLabel.setAttributedTextAsynchronously(
+            attributedText,
+            size: CGSize(width: targetWidth, height: .greatestFiniteMagnitude),
+            rendersAsynchronously: true
+        ) {
+            // 仅当任务未取消且宽度仍匹配时才会主线程交付到控件
+            print("异步排版与预绘完成")
+        }
+    }
+}
+```
+
+#### Objective-C
+
+```objc
+@import UIKit;
+@import TextForge;
+
+@interface FeedCardCell : UITableViewCell
+@property (nonatomic, strong) TextForgeLabel *contentLabel;
+@property (nonatomic, strong, nullable) TextForgeLayoutTask *currentTask;
+@end
+
+@implementation FeedCardCell
+
+- (void)prepareForReuse {
+    [super prepareForReuse];
+    [self.currentTask cancel];
+    self.currentTask = nil;
+}
+
+- (void)bindAttributedText:(NSAttributedString *)attributedText targetWidth:(CGFloat)targetWidth {
+    [self.currentTask cancel];
+    self.contentLabel.numberOfLines = 0;
+    self.currentTask = [self.contentLabel setAttributedTextAsynchronously:attributedText
+                                                                     size:CGSizeMake(targetWidth, CGFLOAT_MAX)
+                                                    rendersAsynchronously:YES
+                                                               completion:^{
+        NSLog(@"异步排版与预绘完成");
+    }];
+}
+
+@end
+```
+
+- **注意事项**：当正文或截断标记内包含实时 `UIView` 等无法脱离主线程的属性时，`TextForgeLayout.prepare` 会自动在内部安全退回主线程排版，调用侧无需手动兜底判断。
+
+---
+
+### 5.2 滚动列表跨单元复用缓存
+
+- **解决什么问题**：长列表中既有数据源 `prefetch`，又有 Cell 渲染时的即时绑定，还常出现多条数据正文外观完全相同（各自只带不同点击回调）的情况；`TextForgeListLayoutCache` 对**内容等价项共享同一份度量、引擎和位图结果**同时保留各自回调不串包，并把纯几何条目上限（`layoutCountLimit`）与位图内存字节预算（`bitmapByteLimit`）独立分开——哪怕位图被系统提前回收，几何布局和行高仍然秒命中。
+
+#### Swift
+
+```swift
+import UIKit
+import TextForge
+
+@MainActor
+final class FeedLayoutManager {
+    // 16MB 位图缓存上限 + 128 条纯几何缓存上限
+    let cache = TextForgeListLayoutCache(bitmapByteLimit: 16 * 1024 * 1024, layoutCountLimit: 128)
+    private var tasks: [IndexPath: TextForgeLayoutTask] = [:]
+
+    func makeItem(attributedText: NSAttributedString, width: CGFloat) -> TextForgeListItem {
+        let container = TextForgeContainer(size: CGSize(width: width, height: .greatestFiniteMagnitude))
+        container.maximumNumberOfRows = 4
+        return TextForgeListItem(attributedText: attributedText, container: container)
+    }
+
+    // 在 prefetchRowsAt 调用预排版与预绘
+    func prefetch(item: TextForgeListItem, indexPath: IndexPath, size: CGSize, traits: UITraitCollection) {
+        tasks[indexPath]?.cancel()
+        tasks[indexPath] = cache.prepare(
+            item,
+            size: size,
+            renderScale: max(1, traits.displayScale),
+            traitCollection: traits
+        ) { _ in }
+    }
+
+    // 在 cellForRowAt 绑定（已驻留缓存同步命中，未命中则发起异步补充）
+    func bind(_ label: TextForgeLabel, item: TextForgeListItem, size: CGSize, traits: UITraitCollection) -> TextForgeLayoutTask? {
+        if let layout = cache.cachedLayout(for: item, size: size, renderScale: max(1, traits.displayScale), traitCollection: traits)
+            ?? cache.cachedLayout(for: item, size: size, traitCollection: traits) {
+            label.textLayout = layout
+            return nil
+        }
+        return cache.prepare(item, size: size, renderScale: max(1, traits.displayScale), traitCollection: traits) { [weak label] layout in
+            label?.textLayout = layout
+        }
+    }
+}
+```
+
+#### Objective-C
+
+```objc
+@import UIKit;
+@import TextForge;
+
+@interface FeedLayoutManager : NSObject
+@property (nonatomic, strong) TextForgeListLayoutCache *cache;
+@end
+
+@implementation FeedLayoutManager
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _cache = [[TextForgeListLayoutCache alloc] initWithBitmapByteLimit:16 * 1024 * 1024 layoutCountLimit:128];
+    }
+    return self;
+}
+
+- (TextForgeLayoutTask * _Nullable)bindLabel:(TextForgeLabel *)label
+                                        item:(TextForgeListItem *)item
+                                        size:(CGSize)size
+                                      traits:(UITraitCollection *)traits {
+    CGFloat scale = MAX(1.0, traits.displayScale);
+    TextForgeLayout *layout = [self.cache cachedLayoutForItem:item size:size renderScale:scale traitCollection:traits]
+        ?: [self.cache cachedLayoutForItem:item size:size traitCollection:traits];
+    if (layout) {
+        label.textLayout = layout;
+        return nil;
+    }
+    __weak typeof(label) weakLabel = label;
+    return [self.cache prepareItem:item size:size renderScale:scale traitCollection:traits completion:^(TextForgeLayout *ready) {
+        weakLabel.textLayout = ready;
+    }];
+}
+
+@end
+```
+
+- **注意事项**：
+  - `TextForgeListItem` 代表一份不可变内容版本。若文案、高亮回调或容器配置发生变化，请重新实例化新的 `TextForgeListItem`（不要直接改动旧项里的字符串内容）。
+  - 可用 `cache.cachedSize(for:size:traitCollection:)` 在 `heightForRowAt` 直接读取缓存尺寸。
+
+---
+
+## 阶段六：HTML 导入与 TextForgeTextView 编辑器
+
+分别覆盖“动态文章正文 HTML 转原生富文本”与“中文输入法友好富文本编辑器”两类高阶场景。
+
+### 6.1 HTML 轻量异步转换
+
+- **解决什么问题**：仅需把后端返回的小段 HTML 片段安全地转为 `NSAttributedString`，希望规避 WebKit 在主线程阻塞启动或静态链下 `-dead_strip_dylibs` 裁剪分类的问题。
+
+#### Swift
+
+```swift
+import UIKit
+import TextForge
+
+@MainActor
+func loadSimpleHTML(into label: TextForgeLabel) {
+    let html = "<p>这是 <b>粗体</b> 与 <a href='https://example.com'>标准链接</a> 片段。</p>"
+    TextForgeHTML.attributedString(from: html, baseURL: nil) { attributed, error in
+        guard let attributed, error == nil else { return }
+        label.attributedText = attributed
+    }
+}
+```
+
+#### Objective-C
+
+```objc
+@import UIKit;
+@import TextForge;
+
+static void LoadSimpleHTMLIntoLabel(TextForgeLabel *label) {
+    NSString *html = @"<p>这是 <b>粗体</b> 与 <a href='https://example.com'>标准链接</a> 片段。</p>";
+    __weak typeof(label) weakLabel = label;
+    [TextForgeHTML attributedStringFromHTML:html baseURL:nil completion:^(NSAttributedString *attributed, NSError *error) {
+        if (!attributed || error) { return; }
+        weakLabel.attributedText = attributed;
+    }];
+}
+```
+
+- **注意事项**：完成回调保证在主线程执行；在表格复用控件赋值前请自行校验该内容是否仍归属于当前列表条目。
+
+---
+
+### 6.2 阅读样式与多图合批导入
+
+- **解决什么问题**：长文章 HTML 的系统默认样式（字体太小、蓝色下划线链接、超宽图片撑爆排版）很难直接融进 App 风格；且同时加载 10 张插图若每到一张就全量重排会导致画面不停跳动。`TextForgeHTMLReadingStyle` 通过零优先级规则设定默认风格（不覆盖作者自带的显式 CSS，如 `.tag`），配合 `imageLoader` 接管宿主图片缓存并对同 URL 请求去重，再用 `imageUpdate`（`TextForgeHTMLImageUpdate`）按主队列合批交付变更位置与 `didChangeSize` 标记。
+
+#### Swift
+
+```swift
+import UIKit
+import TextForge
+
+@MainActor
+func importRichArticleHTML(html: String, label: TextForgeLabel) -> TextForgeHTMLImportTask {
+    let style = TextForgeHTMLReadingStyle()
+    style.defaultFont = .systemFont(ofSize: 15)
+    style.textColor = .label
+    style.linkColor = .systemGreen
+    style.underlinesLinks = false
+    style.maximumImageWidth = 280
+    style.placeholderSize = CGSize(width: 24, height: 24)
+
+    return TextForgeHTML.importHTML(
+        html,
+        baseURL: nil,
+        readingStyle: style,
+        imageLoader: { url, deliver in
+            // 接管宿主网络/缓存，返回可选取消闭包
+            let task = URLSession.shared.dataTask(with: url) { data, _, _ in
+                let image = data.flatMap(UIImage.init(data:))
+                deliver(image)
+            }
+            task.resume()
+            return { task.cancel() }
+        },
+        imageUpdate: { [weak label] update in
+            // update.isInitial 先交付占位快照；多张图片就绪后合批刷新，可用 update.didChangeSize 决定是否重新算高
+            label?.attributedText = update.attributedText
+        },
+        completion: { [weak label] finalText, error in
+            if let finalText, error == nil {
+                label?.attributedText = finalText
+            }
+        }
+    )
+}
+```
+
+#### Objective-C
+
+```objc
+@import UIKit;
+@import TextForge;
+
+static TextForgeHTMLImportTask *ImportRichArticleHTML(NSString *html, TextForgeLabel *label) {
+    TextForgeHTMLReadingStyle *style = [[TextForgeHTMLReadingStyle alloc] init];
+    style.defaultFont = [UIFont systemFontOfSize:15];
+    style.textColor = UIColor.labelColor;
+    style.linkColor = UIColor.systemGreenColor;
+    style.underlinesLinks = @(NO);
+    style.maximumImageWidth = 280;
+    style.placeholderSize = CGSizeMake(24, 24);
+
+    __weak typeof(label) weakLabel = label;
+    return [TextForgeHTML importHTML:html
+                             baseURL:nil
+                        readingStyle:style
+                         imageLoader:^dispatch_block_t (NSURL *url, void (^deliver)(UIImage *image)) {
+        NSURLSessionDataTask *task = [NSURLSession.sharedSession dataTaskWithURL:url
+                                                               completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+            UIImage *image = data ? [UIImage imageWithData:data] : nil;
+            deliver(image);
+        }];
+        [task resume];
+        return ^{ [task cancel]; };
+    } imageUpdate:^(TextForgeHTMLImageUpdate *update) {
+        weakLabel.attributedText = update.attributedText;
+    } completion:^(NSAttributedString *finalText, NSError *error) {
+        if (finalText && !error) {
+            weakLabel.attributedText = finalText;
+        }
+    }];
+}
+```
+
+![HTML 阅读默认样式、作者样式优先与多图合批渲染实机截图](docs/images/05-html-rendering.png)
+
+- **注意事项**：随时调用 `task.cancel()` 会终止尚未完成的宿主图片请求，且取消后不会再交付任何占位更新或 `completion`。
+
+---
+
+### 6.3 输入框占位与就地高亮
+
+- **解决什么问题**：原生 `UITextView` 没有自带占位提示；更棘手的是中文输入法在拼音组字阶段会持续发出 `textViewDidChange`，极易误触发即时检索或计数弹窗，而在 `textViewDidChange` 里直接改 `attributedText` 上色又常导致选区跳乱或组字打断。`TextForgeTextView` 内建纯/富文本占位，精准只在已提交正文变化时回调 `onTextChange`，并提供可在代理内部安全执行的就地属性刷新 `updateTextAttributes(_:)`。
+
+#### Swift
+
+```swift
+import UIKit
+import TextForge
+
+final class ComposerViewController: UIViewController, UITextViewDelegate {
     private let textView = TextForgeTextView()
 
     override func viewDidLoad() {
         super.viewDidLoad()
         textView.font = .systemFont(ofSize: 16)
         textView.placeholderAttributedText = NSAttributedString(
-            string: "说点什么（支持 #话题# 高亮）",
-            attributes: [.foregroundColor: UIColor.placeholderText]
+            string: "说点什么（支持 #话题# 与 @提及 高亮）",
+            attributes: [.foregroundColor: UIColor.placeholderText, .font: UIFont.systemFont(ofSize: 16)]
         )
         textView.delegate = self
         textView.onTextChange = { committedText in
-            print("最终已提交内容：", committedText)
+            // 跳过中文/日文等 IME 拼音组字中间态，仅在已上屏正文变化时触发；兼容粘贴/剪切与代理截断
+            print("已提交全文：", committedText)
         }
     }
 
     func textViewDidChange(_ textView: UITextView) {
         guard let editor = textView as? TextForgeTextView else { return }
-        // 1) 字数上限同步裁剪：仍会正确触发（或恢复原值时抑制）onTextChange
+        // 1) 非组字态字数截断（截断恢复原值时不会重复触发 onTextChange）
         if editor.markedTextRange == nil, editor.text.count > 200 {
             editor.text = String(editor.text.prefix(200))
         }
-        // 2) 原生编辑回调内就地刷新 #话题# 高亮（组字期间自动跳过，不打断选区）
+        // 2) 安全在编辑代理内就地刷亮 #话题# / @提及，不破坏当前选区也不额外触发 onTextChange
         editor.updateTextAttributes { mutable in
             let full = NSRange(location: 0, length: mutable.length)
             mutable.addAttribute(.foregroundColor, value: UIColor.label, range: full)
-            let regex = try? NSRegularExpression(pattern: "#[^#\\s]+#")
+            let regex = try? NSRegularExpression(pattern: "(#[^#\\s]+#|@[\\p{Han}A-Za-z0-9_]+)")
             regex?.enumerateMatches(in: mutable.string, range: full) { match, _, _ in
                 if let range = match?.range {
                     mutable.addAttribute(.foregroundColor, value: UIColor.systemBlue, range: range)
@@ -607,7 +1201,32 @@ final class CommentComposerController: UIViewController, UITextViewDelegate {
 }
 ```
 
+#### Objective-C
+
 ```objc
+@import UIKit;
+@import TextForge;
+
+@interface ComposerViewController : UIViewController <UITextViewDelegate>
+@property (nonatomic, strong) TextForgeTextView *textView;
+@end
+
+@implementation ComposerViewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.textView = [[TextForgeTextView alloc] init];
+    self.textView.font = [UIFont systemFontOfSize:16];
+    self.textView.placeholderAttributedText = [[NSAttributedString alloc]
+        initWithString:@"说点什么（支持 #话题# 与 @提及 高亮）"
+            attributes:@{ NSForegroundColorAttributeName: UIColor.placeholderTextColor,
+                          NSFontAttributeName: [UIFont systemFontOfSize:16] }];
+    self.textView.delegate = self;
+    self.textView.onTextChange = ^(NSString *committedText) {
+        NSLog(@"已提交全文：%@", committedText);
+    };
+}
+
 - (void)textViewDidChange:(UITextView *)textView {
     if (![textView isKindOfClass:TextForgeTextView.class]) { return; }
     TextForgeTextView *editor = (TextForgeTextView *)textView;
@@ -617,22 +1236,29 @@ final class CommentComposerController: UIViewController, UITextViewDelegate {
     [editor updateTextAttributes:^(NSMutableAttributedString *mutableText) {
         NSRange full = NSMakeRange(0, mutableText.length);
         [mutableText addAttribute:NSForegroundColorAttributeName value:UIColor.labelColor range:full];
-        NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"#[^#\\s]+#" options:0 error:nil];
+        NSRegularExpression *regex = [NSRegularExpression
+            regularExpressionWithPattern:@"(#[^#\\s]+#|@[\\p{Han}A-Za-z0-9_]+)" options:0 error:nil];
         [regex enumerateMatchesInString:mutableText.string options:0 range:full
                             usingBlock:^(NSTextCheckingResult *result, NSMatchingFlags flags, BOOL *stop) {
             [mutableText addAttribute:NSForegroundColorAttributeName value:UIColor.systemBlueColor range:result.range];
         }];
     }];
 }
+
+@end
 ```
+
+![TextForgeTextView 富文本占位、精确组字过滤与就地标签高亮实机截图](docs/images/06-textview-editor.png)
+
+- **注意事项**：`updateTextAttributes(_:)` 仅允许修改属性而不能改变字符码元；处于组字状态（`markedTextRange != nil`）或发生字符变更时将返回 `false` 并自动保护输入法状态，待候选词上屏并清空标记文本后可立即正常染色。
 
 ---
 
 ## 独立示例与自动化验证
 
-[`Examples/Swift`](Examples/Swift) 和 [`Examples/ObjectiveC`](Examples/ObjectiveC) 各自提供独立的 Xcode 工程（分别引用根目录 Swift Package），可直接在 Xcode 中打开运行调试。
+[`Examples/Swift`](Examples/Swift) 与 [`Examples/ObjectiveC`](Examples/ObjectiveC) 分别提供引用根目录 Swift Package 的独立 Xcode 工程，可直接打开运行查看。
 
-验证脚本会用 Xcode 工具链构建 `libTextForge.a` 与模块映射，编译 Swift 与 Objective-C 示例 App 并安装到已启动的 iOS 模拟器执行全套自动化断言：
+可以通过仓库内的验证脚本在已启动的 iOS 模拟器上自动编译 `TextForge`、Swift 与 Objective-C 示例工程并运行端到端行为断言：
 
 ```bash
 bash scripts/verify-ios.sh booted
@@ -640,4 +1266,10 @@ bash scripts/verify-ios.sh booted
 # bash scripts/verify-ios.sh <booted-simulator-udid>
 ```
 
-脚本实际核验覆盖：内边距与图文测量、字距/行距/段距/固定行高、圆角胶囊与双向混排字距、附件内容模式 Retina 缩放、按视口惰性实例化 `UIView` 附件、链接热区外扩、排除路径防末行回流、按词选区与手柄绘制、长按拷贝菜单、VoiceOver 自定义操作、HTML 阅读样式及多图批更新、列表中等价 `TextForgeListItem` 并发冷启动复用与预算分离、以及 `TextForgeTextView` 在 `UIWindow` 第一响应者下的组字/粘贴/剪切裁剪与 `updateTextAttributes` 就地样式刷新。最低部署目标为 iOS 15.0。
+脚本验证覆盖：内边距与图文测量、字/行/段距与固定行高对齐、圆角胶囊与双向混排水平间距、附件内容模式 Retina 缩放、按视口惰性实例化 `UIView` 附件、链接热区外扩、排除路径防末行回流、按词拖选与手柄绘制、长按拷贝菜单、VoiceOver 自定义操作、HTML 阅读样式及多图批更新、滚动列表等价 `TextForgeListItem` 并发复用与预算分离，以及 `TextForgeTextView` 在第一响应者下的组字/粘贴/剪切裁剪和 `updateTextAttributes` 就地刷新。
+
+---
+
+## License
+
+TextForge 采用 [Apache License 2.0](LICENSE) 开源许可。
