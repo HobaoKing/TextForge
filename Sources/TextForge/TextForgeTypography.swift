@@ -13,7 +13,10 @@ public typealias TextForgeTextAction = (UIView, NSAttributedString, NSRange, CGR
 
 @objc(TextForgeTypography)
 public final class TextForgeTypography: NSObject {
-    /// 复制传入富文本并覆盖指定的间距，nil 保留原属性，0 可显式清除该项。其余段落属性和文本范围保持原样。
+    /// 标记由 styledText 为原本无段落样式的区间合成的段落属性，供控件补齐对齐和断行策略。
+    static let synthesizedParagraphStyle = NSAttributedString.Key("TextForge.SynthesizedParagraphStyle")
+
+    /// 复制传入富文本并覆盖指定的间距，nil 保留原属性，0 可显式清除该项。圆角背景为相邻字素预留的水平间距另行叠加。
     @objc public static func styledText(
         _ text: NSAttributedString,
         characterSpacing: NSNumber?,
@@ -23,7 +26,10 @@ public final class TextForgeTypography: NSObject {
         let result = NSMutableAttributedString(attributedString: text)
         let range = NSRange(location: 0, length: text.length)
         if let characterSpacing {
-            result.addAttribute(.kern, value: characterSpacing, range: range)
+            text.enumerateAttribute(TextForgeBackground.marginKern, in: range) { extra, part, _ in
+                let kern = characterSpacing.doubleValue + ((extra as? NSNumber)?.doubleValue ?? 0)
+                result.addAttribute(.kern, value: kern, range: part)
+            }
         }
         if lineSpacing != nil || paragraphSpacing != nil {
             text.enumerateAttribute(.paragraphStyle, in: range) { value, segment, _ in
@@ -32,6 +38,9 @@ public final class TextForgeTypography: NSObject {
                 if let lineSpacing { style.lineSpacing = CGFloat(lineSpacing.doubleValue) }
                 if let paragraphSpacing { style.paragraphSpacing = CGFloat(paragraphSpacing.doubleValue) }
                 result.addAttribute(.paragraphStyle, value: style.copy(), range: segment)
+                if value == nil {
+                    result.addAttribute(Self.synthesizedParagraphStyle, value: true, range: segment)
+                }
             }
         }
         return result
@@ -194,7 +203,7 @@ public final class TextForgeAttachment: NSObject {
             attachment.image = image
         } else if !bounds.isEmpty {
             let format = UIGraphicsImageRendererFormat()
-            format.scale = image.scale
+            format.scale = max(image.scale, UIScreen.main.scale, UITraitCollection.current.displayScale)
             let renderer = UIGraphicsImageRenderer(size: slot, format: format)
             attachment.image = renderer.image { _ in
                 image.draw(in: CGRect(
@@ -218,6 +227,19 @@ public final class TextForgeAttachment: NSObject {
         return NSAttributedString(attachment: attachment)
     }
 
+    /// 为文本保留指定尺寸，仅当附件落入标签可见视口时才在主线程调用 provider 实例化视图。
+    @objc(viewWithSize:font:alignment:provider:)
+    public static func view(
+        size: CGSize,
+        font: UIFont,
+        alignment: TextForgeVerticalAlignment,
+        provider: @escaping @MainActor () -> UIView
+    ) -> NSAttributedString {
+        let attachment = TextForgeViewAttachment(size: size, provider: provider)
+        attachment.bounds = attachmentBounds(size: size, font: font, alignment: alignment)
+        return NSAttributedString(attachment: attachment)
+    }
+
     /// 换算相对基线向上的偏移，使图片或视图与字体的顶部、中心或底部对齐。
     private static func attachmentBounds(size: CGSize, font: UIFont, alignment: TextForgeVerticalAlignment) -> CGRect {
         let width = size.width.isFinite ? max(0, size.width) : 0
@@ -233,15 +255,41 @@ public final class TextForgeAttachment: NSObject {
 }
 
 final class TextForgeViewAttachment: NSTextAttachment {
-    let view: UIView
-    let viewSize: CGSize
+    private var cachedView: UIView?
+    private let provider: (@MainActor () -> UIView)?
+    private(set) var viewSize: CGSize
 
     /// 捕获宿主传入时的内容尺寸，重复挂载时仍按原尺寸居中。
     @MainActor
     init(view: UIView) {
-        self.view = view
+        cachedView = view
+        provider = nil
         viewSize = view.bounds.size
         super.init(data: nil, ofType: nil)
+    }
+
+    /// 仅记录占位尺寸与主线程构造闭包，在视口真正需要挂载时才创建 UIView。
+    @MainActor
+    init(size: CGSize, provider: @escaping @MainActor () -> UIView) {
+        cachedView = nil
+        self.provider = provider
+        viewSize = CGSize(
+            width: size.width.isFinite ? max(0, size.width) : 0,
+            height: size.height.isFinite ? max(0, size.height) : 0
+        )
+        super.init(data: nil, ofType: nil)
+    }
+
+    /// 在主线程返回已缓存或按需创建的视图，首次实例化后若视图自带非零尺寸则同步记录。
+    @MainActor
+    var view: UIView {
+        if let cachedView { return cachedView }
+        let created = provider!()
+        if created.bounds.size.width > 0, created.bounds.size.height > 0 {
+            viewSize = created.bounds.size
+        }
+        cachedView = created
+        return created
     }
 
     required init?(coder: NSCoder) {

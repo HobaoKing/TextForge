@@ -152,6 +152,7 @@ final class ExampleViewController: UIViewController {
         failures.append(contentsOf: verifyCompositionTransactions())
         failures.append(contentsOf: verifyViewportRendering())
         failures.append(contentsOf: verifyParagraphUpdates())
+        failures.append(contentsOf: verifyReviewRegressions())
 
         verifyAsyncPreparation { asyncResults in
             self.verifyExplicitLayoutAppearance { appearanceFailures in
@@ -160,7 +161,8 @@ final class ExampleViewController: UIViewController {
                     let url = directory.appendingPathComponent("result.txt")
                     Task { @MainActor in
                         let renderingFailures = await self.verifyListRendering()
-                        let allFailures = failures + asyncResults + appearanceFailures + copyFailures + renderingFailures
+                        let clipboardFailures = await self.verifyClipboardTransactions()
+                        let allFailures = failures + asyncResults + appearanceFailures + copyFailures + renderingFailures + clipboardFailures
                         let result = allFailures.isEmpty ? "PASS" : allFailures.joined(separator: "\n")
                         do {
                             try result.write(to: url, atomically: true, encoding: .utf8)
@@ -204,6 +206,95 @@ final class ExampleViewController: UIViewController {
             edit { input.unmarkText() }
             edit { NotificationCenter.default.post(name: UITextView.textDidChangeNotification, object: input) }
             if !failures.isEmpty { break }
+        }
+        return failures
+    }
+
+    /// 在窗口里的原生编辑回调中分别赋值和裁剪存储，覆盖剪贴板操作、独立写入以及空串和 nil 结束组字。
+    private func verifyClipboardTransactions() async -> [String] {
+        let editor = TextForgeTextView(frame: CGRect(x: 10, y: 100, width: 200, height: 60))
+        let limiter = MaxLengthDelegate()
+        view.addSubview(editor)
+        defer { editor.removeFromSuperview() }
+        guard editor.becomeFirstResponder() else { return ["clipboard editor did not become first responder"] }
+        editor.smartInsertDeleteType = .no
+        editor.delegate = limiter
+        var events: [String] = []
+        editor.onTextChange = { events.append($0) }
+        editor.text = "AB"
+        editor.selectedRange = NSRange(location: 2, length: 0)
+        UIPasteboard.general.string = "CD"
+        editor.paste(nil)
+        for _ in 0..<100 where editor.text == "AB" { try? await Task.sleep(nanoseconds: 10_000_000) }
+        var failures: [String] = []
+        if editor.text != "ABC" || events != ["ABC"] {
+            failures.append("paste with delegate: text=\(editor.text ?? ""), callbacks=\(events)")
+        }
+        editor.text = "ABCDEF"
+        editor.selectedRange = NSRange(location: 4, length: 2)
+        events.removeAll()
+        editor.cut(nil)
+        if editor.text != "ABC" || events != ["ABC"] || UIPasteboard.general.string != "EF" {
+            failures.append("cut with delegate: text=\(editor.text ?? ""), callbacks=\(events)")
+        }
+        limiter.trimsStorage = true
+        for (start, pasted, expected) in [("AB", "CD", ["ABC"]), ("ABC", "D", [])] {
+            editor.text = start
+            editor.selectedRange = NSRange(location: editor.textStorage.length, length: 0)
+            events.removeAll()
+            let previousEdits = limiter.editCount
+            UIPasteboard.general.string = pasted
+            editor.paste(nil)
+            for _ in 0..<100 where limiter.editCount == previousEdits { try? await Task.sleep(nanoseconds: 10_000_000) }
+            if limiter.editCount == previousEdits || editor.text != "ABC" || events != expected {
+                failures.append("storage-trimmed paste from \(start): text=\(editor.text ?? ""), callbacks=\(events)")
+            }
+        }
+        editor.text = "ABCDEF"
+        editor.selectedRange = NSRange(location: 4, length: 2)
+        events.removeAll()
+        editor.cut(nil)
+        if editor.text != "ABC" || events != ["ABC"] { failures.append("storage-trimmed cut: \(events)") }
+
+        editor.selectedRange = NSRange(location: 2, length: 1)
+        events.removeAll()
+        limiter.suffixToRestore = "C"
+        let beforeCut = limiter.editCount
+        editor.cut(nil)
+        limiter.suffixToRestore = nil
+        if limiter.editCount == beforeCut || UIPasteboard.general.string != "C" || editor.text != "ABC" || !events.isEmpty {
+            failures.append("cut restored by delegate: text=\(editor.text ?? ""), callbacks=\(events)")
+        }
+
+        // 前一笔程序化存储编辑不会发送 UIKit 编辑通知，剪贴板操作须从更新后的文本重新比较。
+        editor.text = "AB"
+        editor.textStorage.append(NSAttributedString(string: "C"))
+        editor.selectedRange = NSRange(location: 2, length: 1)
+        events.removeAll()
+        editor.cut(nil)
+        if editor.text != "AB" || events != ["AB"] { failures.append("cut reused an earlier storage baseline: \(events)") }
+        editor.textStorage.append(NSAttributedString(string: "C"))
+        editor.selectedRange = NSRange(location: 3, length: 0)
+        events.removeAll()
+        let beforePaste = limiter.editCount
+        UIPasteboard.general.string = "D"
+        editor.paste(nil)
+        for _ in 0..<100 where limiter.editCount == beforePaste { try? await Task.sleep(nanoseconds: 10_000_000) }
+        if limiter.editCount == beforePaste || editor.text != "ABC" || !events.isEmpty {
+            failures.append("paste reused an earlier storage baseline: \(events)")
+        }
+
+        for ending: String? in ["", nil] {
+            editor.text = "前X后"
+            editor.selectedRange = NSRange(location: 1, length: 1)
+            editor.setMarkedText("ni", selectedRange: NSRange(location: 2, length: 0))
+            limiter.styledDuringEdit = nil
+            events.removeAll()
+            editor.setMarkedText(ending, selectedRange: NSRange(location: 0, length: 0))
+            if editor.markedTextRange != nil || editor.text != "前后" || limiter.styledDuringEdit != true
+                || limiter.selectionChangesDuringStyling != 0 || events != ["前后"] {
+                failures.append("ending marked text with \(String(describing: ending)): styled=\(String(describing: limiter.styledDuringEdit)), text=\(editor.text ?? ""), callbacks=\(events)")
+            }
         }
         return failures
     }
@@ -705,9 +796,10 @@ final class ExampleViewController: UIViewController {
         }
     }
 
-    /// 统计视图渲染结果中偏红、偏蓝、偏绿和全部不透明像素的数量，用于判断文字和底色是否真的画出来。
-    private func pixels(of view: UIView) -> (red: Int, blue: Int, green: Int, any: Int) {
-        let width = Int(view.bounds.width), height = Int(view.bounds.height)
+    /// 统计视图指定区域内的颜色与不透明像素；省略区域时检查整张视图。
+    private func pixels(of view: UIView, in region: CGRect? = nil) -> (red: Int, blue: Int, green: Int, any: Int) {
+        let area = region ?? view.bounds
+        let width = Int(area.width), height = Int(area.height)
         guard width > 0, height > 0 else { return (0, 0, 0, 0) }
         var data = [UInt8](repeating: 0, count: width * height * 4)
         guard let context = CGContext(
@@ -716,6 +808,7 @@ final class ExampleViewController: UIViewController {
         ) else { return (0, 0, 0, 0) }
         context.translateBy(x: 0, y: CGFloat(height))
         context.scaleBy(x: 1, y: -1)
+        context.translateBy(x: -area.minX, y: -area.minY)
         view.layer.render(in: context)
         var red = 0, blue = 0, green = 0, any = 0
         for offset in stride(from: 0, to: data.count, by: 4) where data[offset + 3] > 120 {
@@ -1199,11 +1292,29 @@ final class ExampleViewController: UIViewController {
                   zip(a.lines, b.lines).allSatisfy({ $0.range == $1.range && pixels($0) == pixels($1) })
             else { return ["incremental paragraph geometry at step \(step)"] }
         }
+        let prefix = String(repeating: "稳定的一段\n", count: 15)
+        let measuring = TextForgeLabel(frame: label.frame)
+        measuring.numberOfLines = 0
+        measuring.textVerticalAlignment = .top
+        measuring.lineBreakMode = .byTruncatingTail
+        measuring.attributedText = NSAttributedString(string: prefix + "旧尾段")
+        _ = measuring.displayedTextLayout
+        let revised = NSAttributedString(string: prefix + String(repeating: "尾段继续折行", count: 20))
+        measuring.attributedText = revised
+        let fresh = TextForgeLabel(frame: measuring.frame)
+        fresh.numberOfLines = 0
+        fresh.textVerticalAlignment = .top
+        fresh.lineBreakMode = .byTruncatingTail
+        fresh.attributedText = revised
+        let unbounded = CGSize(width: label.frame.width, height: CGFloat.greatestFiniteMagnitude)
+        if measuring.sizeThatFits(unbounded) != fresh.sizeThatFits(unbounded) {
+            return ["reused finite-height stack disagreed with a fresh unbounded measurement"]
+        }
         return held.attributedText.string == oldString && held.textBoundingSize == oldSize
             && held.rect(forRange: NSRange(location: 0, length: 1)) != .null ? [] : ["published layout mutated"]
     }
 
-    /// 验证预绘装饰外伸、无位图的动态前景色往返，以及自适应高度和不同倍率间的同步几何查询。
+    /// 验证预绘外伸、换肤、独立几何预算，以及等价冷项的交互绑定和附件版本隔离。
     private func verifyListRendering() async -> [String] {
         let label = TextForgeLabel(frame: CGRect(x: 0, y: 0, width: 200, height: 24))
         view.addSubview(label)
@@ -1326,6 +1437,78 @@ final class ExampleViewController: UIViewController {
                 }
             }
         }
+        // 等价内容跨 TextForgeListItem 实例命中同步尺寸与布局缓存，且各自保留独立的交互回调。
+        var tappedItem = ""
+        func makeEquivalentItem(_ id: String) -> TextForgeListItem {
+            let text = NSMutableAttributedString(string: "666 查看详情", attributes: [.font: UIFont.systemFont(ofSize: 16)])
+            let hl = TextForgeHighlight(color: .systemBlue, backgroundColor: nil)
+            hl.tapAction = { _, _, _, _ in tappedItem = id }
+            hl.apply(to: text, range: NSRange(location: 4, length: 4))
+            return TextForgeListItem(attributedText: text, container: TextForgeContainer(size: CGSize(width: 160, height: 40)))
+        }
+        let itemA = makeEquivalentItem("A")
+        let itemB = makeEquivalentItem("B")
+        let eqSize = CGSize(width: 160, height: 40)
+        await withCheckedContinuation { done in
+            var remaining = 2
+            for (id, item) in [("A", itemA), ("B", itemB)] {
+                cache.prepare(item, size: eqSize, renderScale: 2, traitCollection: label.traitCollection) { layout in
+                    TextForgeHighlight.highlight(in: layout.attributedText, at: 5)?.tapAction?(
+                        label, layout.attributedText, NSRange(location: 4, length: 4), .zero
+                    )
+                    if tappedItem != id { failures.append("coalesced cold request used another item's action") }
+                    remaining -= 1
+                    if remaining == 0 { done.resume() }
+                }
+            }
+        }
+        if cache.cachedSize(for: itemB, size: eqSize, traitCollection: label.traitCollection) == nil
+            || cache.cachedLayout(for: itemB, size: eqSize, traitCollection: label.traitCollection) == nil {
+            failures.append("value-equivalent TextForgeListItem missed size or layout cache")
+        } else if let layoutB = cache.cachedLayout(for: itemB, size: eqSize, traitCollection: label.traitCollection),
+                  let hitB = TextForgeHighlight.highlight(in: layoutB.attributedText, at: 5) {
+            hitB.tapAction?(label, layoutB.attributedText, NSRange(location: 4, length: 4), .zero)
+            if tappedItem != "B" {
+                failures.append("value-equivalent layout retained previous item's highlight callback: \(tappedItem)")
+            }
+        }
+        let tiny = TextForgeListLayoutCache(bitmapByteLimit: 64, layoutCountLimit: 8)
+        let traits = label.traitCollection
+        let large = await withCheckedContinuation { done in
+            tiny.prepare(itemA, size: eqSize, renderScale: 2, traitCollection: traits) { done.resume(returning: $0) }
+        }
+        for size in [eqSize, CGSize(width: eqSize.width, height: large.textBoundingSize.height)] {
+            if tiny.cachedLayout(for: itemB, size: size, traitCollection: traits) == nil
+                || tiny.cachedLayout(for: itemB, size: size, renderScale: 2, traitCollection: traits) != nil {
+                failures.append("bitmap budget evicted geometry at \(size)")
+            }
+        }
+        let linked = NSAttributedString(string: "链接", attributes: [.link: URL(string: "https://example.com")!])
+        let linkBox = TextForgeContainer(size: eqSize)
+        linkBox.linkTextAttributes = [NSAttributedString.Key("custom"): NSObject()]
+        let warm = TextForgeListItem(attributedText: linked, container: linkBox)
+        let cold = TextForgeListItem(attributedText: linked, container: linkBox)
+        await withCheckedContinuation { done in
+            cache.prepare(warm, size: eqSize, renderScale: 0, traitCollection: traits) { _ in done.resume() }
+        }
+        if cache.cachedSize(for: cold, size: eqSize, traitCollection: traits) == nil {
+            failures.append("cold equivalent item missed full-trait link style")
+        }
+        let attachment = AdaptiveAttachment()
+        let attached = NSAttributedString(attachment: attachment)
+        let previous = TextForgeListItem(attributedText: attached, container: box)
+        let oldSize = await withCheckedContinuation { done in
+            cache.prepare(previous, size: box.size, renderScale: 0, traitCollection: traits) { done.resume(returning: $0.textBoundingSize) }
+        }
+        attachment.extraHeight = 10
+        let revised = TextForgeListItem(attributedText: attached, container: box)
+        if cache.cachedSize(for: revised, size: box.size, traitCollection: traits) != nil {
+            failures.append("a new attachment version reused the old object's measurement")
+        }
+        let newSize = await withCheckedContinuation { done in
+            cache.prepare(revised, size: box.size, renderScale: 0, traitCollection: traits) { done.resume(returning: $0.textBoundingSize) }
+        }
+        if newSize.height != oldSize.height + 10 { failures.append("custom attachment size did not reflect the new version") }
         return failures
     }
 
@@ -1349,6 +1532,9 @@ final class ExampleViewController: UIViewController {
                 .font: font, .shadow: shadow, TextForgeBackground.attributeName: background
             ]))
         }
+        // 跨行背景末尾的留白只能扣在真实尾字素上；脏区中间的片段应与全图相同。
+        text.append(NSAttributedString(string: "结束", attributes: [.font: font]))
+        background.apply(to: text, range: NSRange(location: 1, length: text.length - 2), horizontalMargin: 6)
         let layout = TextForgeLayout(attributedText: text, size: CGSize(width: 160, height: 1000))
         let label = TextForgeLabel(frame: CGRect(x: 0, y: 0, width: 160, height: layout.textBoundingSize.height))
         label.textLayout = layout
@@ -1706,6 +1892,368 @@ final class ExampleViewController: UIViewController {
         richLabel.layoutIfNeeded()
         return failures
     }
+
+    /// 用原文字符的公开几何和点击结果核对视觉两侧的间隙，覆盖两种基础方向和无空格的双向边界。
+    private func verifyPillGeometry() -> [String] {
+        var failures: [String] = []
+        let size = CGSize(width: 260, height: 60)
+        for (string, word) in [("前缀标签正文", "标签"), ("ABC אבגד DEF", "אבגד"), ("אב ABC גד", "ABC"),
+                               ("ABCאבגדDEF", "אבגד"), ("אבABCגד", "ABC"), ("אבגדהו", "גד"), ("AرمزB", "رمز")] {
+            let text = NSMutableAttributedString(string: string, attributes: [.font: UIFont.systemFont(ofSize: 16)])
+            let tag = (string as NSString).range(of: word)
+            let normal = TextForgeLayout(attributedText: text, size: size)
+            let natural = normal.rect(forRange: tag)
+            let neighbors = (0..<text.length).filter { !NSLocationInRange($0, tag) }
+            let left = neighbors.last { abs(normal.rect(forRange: NSRange(location: $0, length: 1)).maxX - natural.minX) < 0.1 }
+            let right = neighbors.first { abs(normal.rect(forRange: NSRange(location: $0, length: 1)).minX - natural.maxX) < 0.1 }
+            guard let left, let right else { failures.append("invalid visual neighbors for \(string)"); continue }
+            let pill = TextForgeBackground(fillColor: .yellow)
+            pill.insets = UIEdgeInsets(top: -1, left: -4, bottom: -1, right: -4)
+            pill.apply(to: text, range: tag, horizontalMargin: 2)
+            let layout = TextForgeLayout(attributedText: text, size: size)
+            guard let piece = layout.rects(forRange: tag).first else { failures.append("missing pill rect for \(string)"); continue }
+            let box = layout.rect(forRange: tag)
+            let leftBox = layout.rect(forRange: NSRange(location: left, length: 1))
+            let rightBox = layout.rect(forRange: NSRange(location: right, length: 1))
+            let leftGap = piece.minX - leftBox.maxX, rightGap = rightBox.minX - piece.maxX
+            if abs(leftGap - 6) > 0.1 || abs(rightGap - 6) > 0.1 || abs(box.minX - piece.minX) > 0.1
+                || abs(box.maxX - piece.maxX) > 0.1 || abs(box.width - natural.width) > 0.1 {
+                failures.append("pill \(string): gaps=\(leftGap),\(rightGap), bounds=\(box.width), run=\(piece.width)")
+            }
+            for x in [piece.minX - 2, piece.maxX + 5] {
+                if layout.characterIndex(at: CGPoint(x: x, y: piece.midY)) != NSNotFound {
+                    failures.append("pill gap hit another character in \(string) at \(x)")
+                }
+            }
+            if word == "标签" {
+                let label = TextForgeLabel(frame: CGRect(origin: .zero, size: size))
+                label.isSelectable = true
+                label.textVerticalAlignment = .top
+                label.tintColor = .green
+                label.attributedText = text
+                let selected = label.selectText(in: tag)
+                label.layoutIfNeeded()
+                let end = label.rect(forRange: tag)
+                let sample = CGRect(x: floor(end.maxX) - 1, y: ceil(end.maxY) + 1, width: 2, height: 1)
+                if !selected || pixels(of: label, in: sample).green == 0 {
+                    failures.append("end handle missed the selection's trailing edge")
+                }
+            }
+            for i in tag.location..<NSMaxRange(tag) {
+                let original = normal.rect(forRange: NSRange(location: i, length: 1))
+                let current = layout.rect(forRange: NSRange(location: i, length: 1))
+                if abs((current.minX - box.minX) - (original.minX - natural.minX)) > 0.1
+                    || layout.characterIndex(at: CGPoint(x: current.midX, y: current.midY)) != i {
+                    failures.append("pill shifted a glyph inside \(string) at \(i)")
+                }
+            }
+        }
+        return failures
+    }
+
+    /// 验证首字符局部属性隔离、合成间距对齐继承、末行截断防回流、代理裁剪回调、惰性附件及越界热区。
+    private func verifyReviewRegressions() -> [String] {
+        var failures: [String] = []
+        let label = TextForgeLabel(frame: CGRect(x: 0, y: 0, width: 220, height: 60))
+        label.font = .systemFont(ofSize: 18)
+        label.textColor = .darkGray
+        label.lineSpacing = 4
+        let partial = NSMutableAttributedString(string: "*上传图片凭证")
+        partial.addAttributes([.font: UIFont.boldSystemFont(ofSize: 12), .foregroundColor: UIColor.red], range: NSRange(location: 0, length: 1))
+        label.attributedText = partial
+        if let rendered = label.displayedTextLayout?.attributedText {
+            let bodyFont = rendered.attribute(.font, at: 2, effectiveRange: nil) as? UIFont
+            let bodyColor = rendered.attribute(.foregroundColor, at: 2, effectiveRange: nil) as? UIColor
+            if bodyFont?.pointSize != 18 || bodyColor != .darkGray {
+                failures.append("index-0 partial attributes hijacked default font or color")
+            }
+        } else {
+            failures.append("missing displayedTextLayout for partial attribute test")
+        }
+
+        label.font = .boldSystemFont(ofSize: 12)
+        if (label.displayedTextLayout?.attributedText.attribute(.font, at: 2, effectiveRange: nil) as? UIFont)?.pointSize != 12 {
+            failures.append("assigning the first run's font did not update the default")
+        }
+        label.font = .systemFont(ofSize: 18)
+        label.attributedText = partial
+        label.text = "普通文本"
+        if label.font.pointSize != 18 || label.textColor != .darkGray {
+            failures.append("plain text reused the first run's style")
+        }
+        let adjacent = NSMutableAttributedString(string: "A\nB")
+        let explicit = NSMutableParagraphStyle()
+        explicit.lineSpacing = 4
+        adjacent.addAttribute(.paragraphStyle, value: explicit, range: NSRange(location: 0, length: 2))
+        label.textAlignment = .center
+        label.attributedText = TextForgeTypography.styledText(adjacent, characterSpacing: nil, lineSpacing: 4, paragraphSpacing: nil)
+        let paragraphs = label.displayedTextLayout?.attributedText
+        if (paragraphs?.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle)?.alignment != .natural
+            || (paragraphs?.attribute(.paragraphStyle, at: 2, effectiveRange: nil) as? NSParagraphStyle)?.alignment != .center {
+            failures.append("explicit and synthesized paragraph styles leaked across paragraphs")
+        }
+
+        let styled = TextForgeTypography.styledText(NSAttributedString(string: "1234 abcdefg 1234"), characterSpacing: nil, lineSpacing: 4, paragraphSpacing: nil)
+        let charWrapLabel = TextForgeLabel(frame: CGRect(x: 0, y: 0, width: 95, height: 200))
+        charWrapLabel.numberOfLines = 0
+        charWrapLabel.textAlignment = .center
+        charWrapLabel.lineBreakMode = .byCharWrapping
+        charWrapLabel.attributedText = styled
+        let paragraphStyle = charWrapLabel.displayedTextLayout?.attributedText.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle
+        if paragraphStyle?.alignment != .center || paragraphStyle?.lineBreakMode != .byCharWrapping || (charWrapLabel.displayedTextLayout?.lines.first?.range.length ?? 0) <= 5 {
+            failures.append("synthesized typography paragraph style dropped label alignment or char wrapping")
+        }
+
+        let tokenBox = TextForgeContainer(size: CGSize(width: 140, height: 200))
+        tokenBox.maximumNumberOfRows = 2
+        tokenBox.lineBreakMode = .byTruncatingTail
+        tokenBox.truncationToken = TextForgeContainer.readMoreToken(title: "……展开查看全文") { _, _, _, _ in }
+        let tokenLayout = TextForgeLayout(
+            container: tokenBox,
+            attributedText: NSAttributedString(string: "Hello supercalifragilisticexpialidocious", attributes: [.font: UIFont.systemFont(ofSize: 16)])
+        )
+        if tokenLayout.lines.count != 2 || tokenLayout.lines[0].range != NSRange(location: 0, length: 6) || tokenLayout.lines[1].range.length == 0 {
+            failures.append("truncation token caused last-line word prefix to reflow to previous line")
+        }
+
+        let emptyPadded = TextForgeLabel()
+        emptyPadded.contentInsets = UIEdgeInsets(top: 8, left: 12, bottom: 8, right: 12)
+        emptyPadded.text = ""
+        if emptyPadded.intrinsicContentSize != .zero || emptyPadded.sizeThatFits(CGSize(width: 100, height: 100)) != .zero {
+            failures.append("empty padded plain label did not collapse to zero")
+        }
+
+        let format1x = UIGraphicsImageRendererFormat()
+        format1x.scale = 1.0
+        let netImage = UIGraphicsImageRenderer(size: CGSize(width: 60, height: 60), format: format1x).image { ctx in
+            UIColor.red.setFill()
+            ctx.fill(CGRect(x: 0, y: 0, width: 60, height: 60))
+        }
+        let scaledImageAttr = TextForgeAttachment.image(netImage, contentMode: .scaleAspectFit, size: CGSize(width: 20, height: 20), font: .systemFont(ofSize: 16), alignment: .center)
+        let scaledAttachment = scaledImageAttr.attribute(.attachment, at: 0, effectiveRange: nil) as? NSTextAttachment
+        if (scaledAttachment?.image?.scale ?? 0) < 2.0 || (scaledAttachment?.image?.cgImage?.width ?? 0) < 40 {
+            failures.append("1x network image lost retina resolution when scaled into slot")
+        }
+
+        var lazyCreated = 0
+        let scroll = UIScrollView(frame: CGRect(x: 0, y: 0, width: 160, height: 36))
+        let lazyText = NSMutableAttributedString()
+        let bodyFont = UIFont.systemFont(ofSize: 16)
+        for _ in 0..<8 {
+            lazyText.append(TextForgeAttachment.view(size: CGSize(width: 14, height: 14), font: bodyFont, alignment: .center) {
+                lazyCreated += 1
+                return UIView(frame: CGRect(x: 0, y: 0, width: 14, height: 14))
+            })
+            lazyText.append(NSAttributedString(string: "惰性附件行\n", attributes: [.font: bodyFont]))
+        }
+        let lazyLayout = TextForgeLayout(attributedText: lazyText, size: CGSize(width: 160, height: 800))
+        if lazyCreated != 0 { failures.append("lazy view attachment instantiated before mounting") }
+        let lazyLabel = TextForgeLabel(frame: CGRect(origin: .zero, size: CGSize(width: 160, height: lazyLayout.textBoundingSize.height)))
+        lazyLabel.textLayout = lazyLayout
+        scroll.addSubview(lazyLabel)
+        lazyLabel.layoutIfNeeded()
+        if lazyCreated == 0 || lazyCreated >= 8 {
+            failures.append("lazy view attachment did not mount strictly for visible viewport: \(lazyCreated)")
+        }
+
+        let linkAttr = NSMutableAttributedString(string: "点击协议", attributes: [.font: UIFont.systemFont(ofSize: 14)])
+        let hl = TextForgeHighlight(color: .blue, backgroundColor: nil)
+        hl.tapAction = { _, _, _, _ in }
+        hl.apply(to: linkAttr, range: NSRange(location: 0, length: 4))
+        let tightLabel = TextForgeLabel()
+        tightLabel.attributedText = linkAttr
+        tightLabel.highlightTouchExtensionRadius = 10
+        let tightSize = tightLabel.sizeThatFits(CGSize(width: 200, height: 100))
+        tightLabel.frame = CGRect(origin: CGPoint(x: 20, y: 20), size: tightSize)
+        let host = UIView(frame: CGRect(x: 0, y: 0, width: 200, height: 100))
+        host.addSubview(tightLabel)
+        if host.hitTest(CGPoint(x: 30, y: 17), with: nil) !== tightLabel {
+            failures.append("highlightTouchExtensionRadius failed outside tight label bounds")
+        }
+        tightLabel.isSelectable = true
+        tightLabel.selectText(in: NSRange(location: 0, length: 2))
+        tightLabel.layoutIfNeeded()
+        let handleHit = host.hitTest(CGPoint(x: 20, y: 17), with: nil)
+        if handleHit == nil || handleHit === host {
+            failures.append("selection handle outside label bounds was rejected by hitTest")
+        }
+
+        tightLabel.tintColor = .green
+        let outside = CGRect(x: tightLabel.frame.minX - 4, y: tightLabel.frame.minY - 4, width: 4, height: tightLabel.frame.height + 8)
+        if pixels(of: host, in: outside).green == 0 {
+            failures.append("selection handle did not paint outside the tight label")
+        }
+
+        let editor = TextForgeTextView(frame: CGRect(x: 0, y: 0, width: 200, height: 80))
+        let limiter = MaxLengthDelegate()
+        editor.delegate = limiter
+        var editorCallbacks: [String] = []
+        editor.onTextChange = { editorCallbacks.append($0) }
+        editor.text = "AB"
+        editorCallbacks.removeAll()
+        editor.insertText("CD")
+        if editor.text != "ABC" || editorCallbacks != ["ABC"] {
+            failures.append("delegate truncation in insertText dropped onTextChange: \(editorCallbacks)")
+        }
+        editor.text = "AB"
+        editorCallbacks.removeAll()
+        editor.setMarkedText("nihao", selectedRange: NSRange(location: 5, length: 0))
+        editor.insertText("你好")
+        if editor.text != "AB你" || editorCallbacks != ["AB你"] {
+            failures.append("delegate truncation in IME commit dropped onTextChange: \(editorCallbacks)")
+        }
+        editor.selectedRange = NSRange(location: 1, length: 1)
+        let updatedAttrs = editor.updateTextAttributes { mutable in
+            mutable.addAttribute(.foregroundColor, value: UIColor.red, range: NSRange(location: 0, length: 2))
+        }
+        if !updatedAttrs || editor.selectedRange != NSRange(location: 1, length: 1) || editorCallbacks != ["AB你"] {
+            failures.append("updateTextAttributes disturbed selection or emitted callback")
+        }
+
+        // 固定行高：行内大尺寸附件不撑高该行，各行高度与基线步进保持一致。
+        let mixedLines = NSMutableAttributedString(string: "第一行文字\n第二行带徽章", attributes: [.font: bodyFont])
+        let tallSlot = NSTextAttachment()
+        tallSlot.bounds = CGRect(x: 0, y: -8, width: 18, height: 36)
+        mixedLines.append(NSAttributedString(attachment: tallSlot))
+        mixedLines.append(NSAttributedString(string: "\n第三行文字", attributes: [.font: bodyFont]))
+        let fixedBox = TextForgeContainer(size: CGSize(width: 200, height: 300))
+        fixedBox.fixedLineHeight = 24
+        let fixedLayout = TextForgeLayout(container: fixedBox, attributedText: mixedLines)
+        if fixedLayout.lines.count != 3 || fixedLayout.textBoundingSize.height != 72
+            || !fixedLayout.lines.allSatisfy({ $0.rect.height == 24 }) {
+            failures.append("fixedLineHeight did not regularize multi-line attachment heights: \(fixedLayout.lines.map(\.rect))")
+        }
+
+        // 行内圆角标签水平留白：不改变 UTF-16 下标，同时将标签前后文字推开 (max(0,-insets) + horizontalMargin)。
+        let unspaced = NSMutableAttributedString(string: "前缀标签正文", attributes: [.font: bodyFont])
+        let unspacedLayout = TextForgeLayout(attributedText: unspaced, size: CGSize(width: 300, height: 60))
+        let spaced = NSMutableAttributedString(string: "前缀标签正文", attributes: [.font: bodyFont])
+        let pill = TextForgeBackground(fillColor: .systemYellow, cornerRadius: 3)
+        pill.insets = UIEdgeInsets(top: -1, left: -4, bottom: -1, right: -4)
+        pill.apply(to: spaced, range: NSRange(location: 2, length: 2), horizontalMargin: 2)
+        let spacedLayout = TextForgeLayout(attributedText: spaced, size: CGSize(width: 300, height: 60))
+        let oldTagX = unspacedLayout.rect(forRange: NSRange(location: 2, length: 2)).minX
+        let newTagX = spacedLayout.rect(forRange: NSRange(location: 2, length: 2)).minX
+        let oldBodyX = unspacedLayout.rect(forRange: NSRange(location: 4, length: 2)).minX
+        let newBodyX = spacedLayout.rect(forRange: NSRange(location: 4, length: 2)).minX
+        if spaced.length != unspaced.length || abs((newTagX - oldTagX) - 6) > 0.5 || abs((newBodyX - oldBodyX) - 12) > 0.5 {
+            failures.append("horizontalMargin did not reserve expected leading/trailing space: tagDelta=\(newTagX - oldTagX), bodyDelta=\(newBodyX - oldBodyX)")
+        }
+
+        for suffix in ["字", "", "\n后", "\r\n后"] {
+            let sample = NSMutableAttributedString(string: "🔥标👩‍💻" + suffix, attributes: [.font: bodyFont])
+            let ns = sample.string as NSString
+            let tag = ns.range(of: "标👩‍💻")
+            let original = TextForgeLayout(attributedText: sample, size: spacedLayout.size)
+            pill.apply(to: sample, range: tag, horizontalMargin: 2)
+            let applied = TextForgeTypography.styledText(sample, characterSpacing: 1, lineSpacing: nil, paragraphSpacing: nil)
+            let end = NSMaxRange(tag)
+            if !(0..<2).allSatisfy({ (applied.attribute(.kern, at: $0, effectiveRange: nil) as? NSNumber)?.intValue == 7 })
+                || !(3..<end).allSatisfy({ (applied.attribute(.kern, at: $0, effectiveRange: nil) as? NSNumber)?.intValue == (suffix == "字" ? 7 : 1) }) {
+                failures.append("grapheme margin + character spacing, suffix=\(suffix.debugDescription)")
+            }
+            let updated = TextForgeLayout(attributedText: sample, size: spacedLayout.size)
+            let movement = updated.rect(forRange: tag).minX - original.rect(forRange: tag).minX
+            if abs(movement - 6) > 0.5 {
+                failures.append("emoji before tag did not advance by the margin: \(movement)")
+            }
+            if abs((updated.rects(forRange: tag).first?.width ?? 0) - (original.rects(forRange: tag).first?.width ?? 0)) > 0.5 {
+                failures.append("tag geometry includes reserved kern, suffix=\(suffix.debugDescription)")
+            }
+        }
+        failures.append(contentsOf: verifyPillGeometry())
+        let rtl = NSMutableAttributedString(string: "אבגד", attributes: [.font: bodyFont])
+        let rtlTag = NSRange(location: 0, length: 2)
+        let rtlNormal = TextForgeLayout(attributedText: rtl, size: spacedLayout.size).rects(forRange: rtlTag)[0]
+        pill.apply(to: rtl, range: rtlTag, horizontalMargin: 2)
+        let rtlLayout = TextForgeLayout(attributedText: rtl, size: spacedLayout.size)
+        if let rect = rtlLayout.rects(forRange: rtlTag).first {
+            if abs(rect.width - rtlNormal.width) > 0.5 || abs(rect.maxX - rtlLayout.rect(forRange: rtlTag).maxX) > 0.5 {
+                failures.append("RTL tag did not trim the visual trailing edge: \(rtlNormal), \(rect)")
+            }
+        } else { failures.append("missing RTL tag geometry") }
+        let narrow = TextForgeContainer(size: CGSize(width: 116, height: 120))
+        let wrapped = NSAttributedString(string: "AAAA BBBBBBBB CCCCCCCC DDDDDDDD", attributes: [.font: UIFont.monospacedSystemFont(ofSize: 16, weight: .regular)])
+        narrow.maximumNumberOfRows = 2
+        narrow.lineBreakMode = .byTruncatingTail
+        narrow.exclusionPaths = [UIBezierPath(rect: CGRect(x: 54, y: 21, width: 62, height: 70))]
+        let initial = TextForgeLayout(container: narrow, attributedText: wrapped)
+        for title in ["+", "+++++", "++++++++++++"] {
+            narrow.truncationToken = NSAttributedString(string: title)
+            let layout = TextForgeLayout(container: narrow, attributedText: wrapped)
+            if let last = layout.lines.last, last.range.length > 0 {
+                let first = layout.rect(forRange: NSRange(location: last.range.location, length: 1))
+                if first.minY < last.rect.minY - 0.5 || layout.characterIndex(at: CGPoint(x: first.midX, y: first.midY)) != last.range.location {
+                    failures.append("visible source index shifted after enforcing the soft wrap")
+                }
+            }
+            if layout.visibleRange.length != layout.lines.map(\.range.length).reduce(0, +)
+                || initial.rowCount != 2 || layout.rowCount != 2 || layout.lines.first?.range != initial.lines.first?.range
+                || layout.truncationTokenRect.minY < (initial.lines.last?.rect.minY ?? 0) - 1
+                || layout.characterIndex(at: CGPoint(x: layout.truncationTokenRect.midX, y: layout.truncationTokenRect.midY)) != NSNotFound {
+                failures.append("last row reflowed: token=\(title), before=\(initial.lines.map(\.range)), after=\(layout.lines.map(\.range)), rect=\(layout.truncationTokenRect)")
+            }
+        }
+        let reuseLabel = TextForgeLabel(frame: CGRect(x: 0, y: 0, width: 150, height: 40))
+        reuseLabel.font = bodyFont
+        reuseLabel.textColor = .black
+        reuseLabel.textAlignment = .center
+        reuseLabel.lineBreakMode = .byCharWrapping
+        let leadingStyle = NSMutableParagraphStyle()
+        leadingStyle.alignment = .right
+        leadingStyle.lineBreakMode = .byTruncatingTail
+        let rich = NSAttributedString(string: "首字符样式", attributes: [
+            .font: UIFont.systemFont(ofSize: 12), .foregroundColor: UIColor.red, .paragraphStyle: leadingStyle
+        ])
+        for clear in [false, true] {
+            reuseLabel.attributedText = rich
+            if clear { reuseLabel.attributedText = nil }
+            reuseLabel.text = "普通文本"
+            if reuseLabel.font != bodyFont || reuseLabel.textColor != .black || reuseLabel.textAlignment != .center
+                || reuseLabel.lineBreakMode != .byCharWrapping {
+                failures.append("rich to plain retained the first run after clear=\(clear)")
+            }
+        }
+        let selectionEvents = limiter.selectionChanges
+        let styledInPlace = editor.updateTextAttributes { $0.addAttribute(.underlineStyle, value: 1, range: editor.selectedRange) }
+        if !styledInPlace || limiter.selectionChanges != selectionEvents || limiter.styledDuringEdit != true {
+            failures.append("attribute edit: delegate=\(String(describing: limiter.styledDuringEdit)), extra selection events=\(limiter.selectionChanges - selectionEvents)")
+        }
+        return failures
+    }
+}
+
+private final class MaxLengthDelegate: NSObject, UITextViewDelegate {
+    var trimsStorage = false
+    var suffixToRestore: String?
+    var editCount = 0
+    var selectionChanges = 0
+    var selectionChangesDuringStyling = 0
+    var styledDuringEdit: Bool?
+
+    /// 统计 UIKit 实际发送的选区通知，验证属性更新期间的光标稳定性。
+    func textViewDidChangeSelection(_ textView: UITextView) { selectionChanges += 1 }
+
+    /// 在原生编辑回调内记录样式更新引发的选区通知，按用例回填剪切内容或将正文裁到三个字素。
+    func textViewDidChange(_ textView: UITextView) {
+        editCount += 1
+        if let editor = textView as? TextForgeTextView, editor.markedTextRange == nil {
+            let beforeStyling = selectionChanges
+            styledDuringEdit = editor.updateTextAttributes { $0.addAttribute(.foregroundColor, value: UIColor.blue,
+                                                                             range: NSRange(location: 0, length: $0.length)) }
+            selectionChangesDuringStyling = selectionChanges - beforeStyling
+        }
+        if let suffixToRestore, textView.markedTextRange == nil {
+            textView.textStorage.append(NSAttributedString(string: suffixToRestore))
+        }
+        if textView.markedTextRange == nil, textView.text.count > 3 {
+            let kept = String(textView.text.prefix(3))
+            if trimsStorage {
+                let start = kept.utf16.count
+                textView.textStorage.deleteCharacters(in: NSRange(location: start, length: textView.textStorage.length - start))
+            } else { textView.text = kept }
+        }
+    }
 }
 
 /// 文章行示例通过 prepareForReuse 撤销旧文章并清空显示。
@@ -1766,9 +2314,11 @@ private final class RejectingCopyLabel: TextForgeLabel {
 }
 
 private final class AdaptiveAttachment: NSTextAttachment {
-    /// 模拟宿主按主题切换图形规格，验证库使用当前请求环境测量自定义附件。
+    var extraHeight: CGFloat = 0
+
+    /// 模拟宿主切换主题或更新附件规格，验证测量同时遵守当前外观与内容版本。
     override func attachmentBounds(for textContainer: NSTextContainer?, proposedLineFragment lineFrag: CGRect,
                                    glyphPosition position: CGPoint, characterIndex charIndex: Int) -> CGRect {
-        CGRect(x: 0, y: 0, width: 20, height: UITraitCollection.current.userInterfaceStyle == .dark ? 58 : 18)
+        CGRect(x: 0, y: 0, width: 20, height: (UITraitCollection.current.userInterfaceStyle == .dark ? 58 : 18) + extraHeight)
     }
 }

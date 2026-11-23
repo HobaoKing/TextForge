@@ -350,6 +350,44 @@
     if (imageLayout.textBoundingSize.width < 20) {
         [failures addObject:@"Objective-C scaled image attachment did not reserve its slot"];
     }
+    __block NSInteger lazyBuilt = 0;
+    NSAttributedString *lazyBadge = [TextForgeAttachment viewWithSize:CGSizeMake(14, 14)
+                                                                 font:[UIFont systemFontOfSize:14]
+                                                            alignment:TextForgeVerticalAlignmentCenter
+                                                             provider:^UIView * _Nonnull{
+        lazyBuilt++;
+        return [[UIView alloc] initWithFrame:CGRectMake(0, 0, 14, 14)];
+    }];
+    TextForgeLayout *lazyLayout = [[TextForgeLayout alloc] initWithAttributedText:lazyBadge size:CGSizeMake(60, 40)];
+    if (lazyBuilt != 0) {
+        [failures addObject:@"Objective-C lazy attachment instantiated during layout"];
+    }
+    label.textLayout = lazyLayout;
+    [label layoutIfNeeded];
+    if (lazyBuilt != 1) {
+        [failures addObject:@"Objective-C lazy attachment did not mount on layout"];
+    }
+    self.input.text = @"#话题# 正文";
+    self.input.selectedRange = NSMakeRange(1, 2);
+    NSUInteger beforeCount = self.received.count;
+    BOOL styleUpdated = [self.input updateTextAttributes:^(NSMutableAttributedString * _Nonnull text) {
+        [text addAttribute:NSForegroundColorAttributeName value:UIColor.systemBlueColor range:NSMakeRange(0, 4)];
+    }];
+    if (!styleUpdated || !NSEqualRanges(self.input.selectedRange, NSMakeRange(1, 2)) || self.received.count != beforeCount) {
+        [failures addObject:@"Objective-C updateTextAttributes failed"];
+    }
+    NSMutableAttributedString *pillText = [[NSMutableAttributedString alloc]
+        initWithString:@"前缀标签正文"
+            attributes:@{NSFontAttributeName: [UIFont systemFontOfSize:14]}];
+    TextForgeBackground *pillBg = [[TextForgeBackground alloc] initWithFillColor:UIColor.yellowColor cornerRadius:3];
+    pillBg.insets = UIEdgeInsetsMake(-1, -4, -1, -4);
+    [pillBg applyTo:pillText range:NSMakeRange(2, 2) horizontalMargin:2];
+    TextForgeContainer *fixedContainer = [[TextForgeContainer alloc] initWithSize:CGSizeMake(200, 100)];
+    fixedContainer.fixedLineHeight = 22;
+    TextForgeLayout *fixedLayout = [[TextForgeLayout alloc] initWithContainer:fixedContainer attributedText:pillText];
+    if (fixedLayout.textBoundingSize.height != 22 || CGRectGetMinX([fixedLayout rectForRange:NSMakeRange(2, 2)]) < 30) {
+        [failures addObject:@"Objective-C fixedLineHeight or background horizontalMargin failed"];
+    }
 }
 
 // 将 ObjC 侧布局、输入和异步断言一起交给验证脚本。

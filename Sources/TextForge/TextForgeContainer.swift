@@ -1,3 +1,4 @@
+import CoreText
 import UIKit
 
 /// 一次排版的边界与策略。交给 TextForgeLayout 后会被复制，之后再改不影响已生成的布局。
@@ -14,6 +15,10 @@ public final class TextForgeContainer: NSObject, NSCopying {
 
     /// 单行允许的最小字号比例。1 保持原字号，仅在启用缩放时试排。
     @objc public var minimumScaleFactor: CGFloat = 1
+
+    /// 固定每行的行片段高度（单位为点），0 表示按字体与附件自然高度排版。
+    /// 大于 0 时统一锁定行高并按该行字体居中基线，防止行内大尺寸徽章、表情或回退字体撑高单行。
+    @objc public var fixedLineHeight: CGFloat = 0
 
     /// 替代系统省略号的截断标记，仅在 `lineBreakMode` 为 `.byTruncatingTail` 且内容放不下时生效。
     /// 标记缺少的字体、前景色和段落样式沿用截断处的正文，可携带 TextForgeHighlight 或链接来响应点击。
@@ -61,6 +66,7 @@ public final class TextForgeContainer: NSObject, NSCopying {
         copy.maximumNumberOfRows = maximumNumberOfRows
         copy.lineBreakMode = lineBreakMode
         copy.minimumScaleFactor = minimumScaleFactor
+        copy.fixedLineHeight = fixedLineHeight
         copy.truncationToken = truncationToken
         copy.exclusionPaths = exclusionPaths.map { $0.copy() as? UIBezierPath ?? $0 }
         if hasExplicitLinkStyle { copy.linkTextAttributes = linkTextAttributes }
@@ -101,6 +107,11 @@ public final class TextForgeBackground: NSObject {
     @objc public var cornerRadius: CGFloat = 0
     /// 相对文字排版矩形的边距，正值收缩、负值外扩。
     @objc public var insets: UIEdgeInsets = .zero
+    /// 写入文本时在圆角背景与左右相邻文字之间额外预留的水平间距（单位为点）。
+    /// 大于 0 时自动通过字距腾出负向水平 insets 与外边距空间，避免行内胶囊标签压住相邻文字。
+    @objc public var horizontalMargin: CGFloat = 0
+    /// 附着在实际腾出间隔的整个字素上，允许控件覆盖基础字距后保留这部分留白。
+    static let marginKern = NSAttributedString.Key("TextForge.MarginKern")
 
     @objc public init(fillColor: UIColor?, cornerRadius: CGFloat) {
         self.fillColor = fillColor
@@ -111,20 +122,98 @@ public final class TextForgeBackground: NSObject {
         self.init(fillColor: fillColor, cornerRadius: 0)
     }
 
-    /// 在合法的 UTF-16 范围内写入背景，越界或空范围保持原文本。跨行时每行各画一段。
+    /// 依段内字形的视觉顺序，在标签与邻字之间留白。字距加在间隙左侧的完整字素上，保留正文 UTF-16 下标。
     @objc public func apply(to text: NSMutableAttributedString, range: NSRange) {
         guard range.location >= 0, range.location <= text.length,
               range.length > 0, range.length <= text.length - range.location else { return }
-        text.addAttribute(Self.attributeName, value: self, range: range)
+        if horizontalMargin > 0 { reserveHorizontalMargins(in: text, range: range) }
+        text.addAttribute(Self.attributeName, value: horizontalMargin > 0 ? clone() : self, range: range)
+    }
+
+    /// 只需分析包含首尾的段落。按每个方向段与标签的交集找到视觉边界，在其左侧字素叠加基础字距和留白标记。
+    private func reserveHorizontalMargins(in text: NSMutableAttributedString, range: NSRange) {
+        let ns = text.string as NSString
+        let first = ns.paragraphRange(for: NSRange(location: range.location, length: 1))
+        let last = ns.paragraphRange(for: NSRange(location: NSMaxRange(range) - 1, length: 1))
+        for paragraph in first == last ? [first] : [first, last] {
+            let line = CTLineCreateWithAttributedString(text.attributedSubstring(from: paragraph))
+            var previous: (index: Int, inside: Bool)?
+            // Core Text 按视觉顺序给出各 run；RTL run 内的逻辑下标递减。
+            for run in CTLineGetGlyphRuns(line) as! [CTRun] {
+                let span = CTRunGetStringRange(run)
+                let lo = paragraph.location + span.location
+                let hi = lo + span.length
+                let rtl = CTRunGetStatus(run).contains(.rightToLeft)
+                var edges = [lo, max(lo, min(hi, range.location)), max(lo, min(hi, NSMaxRange(range))), hi]
+                if rtl { edges.reverse() }
+                for (start, end) in zip(edges, edges.dropFirst()) where start != end {
+                    let left = rtl ? start - 1 : start
+                    let right = rtl ? end : end - 1
+                    let inside = NSLocationInRange(left, range)
+                    defer { previous = (right, inside) }
+                    guard let previous, previous.inside != inside else { continue }
+                    let donor = ns.rangeOfComposedCharacterSequence(at: previous.index)
+                    let neighbor = ns.rangeOfComposedCharacterSequence(at: left)
+                    guard donor != neighbor,
+                          ns.rangeOfCharacter(from: .newlines, options: [], range: donor).location == NSNotFound,
+                          ns.rangeOfCharacter(from: .newlines, options: [], range: neighbor).location == NSNotFound else { continue }
+                    let extra = horizontalMargin + max(0, -(inside ? insets.left : insets.right))
+                    let kern = text.attribute(.kern, at: donor.location, effectiveRange: nil) as? NSNumber
+                    let reserved = text.attribute(Self.marginKern, at: donor.location, effectiveRange: nil) as? NSNumber
+                    text.addAttributes([.kern: (kern?.doubleValue ?? 0) + extra,
+                                        Self.marginKern: (reserved?.doubleValue ?? 0) + extra], range: donor)
+                }
+            }
+        }
+    }
+
+    /// 写入圆角背景并同时指定水平外边距，使行内标签自动与前后文字留出间距。
+    @objc(applyTo:range:horizontalMargin:)
+    public func apply(to text: NSMutableAttributedString, range: NSRange, horizontalMargin: CGFloat) {
+        let copy = clone()
+        copy.horizontalMargin = max(0, horizontalMargin)
+        copy.apply(to: text, range: range)
+    }
+
+    /// 复制完整背景配置，供属性写入与外观解析使用。
+    func clone() -> TextForgeBackground {
+        let copy = TextForgeBackground(fillColor: fillColor, cornerRadius: cornerRadius)
+        copy.strokeColor = strokeColor
+        copy.strokeWidth = strokeWidth
+        copy.insets = insets
+        copy.horizontalMargin = horizontalMargin
+        return copy
     }
 
     /// 生成颜色已按给定外观解析的独立副本，供后台排版线程只读使用。
     func resolved(with traits: UITraitCollection) -> TextForgeBackground {
-        let copy = TextForgeBackground(fillColor: fillColor?.resolvedColor(with: traits), cornerRadius: cornerRadius)
+        let copy = clone()
+        copy.fillColor = fillColor?.resolvedColor(with: traits)
         copy.strokeColor = strokeColor?.resolvedColor(with: traits)
-        copy.strokeWidth = strokeWidth
-        copy.insets = insets
         return copy
+    }
+
+    /// 背景只按外观配置比较，实际预留间距随字素单独保存。
+    public override var hash: Int {
+        var h = Hasher()
+        h.combine(fillColor)
+        h.combine(strokeColor)
+        h.combine(strokeWidth)
+        h.combine(cornerRadius)
+        h.combine(insets.top)
+        h.combine(insets.left)
+        h.combine(insets.bottom)
+        h.combine(insets.right)
+        h.combine(horizontalMargin)
+        return h.finalize()
+    }
+
+    /// 具有同一颜色、描边、圆角和边距的配置可共享绘制样式。
+    public override func isEqual(_ object: Any?) -> Bool {
+        guard let other = object as? TextForgeBackground else { return false }
+        return fillColor == other.fillColor && strokeColor == other.strokeColor
+            && strokeWidth == other.strokeWidth && cornerRadius == other.cornerRadius
+            && insets == other.insets && horizontalMargin == other.horizontalMargin
     }
 
     /// 在当前图形上下文中按配置填充并描边一段矩形。

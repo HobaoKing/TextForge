@@ -50,10 +50,7 @@ final class TextForgePaintPalette {
                 return copy
             }
         } else if let background = value as? TextForgeBackground {
-            let source = TextForgeBackground(fillColor: background.fillColor, cornerRadius: background.cornerRadius)
-            source.insets = background.insets
-            source.strokeWidth = background.strokeWidth
-            source.strokeColor = background.strokeColor
+            let source = background.clone()
             live = source
             candidates = [source.fillColor, source.strokeColor].compactMap { $0 }
             resolve = { source.resolved(with: $0) }

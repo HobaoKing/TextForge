@@ -85,7 +85,8 @@ public final class TextForgeLayout: NSObject {
         /// 截断或变换过的存储与原文范围不同，仅接管普通、不限行的同步正文。
         init?(_ layout: TextForgeLayout) {
             guard layout.preparedTraits == nil, layout.maximumNumberOfRows == 0, !layout.isTruncated,
-                  layout.container.minimumScaleFactor == 1, layout.container.exclusionPaths.isEmpty,
+                  layout.container.minimumScaleFactor == 1, layout.container.fixedLineHeight <= 0,
+                  layout.container.exclusionPaths.isEmpty,
                   layout.container.truncationToken == nil,
                   TextForgeLayoutEngine.hasStandardLineMetrics(layout.attributedText,
                       in: NSRange(location: 0, length: layout.attributedText.length)) else { return nil }
@@ -105,10 +106,10 @@ public final class TextForgeLayout: NSObject {
         let rendered = Self.renderingText(attributedText, container: container)
         let parameters = Self.parameters(for: container)
         var prefix = 0
-        if let previous, previous.owner == nil, previous.box.size == container.size,
+        if let previous, previous.owner == nil, previous.box.size.width == container.size.width,
            previous.box.insets == container.insets, previous.box.lineBreakMode == container.lineBreakMode,
            container.maximumNumberOfRows == 0, container.truncationToken == nil, container.exclusionPaths.isEmpty,
-           container.minimumScaleFactor == 1,
+           container.minimumScaleFactor == 1, container.fixedLineHeight <= 0,
            TextForgeLayoutEngine.hasStandardLineMetrics(rendered, in: NSRange(location: 0, length: rendered.length)) {
             let attachmentLimit = previous.attachments.first(where: \.needsLayout)?.index ?? attributedText.length
             prefix = Self.unchangedParagraphPrefix(previous.text, attributedText, before: attachmentLimit)
@@ -196,6 +197,26 @@ public final class TextForgeLayout: NSObject {
                                preparedTraits: preparedTraits, paint: paint)
     }
 
+    /// 剥离预绘位图但保留已排好的几何引擎，供缓存在淘汰大位图后继续同步命中。
+    var withoutBitmap: TextForgeLayout {
+        if preparedImage == nil { return self }
+        let box = container.copy() as! TextForgeContainer
+        return TextForgeLayout(attributedText: attributedText, container: box, engine: engine, preparedImage: nil,
+                               preparedTraits: preparedTraits, paint: paint)
+    }
+
+    /// 跨等价项共享引擎与位图，并绑定目标项的正文和标记回调；两者一致时可直接返回已有布局。
+    func binding(attributedText targetText: NSAttributedString, container targetContainer: TextForgeContainer,
+                 size: CGSize, displayScale: CGFloat? = nil) -> TextForgeLayout {
+        let useBitmap = displayScale == nil || preparedImage == nil || preparedImage?.scale == displayScale
+        if attributedText === targetText, container.truncationToken == targetContainer.truncationToken,
+           size == self.size, useBitmap { return self }
+        let box = targetContainer.copy() as! TextForgeContainer
+        box.size = size
+        return TextForgeLayout(attributedText: targetText, container: box, engine: engine,
+                               preparedImage: useBitmap ? preparedImage : nil, preparedTraits: preparedTraits, paint: paint)
+    }
+
     // MARK: 公开查询
 
     /// 创建布局时配置的截断标记，未配置时为 nil。实际显示情况见 `showsTruncationToken`。
@@ -258,7 +279,7 @@ public final class TextForgeLayout: NSObject {
     func nearestSelectionIndex(to point: CGPoint) -> Int { engine.nearestIndex(to: point) }
 
     /// 根据端点字形方向选择手柄位于字形框的左侧还是右侧。
-    func isRightToLeft(at index: Int) -> Bool { engine.isRightToLeft(at: index) }
+    func isRightToLeft(at index: Int) -> Bool { engine.isRightToLeft(atStorageIndex: engine.storageIndex(forSource: index)) }
 
     /// 文字自身宽度加内边距，标签按内容自适应时使用。
     var fittingSize: CGSize { engine.fittingSize }
@@ -283,7 +304,7 @@ public final class TextForgeLayout: NSObject {
 
     /// 复用到实际测量高度前核对末行完整片段，以及会改变 TextKit 高度行为的样式与截断配置。
     func canReuseAtMeasuredHeight(_ height: CGFloat) -> Bool {
-        container.exclusionPaths.isEmpty && container.minimumScaleFactor >= 1 && fitsHeight(height)
+        container.exclusionPaths.isEmpty && container.minimumScaleFactor >= 1 && container.fixedLineHeight <= 0 && fitsHeight(height)
             && (!isTruncated || (container.truncationToken == nil && maximumNumberOfRows > 0 && rowCount == maximumNumberOfRows))
             && engine.supportsMeasuredHeight(lineBreakMode: lineBreakMode, height: height - insets.top - insets.bottom)
     }
@@ -355,19 +376,21 @@ public final class TextForgeLayout: NSObject {
 
     /// 仅索引视图在排版串中的位置。视图大于槽时扩大候选行，避免视图中心滚出后提早卸载。
     private lazy var viewSlots: (entries: [ViewSlot], overhang: CGFloat) = {
+        let engine = self.engine
         var entries: [ViewSlot] = []
         var overhang: CGFloat = 0
-        // 只索引可见正文或截断标记；offset 把标记内部下标换算到引擎存储。
-        func collect(_ text: NSAttributedString, range: NSRange, offset: Int) {
+        /// 只索引可见附件；分别换算原文和标记下标，跳过引擎为防回流插入的软换行。
+        func collect(_ text: NSAttributedString, range: NSRange, tokenOffset: Int?) {
             text.enumerateAttribute(.attachment, in: range) { value, segment, _ in
                 guard let attachment = value as? TextForgeViewAttachment else { return }
                 overhang = max(overhang, abs(attachment.bounds.midY) + max(attachment.viewSize.height, attachment.bounds.height))
-                entries.append(ViewSlot(index: segment.location + offset, attachment: attachment))
+                let index = tokenOffset.map { $0 + segment.location } ?? engine.storageIndex(forSource: segment.location)
+                entries.append(ViewSlot(index: index, attachment: attachment))
             }
         }
-        if let range = engine.visibleCharacterRange { collect(attributedText, range: range, offset: 0) }
+        if let range = engine.visibleCharacterRange { collect(attributedText, range: range, tokenOffset: nil) }
         if let token = truncationToken, let range = engine.tokenRange {
-            collect(token, range: NSRange(location: 0, length: min(token.length, range.length)), offset: range.location)
+            collect(token, range: NSRange(location: 0, length: min(token.length, range.length)), tokenOffset: range.location)
         }
         return (entries, overhang)
     }()
@@ -394,7 +417,14 @@ public final class TextForgeLayout: NSObject {
             let size = native.width > 0 && native.height > 0 ? native : bounds.size
             let frame = CGRect(origin: CGPoint(x: baseline.x + bounds.midX - size.width / 2,
                                                y: baseline.y - bounds.midY - size.height / 2), size: size)
-            if frame.intersects(viewport) { result.append((slot.attachment.view, frame)) }
+            if frame.intersects(viewport) {
+                let view = slot.attachment.view
+                let actual = slot.attachment.viewSize
+                let finalSize = actual.width > 0 && actual.height > 0 ? actual : bounds.size
+                let finalFrame = CGRect(origin: CGPoint(x: baseline.x + bounds.midX - finalSize.width / 2,
+                                                        y: baseline.y - bounds.midY - finalSize.height / 2), size: finalSize)
+                result.append((view, finalFrame))
+            }
         }
         return result
     }
@@ -407,6 +437,7 @@ public final class TextForgeLayout: NSObject {
             size: container.size, insets: container.insets,
             maximumNumberOfRows: container.maximumNumberOfRows, lineBreakMode: container.lineBreakMode,
             minimumScaleFactor: container.minimumScaleFactor,
+            fixedLineHeight: container.fixedLineHeight,
             exclusionPaths: container.exclusionPaths.map { $0.copy() as? UIBezierPath ?? $0 }
         )
     }

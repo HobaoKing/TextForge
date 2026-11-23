@@ -72,6 +72,10 @@ open class TextForgeTextView: UITextView {
     private var lastCommittedText = ""
     private var observedStorageText = ""
     private var isUpdatingComposition = false
+    private var textAssignmentDepth = 0
+    private var hasPendingStorageEdit = false
+    private var isUpdatingAttributes = false
+    private var isSettingMarkedText = false
     private var compositionBaseline: String?
     private var customAccessibilityValue: String?
     private var attributedPlaceholder: NSAttributedString?
@@ -89,26 +93,59 @@ open class TextForgeTextView: UITextView {
         setupPlaceholder()
     }
 
-    /// 直接设置纯文本时恢复系统链接外观并同步占位和比较基线。
+    /// 直接设置纯文本时恢复系统链接外观并同步占位；用户编辑事务内由代理触发的同步裁剪保留编辑前比较基线。
     open override var text: String! {
+        willSet { textAssignmentDepth += 1 }
         didSet {
+            textAssignmentDepth -= 1
             refreshLinkStyle(for: nil)
-            lastCommittedText = text ?? ""
-            observedStorageText = lastCommittedText
-            compositionBaseline = nil
+            observedStorageText = text ?? ""
+            if !isUpdatingComposition, !hasPendingStorageEdit {
+                lastCommittedText = observedStorageText
+                compositionBaseline = nil
+            }
             updatePlaceholderVisibility()
         }
     }
 
-    /// 直接设置富文本时应用其链接样式并同步占位，以纯文本作为下一次编辑的比较基线。
+    /// 直接设置富文本时应用其链接样式并同步占位；用户编辑事务内由代理触发的同步裁剪保留编辑前比较基线。
     open override var attributedText: NSAttributedString! {
+        willSet { textAssignmentDepth += 1 }
         didSet {
+            textAssignmentDepth -= 1
             refreshLinkStyle(for: attributedText)
-            lastCommittedText = text ?? ""
-            observedStorageText = lastCommittedText
-            compositionBaseline = nil
+            observedStorageText = text ?? ""
+            if !isUpdatingComposition, !hasPendingStorageEdit {
+                lastCommittedText = observedStorageText
+                compositionBaseline = nil
+            }
             updatePlaceholderVisibility()
         }
+    }
+
+    /// 在非组字状态下就地更新富文本样式（如话题、提及高亮），保持正文字符、当前光标选区且不触发额外的 onTextChange。
+    /// 可从原生编辑代理内调用。组字、递归更新或正文码元变化时返回 false；只写回变动的属性段。
+    @objc(updateTextAttributes:) @discardableResult
+    public func updateTextAttributes(_ body: (NSMutableAttributedString) -> Void) -> Bool {
+        guard !isUpdatingAttributes, !isSettingMarkedText, markedTextRange == nil else { return false }
+        isUpdatingAttributes = true
+        defer { isUpdatingAttributes = false }
+        let current = NSAttributedString(attributedString: textStorage)
+        let mutable = NSMutableAttributedString(attributedString: current)
+        body(mutable)
+        guard mutable.string.utf16.elementsEqual(current.string.utf16), textStorage.isEqual(to: current),
+              markedTextRange == nil else { return false }
+        let savedTyping = typingAttributes
+        textStorage.beginEditing()
+        mutable.enumerateAttributes(in: NSRange(location: 0, length: mutable.length)) { attrs, range, _ in
+            current.enumerateAttributes(in: range) { old, part, _ in
+                if !(old as NSDictionary).isEqual(to: attrs) { textStorage.setAttributes(attrs, range: part) }
+            }
+        }
+        textStorage.endEditing()
+        if !(typingAttributes as NSDictionary).isEqual(to: savedTyping) { typingAttributes = savedTyping }
+        refreshLinkStyle(for: textStorage)
+        return true
     }
 
     /// 按 UITextView 的内容区摆放占位标签，保持字体、对齐和内边距一致。
@@ -134,6 +171,7 @@ open class TextForgeTextView: UITextView {
     /// UIKit 替换标记时可先删后写，期间短暂没有 markedTextRange。等最外层操作完成再判断是否提交。
     private func updateComposition(_ update: () -> Void) {
         if isUpdatingComposition { update(); return }
+        hasPendingStorageEdit = false
         if compositionBaseline == nil { compositionBaseline = text ?? "" }
         isUpdatingComposition = true
         update()
@@ -141,26 +179,28 @@ open class TextForgeTextView: UITextView {
         textDidChange()
     }
 
-    /// 记录第一笔拼音前的正文。后续改写标记只更新占位状态，原生标记真正结束才比较最终文本。
+    /// 非空组字替换期间抑制样式更新；空串或 nil 取消组字后，原生代理可立即更新最终正文的样式。
     open override func setMarkedText(_ markedText: String?, selectedRange: NSRange) {
-        updateComposition { super.setMarkedText(markedText, selectedRange: selectedRange) }
+        updateComposition {
+            let previous = isSettingMarkedText
+            isSettingMarkedText = previous || !(markedText?.isEmpty ?? true)
+            super.setMarkedText(markedText, selectedRange: selectedRange)
+            isSettingMarkedText = previous
+        }
     }
 
-    /// 候选字可直接替换标记；整次插入完成后再报告上屏结果。
+    /// 候选字或普通输入均在整次插入完成后再比较并报告上屏结果，兼容代理在 textViewDidChange 中同步裁剪。
     open override func insertText(_ text: String) {
-        guard compositionBaseline != nil || markedTextRange != nil else { super.insertText(text); return }
         updateComposition { super.insertText(text) }
     }
 
-    /// 部分输入法经 UITextInput 的范围替换接口提交候选，沿用同一个组字边界。
+    /// 部分输入法经 UITextInput 的范围替换接口提交候选，沿用同一个编辑事务边界。
     open override func replace(_ range: UITextRange, withText text: String) {
-        guard compositionBaseline != nil || markedTextRange != nil else { super.replace(range, withText: text); return }
         updateComposition { super.replace(range, withText: text) }
     }
 
-    /// 删除或撤销标记时，UIKit 可以分多步修改存储，只比较操作结束后的正文。
+    /// 删除字符或撤销标记时，UIKit 与代理可以分多步修改存储，只比较操作结束后的正文。
     open override func deleteBackward() {
-        guard compositionBaseline != nil || markedTextRange != nil else { super.deleteBackward(); return }
         updateComposition { super.deleteBackward() }
     }
 
@@ -177,6 +217,23 @@ open class TextForgeTextView: UITextView {
             customAccessibilityValue = newValue
             super.accessibilityValue = newValue
         }
+    }
+
+    /// 剪切同步完成，用操作开始时的正文比较代理裁剪后的最终结果。
+    open override func cut(_ sender: Any?) {
+        updateComposition { super.cut(sender) }
+    }
+
+    /// 粘贴可能异步加载。丢弃先前独立存储编辑的基线，在 UIKit 真正写入时再取当前正文。
+    open override func paste(_ sender: Any?) {
+        hasPendingStorageEdit = false
+        super.paste(sender)
+    }
+
+    /// 通过项目提供者发起粘贴时，同样从此次载入后的写入开始记录。
+    open override func paste(itemProviders: [NSItemProvider]) {
+        hasPendingStorageEdit = false
+        super.paste(itemProviders: itemProviders)
     }
 
     /// 选区含语义附件时用其替代文字提供纯文本；其余选区沿用系统复制，包括安全输入限制。
@@ -220,17 +277,25 @@ open class TextForgeTextView: UITextView {
         )
     }
 
-    /// 存储通知先于 UIKit 编辑通知。直接写入只同步界面，下一次用户编辑以变更前的真实内容为基线。
+    /// 原生粘贴和剪切可直接写入存储，再调用宿主代理，最后发送 UIKit 通知。
+    /// 从第一笔存储变更保留编辑前正文，直到 UIKit 确认；代理内赋值或直接裁剪存储都只改变最终值。
     @objc private func storageDidChange(_ note: Notification) {
         guard let storage = note.object as? NSTextStorage, storage.editedMask.contains(.editedCharacters) else { return }
         let current = storage.string
         guard current != observedStorageText else { return }
-        lastCommittedText = compositionBaseline ?? observedStorageText
+        if textAssignmentDepth == 0, !isUpdatingComposition, !hasPendingStorageEdit {
+            lastCommittedText = observedStorageText
+            hasPendingStorageEdit = true
+            // 无 UIKit 通知的独立写入只在本轮合并。释放标记不改比较基线，迟到的通知仍可比较最终正文。
+            DispatchQueue.main.async { [weak self] in self?.hasPendingStorageEdit = false }
+        }
         observedStorageText = current
         updatePlaceholderVisibility()
     }
 
+    /// UIKit 确认用户编辑后消费存储基线；普通赋值不发送此通知，组字事务仍在最外层完成后交付。
     @objc private func handleTextChangeNotification(_ notification: Notification) {
+        hasPendingStorageEdit = false
         textDidChange()
     }
 

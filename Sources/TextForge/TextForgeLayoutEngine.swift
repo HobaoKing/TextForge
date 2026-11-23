@@ -8,6 +8,7 @@ struct TextForgeLayoutParameters {
     var maximumNumberOfRows: Int
     var lineBreakMode: NSLineBreakMode
     var minimumScaleFactor: CGFloat
+    var fixedLineHeight: CGFloat = 0
     var exclusionPaths: [UIBezierPath]
 }
 
@@ -42,10 +43,12 @@ final class TextForgeLayoutEngine {
     let usedRect: CGRect
     /// 内容超出行数或高度限制。
     let isTruncated: Bool
-    /// 自定义截断标记在排版串中的范围。排版串为原文前缀加标记，nil 表示未使用自定义标记。
+    /// 自定义截断标记在内部排版串中的范围，nil 表示未使用；公开查询会换算为原文或标记的下标。
     let tokenRange: NSRange?
     private(set) var rasterOrigin: CGPoint = .zero
     private lazy var inkBounds = measureInkBounds()
+    /// 仅在末行发生回流时插入的软换行位置，以排版串为坐标；原文与标记均不含此字符。
+    private let insertedBreak: Int?
     private let sourceLength: Int
     /// 无界宽度下文字被排到远处时的横向平移量。对外的坐标都已减去它，传入的点会加回。
     private let shift: CGFloat
@@ -56,6 +59,7 @@ final class TextForgeLayoutEngine {
     private let glyphs: NSRange
     /// TextKit 未通过 truncatedGlyphRange 报告的头部或中部省略范围，包含替代省略号的字形位置。
     private let substitutedGlyphs: NSRange?
+    private let lineLock: TextForgeLayoutDelegate?
 
     /// 创建独立的排版栈并计算实际字形区域，零尺寸保留空结果。
     /// 尾段更新只接管标签独占的旧栈，保留相同段落之前的字形和行缓存。
@@ -68,10 +72,18 @@ final class TextForgeLayoutEngine {
         let wrapped = Self.wrappingText(text, maximumNumberOfRows: rows, mode: parameters.lineBreakMode)
         let width = Self.containerDimension(parameters.size.width, minus: insets.left + insets.right)
         let height = Self.containerDimension(parameters.size.height, minus: insets.top + insets.bottom)
+        var layoutDelegate: TextForgeLayoutDelegate?
+        if parameters.fixedLineHeight > 0 {
+            let delegate = TextForgeLayoutDelegate()
+            delegate.fixedLineHeight = parameters.fixedLineHeight
+            layoutDelegate = delegate
+        }
         if let previous {
             storage = previous.storage
             manager = previous.manager
             container = previous.container
+            manager.delegate = layoutDelegate
+            container.size = CGSize(width: width, height: height)
             let oldRange = NSRange(location: unchangedPrefix, length: storage.length - unchangedPrefix)
             let newRange = NSRange(location: unchangedPrefix, length: wrapped.length - unchangedPrefix)
             if oldRange.length > 0 || newRange.length > 0 {
@@ -80,19 +92,17 @@ final class TextForgeLayoutEngine {
         } else {
             storage = NSTextStorage(attributedString: wrapped)
             manager = NSLayoutManager()
+            manager.delegate = layoutDelegate
             container = NSTextContainer(size: CGSize(width: width, height: height))
             container.lineFragmentPadding = 0
             container.maximumNumberOfLines = rows
             container.exclusionPaths = parameters.exclusionPaths
-            // UILabel 的不限行模式仍需折行。截断交给有行数或高度限制的容器处理。
-            if rows == 0, parameters.size.height >= 1_000_000, Self.truncates(parameters.lineBreakMode) {
-                container.lineBreakMode = .byWordWrapping
-            } else {
-                container.lineBreakMode = parameters.lineBreakMode
-            }
             manager.addTextContainer(container)
             storage.addLayoutManager(manager)
         }
+        // 复用栈时可从有限高切换为无界高；两条路径均按新约束选择容器末行策略。
+        container.lineBreakMode = rows == 0 && parameters.size.height >= 1_000_000 && Self.truncates(parameters.lineBreakMode)
+            ? .byWordWrapping : parameters.lineBreakMode
         guard width > 0, height > 0, text.length > 0 else {
             clippedGlyphs = []
             glyphs = NSRange(location: 0, length: 0)
@@ -102,7 +112,9 @@ final class TextForgeLayoutEngine {
             fittingSize = .zero
             isTruncated = false
             tokenRange = nil
+            insertedBreak = nil
             substitutedGlyphs = nil
+            lineLock = nil
             return
         }
         if rows == 1, parameters.minimumScaleFactor < 1 {
@@ -111,12 +123,18 @@ final class TextForgeLayoutEngine {
         manager.ensureLayout(for: container)
         let overflowed = Self.overflows(manager: manager, container: container, length: storage.length)
         var appliedToken: NSRange?
+        var breakIndex: Int?
         if overflowed, parameters.lineBreakMode == .byTruncatingTail, let truncationToken, truncationToken.length > 0 {
-            appliedToken = Self.applyTruncationToken(
+            let applied = Self.applyTruncationToken(
                 truncationToken, source: NSAttributedString(attributedString: storage), maximumNumberOfRows: rows,
-                storage: storage, manager: manager, container: container
+                storage: storage, manager: manager, container: container, existingDelegate: layoutDelegate
             )
+            appliedToken = applied?.range
+            breakIndex = applied?.insertedBreak
+            if let lock = applied?.lock { layoutDelegate = lock }
         }
+        insertedBreak = breakIndex
+        lineLock = layoutDelegate
         let raw = manager.usedRect(for: container)
         // 无界宽度下居中、右对齐或从右到左的文字会排到几十万点之外。保留排版结果，只把坐标整体平移回原点，
         // 折行不受影响。阈值远大于任何合理缩进，左对齐文本的首行缩进仍然保留。
@@ -313,23 +331,37 @@ final class TextForgeLayoutEngine {
     /// 后台提前计算局部绘制所需的外伸量，让从不预绘位图的长文也能直接绘制首屏。
     func prepareDrawingBounds() { if glyphs.length > 0 { _ = inkBounds } }
 
-    /// 合并字形、斜体、偏移、阴影与圆角背景的墨迹范围；在排版所在线程计算，首次局部绘制直接查询。
+    /// 合并字形、斜体、偏移、阴影与圆角背景的墨迹范围；仅在实际存在装饰或斜体时按需外扩，避免普通文本预绘位图膨胀。
     private func measureInkBounds() -> CGRect {
         let visible = manager.characterRange(forGlyphRange: glyphs, actualGlyphRange: nil)
-        var ink = usedRect.union(manager.boundingRect(forGlyphRange: glyphs, in: container).offsetBy(dx: -shift, dy: 0))
+        let base = usedRect.union(manager.boundingRect(forGlyphRange: glyphs, in: container).offsetBy(dx: -shift, dy: 0))
+        var ink = base
         storage.enumerateAttributes(in: visible) { attributes, _, _ in
-            let font = (attributes[.font] as? UIFont)?.pointSize ?? 12
-            let stroke = abs((attributes[.strokeWidth] as? NSNumber)?.doubleValue ?? 0) * font / 100
-            let overhang = font + stroke
+            let font = attributes[.font] as? UIFont
+            let pointSize = font?.pointSize ?? 12
+            let stroke = abs((attributes[.strokeWidth] as? NSNumber)?.doubleValue ?? 0) * pointSize / 100
+            let isItalic = font?.fontDescriptor.symbolicTraits.contains(.traitItalic) == true
+                || ((attributes[.obliqueness] as? NSNumber)?.doubleValue ?? 0) != 0
+            let horizontalOverhang = (isItalic ? pointSize * 0.5 : 0) + stroke
             let baseline = abs((attributes[.baselineOffset] as? NSNumber)?.doubleValue ?? 0)
-            var area = self.usedRect.insetBy(dx: -overhang, dy: -overhang - baseline)
+            let attachmentOverhang = (attributes[.attachment] as? NSTextAttachment).map { max(0, $0.bounds.height - pointSize) } ?? 0
+            let verticalOverhang = stroke + baseline + attachmentOverhang
+            var area = base.insetBy(dx: -horizontalOverhang, dy: -verticalOverhang)
             if let shadow = attributes[.shadow] as? NSShadow {
                 let blur = 3 * max(0, shadow.shadowBlurRadius)
                 area = area.union(area.offsetBy(dx: shadow.shadowOffset.width, dy: shadow.shadowOffset.height)
                     .insetBy(dx: -blur, dy: -blur))
             }
             if let background = attributes[TextForgeBackground.attributeName] as? TextForgeBackground {
-                area = area.union(self.usedRect.inset(by: background.insets))
+                let insets = background.insets
+                let strokeHalf = background.strokeColor != nil ? max(0, background.strokeWidth / 2) : 0
+                let bgRect = base.inset(by: UIEdgeInsets(
+                    top: min(0, insets.top) - strokeHalf,
+                    left: min(0, insets.left) - strokeHalf,
+                    bottom: min(0, insets.bottom) - strokeHalf,
+                    right: min(0, insets.right) - strokeHalf
+                ))
+                area = area.union(bgRect)
             }
             ink = ink.union(area)
         }
@@ -341,7 +373,7 @@ final class TextForgeLayoutEngine {
         guard let clip, !clip.contains(usedRect) else { return glyphs }
         guard !clip.isEmpty else { return NSRange() }
         let insets = activeBackground?.insets ?? .zero
-        let margin = max(usedRect.minY - inkBounds.minY, inkBounds.maxY - usedRect.maxY) + max(0, -insets.top, -insets.bottom)
+        let margin = max(4, usedRect.minY - inkBounds.minY, inkBounds.maxY - usedRect.maxY) + max(0, -insets.top, -insets.bottom)
         let band = CGRect(x: 0, y: clip.minY - margin, width: container.size.width, height: clip.height + 2 * margin)
         return NSIntersectionRange(glyphs, manager.glyphRange(forBoundingRectWithoutAdditionalLayout: band, in: container))
     }
@@ -355,7 +387,9 @@ final class TextForgeLayoutEngine {
         let visible = manager.characterRange(forGlyphRange: glyphs, actualGlyphRange: nil)
         storage.enumerateAttribute(TextForgeBackground.attributeName, in: visible) { value, range, _ in
             guard let background = value as? TextForgeBackground else { return }
-            for rect in runRects(for: range) { background.draw(in: rect.offsetBy(dx: origin.x, dy: origin.y)) }
+            for rect in runRects(for: range) {
+                background.draw(in: rect.offsetBy(dx: origin.x, dy: origin.y))
+            }
         }
         let activeRange = active.map { NSIntersectionRange($0.range, visible) }
         if let active, let activeRange, let background = active.background {
@@ -382,7 +416,7 @@ final class TextForgeLayoutEngine {
         }
     }
 
-    /// 将 TextKit 的最近字形查找约束在实际字形中，排除行尾空白与被截断的原文字形。
+    /// 将最近字形限制到可见内容，排除行尾空白、标签间隙及截断字形。
     func hit(at point: CGPoint) -> TextForgeHit? {
         guard glyphs.length > 0 else { return nil }
         let point = CGPoint(x: point.x + shift, y: point.y)
@@ -392,10 +426,15 @@ final class TextForgeLayoutEngine {
             return nil
         }
         let index = manager.characterIndexForGlyph(at: glyph)
+        if storage.attribute(TextForgeBackground.marginKern, at: index, effectiveRange: nil) != nil {
+            let cluster = (storage.string as NSString).rangeOfComposedCharacterSequence(at: index)
+            let content = boundingRect(for: cluster).offsetBy(dx: shift, dy: 0)
+            guard content.contains(point) else { return nil }
+        }
         if let tokenRange, index >= tokenRange.location {
             return index < NSMaxRange(tokenRange) ? .token(index - tokenRange.location) : nil
         }
-        return index < sourceLength ? .text(index) : nil
+        return .text(sourceOffset(index))
     }
 
     /// 选词只允许在连续可见的原文中扩展。按行排除系统省略和自定义标记，合并跨行相邻的 UTF-16 范围。
@@ -407,7 +446,7 @@ final class TextForgeLayoutEngine {
         manager.enumerateLineFragments(forGlyphRange: glyphs) { _, _, _, line, _ in
             for part in self.visibleGlyphParts(of: NSIntersectionRange(line, self.glyphs)) {
                 let range = NSIntersectionRange(source, self.manager.characterRange(forGlyphRange: part, actualGlyphRange: nil))
-                if range.length > 0 { indices.insert(integersIn: range.location..<NSMaxRange(range)) }
+                if range.length > 0 { indices.insert(integersIn: self.sourceOffset(range.location)..<self.sourceOffset(NSMaxRange(range))) }
             }
         }
         return indices.rangeView.map { NSRange(location: $0.lowerBound, length: $0.count) }
@@ -418,16 +457,28 @@ final class TextForgeLayoutEngine {
         guard glyphs.length > 0 else { return NSNotFound }
         let local = CGPoint(x: point.x + shift, y: point.y)
         let glyph = min(max(glyphs.location, manager.glyphIndex(for: local, in: container)), NSMaxRange(glyphs) - 1)
-        return manager.characterIndexForGlyph(at: glyph)
+        return sourceOffset(manager.characterIndexForGlyph(at: glyph))
     }
 
     /// 使用字形的双向嵌入层级定位选区端点；同一行的 RTL 和 LTR 段分别选择正确的一侧。
-    func isRightToLeft(at index: Int) -> Bool {
+    func isRightToLeft(atStorageIndex index: Int) -> Bool {
         var level: UInt8 = 0
         let glyph = manager.glyphIndexForCharacter(at: index)
         manager.getGlyphs(in: NSRange(location: glyph, length: 1), glyphs: nil, properties: nil,
                           characterIndexes: nil, bidiLevels: &level)
         return !level.isMultiple(of: 2)
+    }
+
+    /// 将排版串的边界还原到原文前缀；额外的软换行在原文中占零个码元。
+    private func sourceOffset(_ offset: Int) -> Int {
+        if let insertedBreak, offset > insertedBreak { return offset - 1 }
+        return offset
+    }
+
+    /// 原文字符的实际存储下标，用于查询方向、字形和附件槽。
+    func storageIndex(forSource index: Int) -> Int {
+        if let insertedBreak, index >= insertedBreak { return index + 1 }
+        return index
     }
 
     /// 把 UTF-16 查询范围裁到正文或标记可用的区间。无效位置返回空范围，长度先裁切再相加，避免整数溢出。
@@ -437,18 +488,37 @@ final class TextForgeLayoutEngine {
             guard let tokenRange else { return NSRange(location: 0, length: 0) }
             available = tokenRange
         } else {
-            available = NSRange(location: 0, length: tokenRange?.location ?? storage.length)
+            available = NSRange(location: 0, length: sourceOffset(tokenRange?.location ?? storage.length))
         }
         guard range.location >= 0, range.location < available.length, range.length > 0 else {
             return NSRange(location: 0, length: 0)
         }
-        return NSRange(
-            location: available.location + range.location,
-            length: min(range.length, available.length - range.location)
-        )
+        let start = available.location + range.location
+        let length = min(range.length, available.length - range.location)
+        if inToken { return NSRange(location: start, length: length) }
+        let lower = storageIndex(forSource: start)
+        return NSRange(location: lower, length: storageIndex(forSource: start + length - 1) - lower + 1)
     }
 
-    /// 排版串范围内可见字形的外接矩形，按行片段高度计算。范围不可见时返回 null。
+    /// 逐个交付可见片段的内容区，保持行片段高度，去掉视觉右缘字素为下一个字预留的间距。
+    /// TextKit 的字形选择框包含这部分 advance；绘制、选区和命中共用同一条边界。
+    private func enumerateContentRects(for part: NSRange, _ visit: @escaping (CGRect) -> Void) {
+        manager.enumerateEnclosingRects(forGlyphRange: part, withinSelectedGlyphRange: part, in: container) { rect, _ in
+            guard !rect.isEmpty else { return }
+            let edge = CGPoint(x: rect.maxX - min(0.01, rect.width / 2), y: rect.midY)
+            let glyph = self.manager.glyphIndex(for: edge, in: self.container)
+            var content = rect
+            if NSLocationInRange(glyph, part) {
+                let index = self.manager.characterIndexForGlyph(at: glyph)
+                if let margin = self.storage.attribute(TextForgeBackground.marginKern, at: index, effectiveRange: nil) as? NSNumber {
+                    content.size.width = max(0, rect.width - CGFloat(margin.doubleValue))
+                }
+            }
+            if !content.isEmpty { visit(content) }
+        }
+    }
+
+    /// 合并剔除标签留白后的可见内容矩形，纵向保留行片段高度；范围不可见时返回 null。
     func boundingRect(for range: NSRange) -> CGRect {
         guard range.length > 0 else { return .null }
         let selected = NSIntersectionRange(manager.glyphRange(forCharacterRange: range, actualCharacterRange: nil), glyphs)
@@ -456,16 +526,14 @@ final class TextForgeLayoutEngine {
         var bounds = CGRect.null
         manager.enumerateLineFragments(forGlyphRange: selected) { _, _, _, line, _ in
             for part in self.visibleGlyphParts(of: NSIntersectionRange(line, selected)) {
-                self.manager.enumerateEnclosingRects(forGlyphRange: part, withinSelectedGlyphRange: part, in: self.container) { rect, _ in
-                    if !rect.isEmpty { bounds = bounds.union(rect) }
-                }
+                self.enumerateContentRects(for: part) { bounds = bounds.union($0) }
             }
         }
         return bounds.isNull ? .null : bounds.offsetBy(dx: -shift, dy: 0)
     }
 
     /// 排版串范围在每个行片段上的排版矩形：横向取字形外接范围，纵向取基线上下的字体升部与降部，
-    /// 不含行距。背景装饰、按压反馈和触摸距离都使用这组矩形。
+    /// 不含行距。按视觉片段的实际右缘剔除预留间隔，背景、按压和触摸距离共用结果。
     func runRects(for range: NSRange) -> [CGRect] {
         guard range.length > 0 else { return [] }
         let selected = NSIntersectionRange(manager.glyphRange(forCharacterRange: range, actualCharacterRange: nil), glyphs)
@@ -486,14 +554,13 @@ final class TextForgeLayoutEngine {
                         descent = min(descent, font.descender)
                     }
                 }
-                // 双向文字的同一逻辑范围可能有多个不相邻的视觉片段。
-                self.manager.enumerateEnclosingRects(forGlyphRange: part, withinSelectedGlyphRange: part, in: self.container) { rect, _ in
-                    var bounds = rect.offsetBy(dx: -self.shift, dy: 0)
+                self.enumerateContentRects(for: part) { rect in
+                    var bounds = rect
                     if ascent > descent {
                         bounds.origin.y = baseline - ascent
                         bounds.size.height = ascent - descent
                     }
-                    if !bounds.isEmpty { result.append(bounds) }
+                    if !bounds.isEmpty { result.append(bounds.offsetBy(dx: -self.shift, dy: 0)) }
                 }
             }
         }
@@ -520,7 +587,7 @@ final class TextForgeLayoutEngine {
                 lower = max(lower, manager.characterIndexForGlyph(at: NSMaxRange(hidden)))
             }
         }
-        return upper > lower ? NSRange(location: lower, length: upper - lower) : nil
+        return upper > lower ? NSRange(location: sourceOffset(lower), length: sourceOffset(upper) - sourceOffset(lower)) : nil
     }
 
     /// 返回语义范围中第一个实际可见的 UTF-16 下标。inToken 为 true 时，入参与返回值均相对截断标记。
@@ -532,7 +599,7 @@ final class TextForgeLayoutEngine {
             isVisible(manager.glyphIndexForCharacter(at: $0))
         }
         let offset = inToken ? (tokenRange?.location ?? 0) : 0
-        return index.map { $0 - offset }
+        return index.map { inToken ? $0 - offset : sourceOffset($0) }
     }
 
     /// 由垂直视口查询已排版的字符范围，保留整行以覆盖双向文字及横向偏移的附件。
@@ -575,7 +642,7 @@ final class TextForgeLayoutEngine {
             let upper = min(NSMaxRange(characters), limit)
             let lower = min(characters.location, upper)
             result.append(TextForgeEngineLine(
-                range: NSRange(location: lower, length: upper - lower), rect: used.offsetBy(dx: -self.shift, dy: 0),
+                range: NSRange(location: self.sourceOffset(lower), length: self.sourceOffset(upper) - self.sourceOffset(lower)), rect: used.offsetBy(dx: -self.shift, dy: 0),
                 baseline: fragment.minY + self.manager.location(forGlyphAt: part.location).y, row: row
             ))
         }
@@ -605,31 +672,29 @@ final class TextForgeLayoutEngine {
         return image
     }
 
-    /// 排除容器外或末行截断替换掉的字形。
+    /// 排除容器外、被截断以及仅用于固定末行的软换行字形。
     private func isVisible(_ glyph: Int) -> Bool {
         guard NSLocationInRange(glyph, glyphs), !clippedGlyphs.contains(glyph) else { return false }
+        if let insertedBreak, manager.characterIndexForGlyph(at: glyph) == insertedBreak { return false }
         guard let omitted = omittedGlyphs(inLineAt: glyph) else { return true }
         return !NSLocationInRange(glyph, omitted)
     }
 
-    /// 从同一行片段中剔除 TextKit 以省略号代替的字形。中部截断可能留下前后两段。
+    /// 从行片段中剔除排版用软换行及 TextKit 以省略号代替的字形。中部截断可能留下前后两段。
     private func visibleGlyphParts(of range: NSRange) -> [NSRange] {
         guard range.length > 0 else { return [] }
         if !clippedGlyphs.isEmpty {
             let selected = IndexSet(integersIn: range.location..<NSMaxRange(range))
             return selected.subtracting(clippedGlyphs).rangeView.map { NSRange(location: $0.lowerBound, length: $0.count) }
         }
-        guard isTruncated, let hidden = omittedGlyphs(inLineAt: range.location) else { return [range] }
-        let omitted = NSIntersectionRange(range, hidden)
-        guard omitted.length > 0 else { return [range] }
-        var parts: [NSRange] = []
-        if range.location < omitted.location {
-            parts.append(NSRange(location: range.location, length: omitted.location - range.location))
+        guard isTruncated else { return [range] }
+        var hidden = IndexSet()
+        if let omitted = omittedGlyphs(inLineAt: range.location) {
+            hidden.insert(integersIn: omitted.location..<NSMaxRange(omitted))
         }
-        if NSMaxRange(omitted) < NSMaxRange(range) {
-            parts.append(NSRange(location: NSMaxRange(omitted), length: NSMaxRange(range) - NSMaxRange(omitted)))
-        }
-        return parts
+        if let insertedBreak { hidden.insert(manager.glyphIndexForCharacter(at: insertedBreak)) }
+        guard !hidden.isEmpty else { return [range] }
+        return IndexSet(integersIn: range.location..<NSMaxRange(range)).subtracting(hidden).rangeView.map(NSRange.init)
     }
 
     /// 优先使用 TextKit 公布的省略范围，只在系统没有报告时使用已识别的头部或中部省略范围。
@@ -727,13 +792,14 @@ final class TextForgeLayoutEngine {
         return manager.truncatedGlyphRange(inLineFragmentForGlyphAt: NSMaxRange(glyphs) - 1).location != NSNotFound
     }
 
-    /// 把末行尾部替换成自定义截断标记，返回标记在排版串中的范围。
-    /// 先用单行试排在末行内二分出能容纳"正文 + 标记"的最长前缀，再用真实容器复核；
-    /// 缩进或排除路径使复核仍溢出时逐字回退。标记比整行还宽时放在行首，由容器裁切。
+    /// 把末行尾部替换成自定义截断标记，返回标记在排版串中的范围与末行断行锁。
+    /// 先用单行试排在末行内二分出能容纳“正文 + 标记”的最长前缀，再用真实容器复核。
+    /// 原末行被吸回上行时在排版串加入软换行并记录映射；真实容器仍溢出时逐字回退，过宽标记交给末行裁切。
     private static func applyTruncationToken(
         _ token: NSAttributedString, source: NSAttributedString, maximumNumberOfRows: Int,
-        storage: NSTextStorage, manager: NSLayoutManager, container: NSTextContainer
-    ) -> NSRange? {
+        storage: NSTextStorage, manager: NSLayoutManager, container: NSTextContainer,
+        existingDelegate: TextForgeLayoutDelegate?
+    ) -> (range: NSRange, lock: TextForgeLayoutDelegate?, insertedBreak: Int?)? {
         let glyphs = manager.glyphRange(for: container)
         guard glyphs.length > 0 else { return nil }
         let lastGlyph = NSMaxRange(glyphs) - 1
@@ -802,13 +868,34 @@ final class TextForgeLayoutEngine {
             let middle = (choice + upper + 1) / 2
             if fits(middle) { choice = middle } else { upper = middle - 1 }
         }
+        let lock = existingDelegate ?? (lineStart > 0 ? TextForgeLayoutDelegate() : nil)
+        manager.delegate = lock
+        var insertedBreak: Int?
         while true {
             let end = trimmedEnd(boundaries[choice])
+            let offset = insertedBreak == nil ? 0 : 1
             let piece = wrappingText(inheritedToken(end), maximumNumberOfRows: maximumNumberOfRows, mode: container.lineBreakMode)
-            storage.replaceCharacters(in: NSRange(location: end, length: storage.length - end), with: piece)
+            if lineStart > 0 {
+                lock?.lockedRange = NSRange(location: lineStart + offset, length: end - lineStart + piece.length)
+            }
+            let tokenStart = end + offset
+            storage.replaceCharacters(in: NSRange(location: tokenStart, length: storage.length - tokenStart), with: piece)
             manager.ensureLayout(for: container)
+            if insertedBreak == nil, lineStart > 0 {
+                let first = manager.glyphIndexForCharacter(at: lineStart)
+                if NSLocationInRange(first, manager.glyphRange(for: container)),
+                   manager.lineFragmentRect(forGlyphAt: first, effectiveRange: nil).minY < fragment.minY - 0.5 {
+                    var attributes: [NSAttributedString.Key: Any] = [:]
+                    for key in [NSAttributedString.Key.font, .paragraphStyle] {
+                        attributes[key] = source.attribute(key, at: lineStart - 1, effectiveRange: nil)
+                    }
+                    storage.insert(NSAttributedString(string: "\u{2028}", attributes: attributes), at: lineStart)
+                    insertedBreak = lineStart
+                    continue
+                }
+            }
             if choice == 0 || !overflows(manager: manager, container: container, length: storage.length) {
-                return NSRange(location: end, length: piece.length)
+                return (NSRange(location: tokenStart, length: piece.length), lock, insertedBreak)
             }
             choice -= 1
         }
@@ -820,19 +907,21 @@ final class TextForgeLayoutEngine {
         return max(0, min(value - inset, 1_000_000))
     }
 
-    /// 缺少段落样式时采用容器的逐字换行。多行文本先折行，末行由容器决定如何截断。
+    /// 缺少段落样式或仅由 TextForgeTypography 合成间距时采用容器的逐字换行。多行文本先折行，末行由容器决定如何截断。
     private static func wrappingText(_ text: NSAttributedString, maximumNumberOfRows: Int, mode: NSLineBreakMode) -> NSAttributedString {
         guard maximumNumberOfRows != 1 || mode == .byCharWrapping else { return text }
         let result = NSMutableAttributedString(attributedString: text)
         let fullRange = NSRange(location: 0, length: text.length)
-        text.enumerateAttribute(.paragraphStyle, in: fullRange) { value, range, _ in
-            if value == nil, mode == .byCharWrapping {
-                let style = NSMutableParagraphStyle()
+        text.enumerateAttributes(in: fullRange) { attributes, range, _ in
+            let value = attributes[.paragraphStyle] as? NSParagraphStyle
+            let synthesized = attributes[TextForgeTypography.synthesizedParagraphStyle] != nil
+            if (value == nil || synthesized), mode == .byCharWrapping {
+                let style = (value?.mutableCopy() as? NSMutableParagraphStyle) ?? NSMutableParagraphStyle()
                 style.lineBreakMode = .byCharWrapping
                 result.addAttribute(.paragraphStyle, value: style, range: range)
                 return
             }
-            guard maximumNumberOfRows != 1, let style = value as? NSParagraphStyle,
+            guard maximumNumberOfRows != 1, let style = value,
                   truncates(style.lineBreakMode),
                   let wrapping = style.mutableCopy() as? NSMutableParagraphStyle else { return }
             wrapping.lineBreakMode = .byWordWrapping
@@ -844,5 +933,60 @@ final class TextForgeLayoutEngine {
     /// 识别 Unicode 省略号策略，普通折行和裁切保留原行为。
     private static func truncates(_ mode: NSLineBreakMode) -> Bool {
         mode == .byTruncatingHead || mode == .byTruncatingMiddle || mode == .byTruncatingTail
+    }
+}
+
+/// 统一承载固定行高基线规整与末行截断防跨行回流。
+private final class TextForgeLayoutDelegate: NSObject, NSLayoutManagerDelegate {
+    var fixedLineHeight: CGFloat = 0
+    var lockedRange = NSRange(location: NSNotFound, length: 0)
+
+    func layoutManager(_ layoutManager: NSLayoutManager, shouldBreakLineByWordBeforeCharacterAt charIndex: Int) -> Bool {
+        if lockedRange.location != NSNotFound, charIndex > lockedRange.location, charIndex < NSMaxRange(lockedRange) {
+            return false
+        }
+        return true
+    }
+
+    func layoutManager(_ layoutManager: NSLayoutManager, shouldBreakLineByHyphenatingBeforeCharacterAt charIndex: Int) -> Bool {
+        if lockedRange.location != NSNotFound, charIndex > lockedRange.location, charIndex < NSMaxRange(lockedRange) {
+            return false
+        }
+        return true
+    }
+
+    func layoutManager(
+        _ layoutManager: NSLayoutManager,
+        shouldSetLineFragmentRect lineFragmentRect: UnsafeMutablePointer<CGRect>,
+        lineFragmentUsedRect: UnsafeMutablePointer<CGRect>,
+        baselineOffset: UnsafeMutablePointer<CGFloat>,
+        in textContainer: NSTextContainer,
+        forGlyphRange glyphRange: NSRange
+    ) -> Bool {
+        guard fixedLineHeight > 0, glyphRange.length > 0 else { return false }
+        var maxAscender: CGFloat = 0
+        var minDescender: CGFloat = 0
+        if let storage = layoutManager.textStorage, storage.length > 0 {
+            let startChar = min(layoutManager.characterIndexForGlyph(at: glyphRange.location), storage.length - 1)
+            let endChar = min(layoutManager.characterIndexForGlyph(at: NSMaxRange(glyphRange) - 1), storage.length - 1)
+            let chars = NSRange(location: min(startChar, endChar), length: abs(endChar - startChar) + 1)
+            storage.enumerateAttribute(.font, in: chars) { value, _, _ in
+                if let font = value as? UIFont {
+                    maxAscender = max(maxAscender, font.ascender)
+                    minDescender = min(minDescender, font.descender)
+                }
+            }
+        }
+        if maxAscender == 0, minDescender == 0 {
+            let fallback = UIFont.systemFont(ofSize: 16)
+            maxAscender = fallback.ascender
+            minDescender = fallback.descender
+        }
+        let naturalHeight = maxAscender - minDescender
+        let leading = (fixedLineHeight - naturalHeight) / 2
+        lineFragmentRect.pointee.size.height = fixedLineHeight
+        lineFragmentUsedRect.pointee.size.height = fixedLineHeight
+        baselineOffset.pointee = max(0, leading + maxAscender)
+        return true
     }
 }

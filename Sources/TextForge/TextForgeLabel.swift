@@ -22,6 +22,12 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
     @objc public var lineSpacing: CGFloat = 0 { didSet { invalidateTextLayout() } }
     /// 非零时以点覆盖段后距；设回 0 后恢复每段原始段距。
     @objc public var paragraphSpacing: CGFloat = 0 { didSet { invalidateTextLayout() } }
+    /// 大于 0 时以点锁定每行高度并按该行字体居中基线，防止行内大尺寸徽章或表情撑高单行。
+    @objc public var fixedLineHeight: CGFloat = 0 {
+        didSet {
+            if fixedLineHeight != oldValue { invalidateTextLayout() }
+        }
+    }
     @objc public var textVerticalAlignment: TextForgeVerticalAlignment = .center {
         didSet { invalidateTextLayout() }
     }
@@ -121,11 +127,11 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         dismissSelectionMenu()
     }
 
-    /// 选区覆盖在当前附件和文字上方；它仅在手柄附近拦截触摸。
+    /// 为伸出标签的手柄圆点保留绘制空间，并将文字原点转换到覆盖层坐标。
     private func positionSelection(_ overlay: TextForgeLabelSelection) {
-        overlay.frame = bounds
+        overlay.frame = bounds.insetBy(dx: -4, dy: -4)
         let origin = drawingOrigin(for: overlay.layout)
-        overlay.refresh(origin: CGPoint(x: origin.x - bounds.minX, y: origin.y - bounds.minY))
+        overlay.refresh(origin: convert(origin, to: overlay))
         bringSubviewToFront(overlay)
     }
 
@@ -183,14 +189,27 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
     private weak var actionTapGesture: UITapGestureRecognizer?
     private weak var actionPressGesture: UILongPressGestureRecognizer?
     private var customAccessibilityLabel: String?
+    private var defaultFont: UIFont?
+    private var defaultTextColor: UIColor?
+    private var defaultTextAlignment: NSTextAlignment = .natural
+    private var defaultLineBreakMode: NSLineBreakMode = .byTruncatingTail
+    private var isStoringAttributedText = false
 
     public override init(frame: CGRect) {
         super.init(frame: frame)
+        defaultFont = super.font
+        defaultTextColor = super.textColor
+        defaultTextAlignment = super.textAlignment
+        defaultLineBreakMode = super.lineBreakMode
         configureInteraction()
     }
 
     public required init?(coder: NSCoder) {
         super.init(coder: coder)
+        defaultFont = super.font
+        defaultTextColor = super.textColor
+        defaultTextAlignment = super.textAlignment
+        defaultLineBreakMode = super.lineBreakMode
         configureInteraction()
         refreshAttributeUsage()
     }
@@ -200,12 +219,15 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         pendingLayout?.cancel()
     }
 
-    /// 读取当前显示的文本。赋值替换内部异步内容，显式布局继续优先显示。
+    /// 切回纯文本时恢复宿主的默认样式；显式布局继续优先显示。
     open override var text: String? {
         get { textLayout?.attributedText.string ?? super.text }
         set {
             preparedTextLayout = nil
+            isStoringAttributedText = true
             super.text = newValue
+            restorePlainTextStyle()
+            isStoringAttributedText = false
             refreshAttributeUsage()
         }
     }
@@ -218,10 +240,38 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
     // 选中态仅影响绘制，切换时可继续使用同一份布局和常态位图。
     open override var isHighlighted: Bool { didSet { if oldValue != isHighlighted { setNeedsDisplay() } } }
     open override var highlightedTextColor: UIColor? { didSet { setNeedsDisplay() } }
-    open override var font: UIFont! { didSet { if font != oldValue { invalidateTextLayout() } } }
-    open override var textColor: UIColor! { didSet { if textColor != oldValue { invalidateTextLayout() } } }
-    open override var textAlignment: NSTextAlignment { didSet { if textAlignment != oldValue { invalidateTextLayout() } } }
-    open override var lineBreakMode: NSLineBreakMode { didSet { if lineBreakMode != oldValue { invalidateTextLayout() } } }
+    /// 宿主变更默认字体时重新排版，忽略 UIKit 存储富文本时同步的首段样式。
+    open override var font: UIFont! {
+        didSet {
+            guard !isStoringAttributedText, defaultFont != super.font else { return }
+            defaultFont = super.font
+            invalidateTextLayout()
+        }
+    }
+    /// 宿主变更默认文字颜色时重新排版，忽略 UIKit 存储富文本时同步的首段样式。
+    open override var textColor: UIColor! {
+        didSet {
+            guard !isStoringAttributedText, defaultTextColor != super.textColor else { return }
+            defaultTextColor = super.textColor
+            invalidateTextLayout()
+        }
+    }
+    /// 宿主变更默认对齐方式时重新排版，忽略 UIKit 存储富文本时同步的首段样式。
+    open override var textAlignment: NSTextAlignment {
+        didSet {
+            guard !isStoringAttributedText, defaultTextAlignment != super.textAlignment else { return }
+            defaultTextAlignment = super.textAlignment
+            invalidateTextLayout()
+        }
+    }
+    /// 宿主变更默认断行模式时重新排版，忽略 UIKit 存储富文本时同步的首段样式。
+    open override var lineBreakMode: NSLineBreakMode {
+        didSet {
+            guard !isStoringAttributedText, defaultLineBreakMode != super.lineBreakMode else { return }
+            defaultLineBreakMode = super.lineBreakMode
+            invalidateTextLayout()
+        }
+    }
     open override var numberOfLines: Int { didSet { if numberOfLines != oldValue { invalidateTextLayout() } } }
     open override var adjustsFontSizeToFitWidth: Bool {
         didSet { if adjustsFontSizeToFitWidth != oldValue { invalidateTextLayout() } }
@@ -361,9 +411,7 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
             self.pendingLayout = nil
             self.pendingLayoutWidth = nil
             self.storeAttributedText(source)
-            if self.bounds.width == 0 || self.bounds.width == size.width {
-                self.preparedTextLayout = result
-            }
+            self.preparedTextLayout = result
             completion?()
         }
         pendingLayout = task
@@ -371,16 +419,27 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         return task
     }
 
-    /// 换文时保留不限行正文的候选栈，下次同尺寸排版可复用未变化段；空文本和显式布局解除旧引用。
+    /// 换文时保留不限行正文的候选栈，下次同尺寸排版可复用未变化段；保护控件默认字体与颜色不被首字符局部属性覆盖。
     private func storeAttributedText(_ text: NSAttributedString?) {
         var candidates: [TextForgeLayout.ParagraphCandidate] = []
         if text != nil, numberOfLines == 0, explicitTextLayout == nil {
             candidates = cachedLayouts.isEmpty ? previousLayouts : cachedLayouts.compactMap(TextForgeLayout.ParagraphCandidate.init)
         }
         preparedTextLayout = nil
+        isStoringAttributedText = true
         super.attributedText = text
+        if text == nil { restorePlainTextStyle() }
+        isStoringAttributedText = false
         refreshAttributeUsage()
         if usesCustomLayout { previousLayouts = candidates }
+    }
+
+    /// 在纯文本赋值事务中恢复 UIKit 绘制与测量使用的样式，避免沿用上一段富文本的首字符属性。
+    private func restorePlainTextStyle() {
+        if let defaultFont, super.font != defaultFont { super.font = defaultFont }
+        if let defaultTextColor, super.textColor != defaultTextColor { super.textColor = defaultTextColor }
+        if super.textAlignment != defaultTextAlignment { super.textAlignment = defaultTextAlignment }
+        if super.lineBreakMode != defaultLineBreakMode { super.lineBreakMode = defaultLineBreakMode }
     }
 
     /// 首次获得宽度时也校验待交付结果。已交付的异步文本保留原文，宽度变化后重新排版。
@@ -455,6 +514,7 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         }
         let contentRect = insetTextRect(bounds)
         let textRect = super.textRect(forBounds: contentRect, limitedToNumberOfLines: numberOfLines)
+        guard !textRect.isEmpty else { return .zero }
         return CGRect(
             x: textRect.origin.x - contentInsets.left,
             y: textRect.origin.y - contentInsets.top,
@@ -572,6 +632,23 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         clearHighlight()
     }
 
+    /// 允许伸出控件边界的选区手柄以及热区扩展半径内的高亮链接接收触摸。
+    open override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+        if super.point(inside: point, with: event) { return true }
+        guard isUserInteractionEnabled, !isHidden, alpha > 0.01 else { return false }
+        if let selection, selection.point(inside: convert(point, to: selection), with: event) {
+            return true
+        }
+        guard usesCustomLayout, !bounds.isEmpty, highlightTouchExtensionRadius > 0,
+              bounds.insetBy(dx: -highlightTouchExtensionRadius, dy: -highlightTouchExtensionRadius).contains(point) else {
+            return false
+        }
+        let hit = interaction(at: point)
+        guard hit.highlightRange.location != NSNotFound else { return false }
+        return hit.highlight?.tapAction != nil || hit.highlight?.longPressAction != nil
+            || highlightTapAction != nil || highlightLongPressAction != nil
+    }
+
     /// 让普通文字和链接之外的空白透传给下层控件，保留附件子视图、宿主手势以及确实可执行的标签操作。
     open override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         let target = super.hitTest(point, with: event)
@@ -611,7 +688,7 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
     /// 判断当前内容是否需要同一份可查询、可复用的布局。
     private var usesCustomLayout: Bool {
         isSelectable || textLayout != nil || requiresAttributedLayout || textVerticalAlignment != .center
-            || truncationToken != nil || !exclusionPaths.isEmpty
+            || truncationToken != nil || !exclusionPaths.isEmpty || fixedLineHeight > 0
             || characterSpacing != 0 || lineSpacing != 0 || paragraphSpacing != 0
             || textTapAction != nil || textLongPressAction != nil || highlightTapAction != nil || highlightLongPressAction != nil
     }
@@ -636,7 +713,7 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         }
         if let cached = cachedLayouts.first(where: fits) { return cached }
         let original = super.attributedText ?? NSAttributedString(string: super.text ?? "")
-        let previous = previousLayouts.firstIndex { $0.box.size == size }.map { previousLayouts.remove(at: $0) }
+        let previous = previousLayouts.firstIndex { $0.box.size.width == size.width }.map { previousLayouts.remove(at: $0) }
         let result = TextForgeLayout(container: makeContainer(size: size, rows: rows), attributedText: styledText(original),
                                      fallbackTraits: nil, reusing: previous)
         if rows == 0, !result.isTruncated { result.captureAttachmentMetrics() }
@@ -649,8 +726,9 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
     private func makeContainer(size: CGSize, rows: Int) -> TextForgeContainer {
         let container = TextForgeContainer(size: size, insets: contentInsets)
         container.maximumNumberOfRows = rows
-        container.lineBreakMode = lineBreakMode
+        container.lineBreakMode = defaultLineBreakMode
         container.minimumScaleFactor = adjustsFontSizeToFitWidth ? minimumScaleFactor : 1
+        container.fixedLineHeight = fixedLineHeight
         container.truncationToken = truncationToken
         container.exclusionPaths = exclusionPaths
         if hasExplicitLinkStyle { container.linkTextAttributes = linkTextAttributes }
@@ -662,18 +740,29 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         let prepared = NSMutableAttributedString(attributedString: original)
         let range = NSRange(location: 0, length: original.length)
         let paragraph = NSMutableParagraphStyle()
-        paragraph.alignment = textAlignment
-        if lineBreakMode == .byCharWrapping { paragraph.lineBreakMode = .byCharWrapping }
-        let defaults: [(NSAttributedString.Key, Any?)] = [(.font, font), (.foregroundColor, textColor), (.paragraphStyle, paragraph)]
+        paragraph.alignment = defaultTextAlignment
+        if defaultLineBreakMode == .byCharWrapping { paragraph.lineBreakMode = .byCharWrapping }
+        let defaults: [(NSAttributedString.Key, Any?)] = [
+            (.font, defaultFont ?? font),
+            (.foregroundColor, defaultTextColor ?? textColor),
+            (.paragraphStyle, paragraph)
+        ]
         // 按单个属性的连续区间补值；仅颜色频繁变化的长段落只需设置一次段落样式。
         for (key, value) in defaults {
             guard let value else { continue }
             original.enumerateAttribute(key, in: range) { existing, part, _ in
                 if existing == nil {
                     prepared.addAttribute(key, value: value, range: part)
-                } else if key == .paragraphStyle, let mutable = existing as? NSMutableParagraphStyle {
-                    // 保存排版时的段落属性，宿主原地改动同一个可变样式后仍能识别首个变化段。
-                    prepared.addAttribute(key, value: mutable.copy(), range: part)
+                } else if key == .paragraphStyle {
+                    original.enumerateAttribute(TextForgeTypography.synthesizedParagraphStyle, in: part) { marker, segment, _ in
+                        if marker != nil, let style = (existing as? NSParagraphStyle)?.mutableCopy() as? NSMutableParagraphStyle {
+                            style.alignment = defaultTextAlignment
+                            if defaultLineBreakMode == .byCharWrapping { style.lineBreakMode = .byCharWrapping }
+                            prepared.addAttribute(key, value: style.copy(), range: segment)
+                        } else if let mutable = existing as? NSMutableParagraphStyle {
+                            prepared.addAttribute(key, value: mutable.copy(), range: segment)
+                        }
+                    }
                 }
             }
         }
@@ -872,6 +961,7 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
             attributedText.enumerateAttributes(in: NSRange(location: 0, length: attributedText.length)) { attributes, _, stop in
                 if attributes[TextForgeHighlight.attributeName] != nil || attributes[.link] != nil
                     || attributes[TextForgeBackground.attributeName] != nil
+                    || attributes[TextForgeTypography.synthesizedParagraphStyle] != nil
                     || attributes[.attachment] is TextForgeViewAttachment {
                     requiresAttributedLayout = true
                     stop.pointee = true
