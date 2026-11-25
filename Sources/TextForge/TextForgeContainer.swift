@@ -233,3 +233,75 @@ public final class TextForgeBackground: NSObject {
         }
     }
 }
+
+/// 由宿主提供的自定义绘制，随一段文字排版：引用竖线、波浪下划线、代码块底色、渐变高亮等不必各加一种内置属性。
+/// 含自定义绘制的文本在主线程同步排版和绘制，不参与后台预排和位图预绘。
+@objc(TextForgeDrawing)
+public final class TextForgeDrawing: NSObject {
+    /// 富文本属性名，值为 TextForgeDrawing。
+    @objc public static let attributeName = NSAttributedString.Key("TextForge.Drawing")
+
+    /// 为 true 时画在字形之上；默认画在字形之下、圆角背景之上。
+    @objc public var drawsAboveText = false
+    /// 绘制内容可能超出文字矩形的最大距离，单位为点。局部重绘据此判断哪些片段需要重画。
+    @objc public var outset: CGFloat = 0
+    /// 在主线程、当前图形上下文里绘制一段。rect 是这段文字在一行内的排版矩形：横向为字形范围，
+    /// 纵向为基线上下的字体升部与降部，不含行距。范围跨行或被双向文字拆开时每段各调用一次，
+    /// isFirst、isLast 标明本段是不是整个范围的首段、末段，用来决定圆角或端头画在哪一侧。
+    @objc public let handler: (CGContext, CGRect, Bool, Bool) -> Void
+
+    @objc public init(handler: @escaping (_ context: CGContext, _ rect: CGRect, _ isFirst: Bool, _ isLast: Bool) -> Void) {
+        self.handler = handler
+    }
+
+    /// 在合法的 UTF-16 范围内写入自定义绘制，越界或空范围保持原文本。
+    @objc public func apply(to text: NSMutableAttributedString, range: NSRange) {
+        guard range.location >= 0, range.location <= text.length,
+              range.length > 0, range.length <= text.length - range.location else { return }
+        text.addAttribute(Self.attributeName, value: self, range: range)
+    }
+
+    /// 现成的下划线：系统的 `.underlineStyle` 不能指定线宽和位置时使用。线画在文字排版矩形的底边之下，
+    /// width 为线宽，offset 为线的上沿到底边的距离，单位为点；纵向对齐到设备像素，跨行时每行各一段。
+    /// 颜色在绘制时按标签当前外观解析。
+    @objc(underlineWithColor:width:offset:)
+    public static func underline(color: UIColor, width: CGFloat, offset: CGFloat) -> TextForgeDrawing {
+        let drawing = TextForgeDrawing { context, rect, _, _ in
+            guard width > 0 else { return }
+            let scale = max(1, UITraitCollection.current.displayScale)
+            let top = ((rect.maxY + offset) * scale).rounded() / scale
+            context.setFillColor(color.cgColor)
+            context.fill(CGRect(x: rect.minX, y: top, width: rect.width, height: width))
+        }
+        drawing.outset = max(0, offset + width) + 1
+        return drawing
+    }
+}
+
+/// 排版调试叠层的颜色配置：画出行框、基线、文字外接矩形和附件槽，用来排查对齐和行高问题。某项为 nil 表示不画。
+/// 开启后标签改用 TextForge 自己的排版绘制，画出的线才与文字位置一致。
+@objc(TextForgeDebugOptions)
+public final class TextForgeDebugOptions: NSObject {
+    /// 对没有单独设置 `debugOptions` 的标签生效，nil 关闭。在主线程读写。
+    /// 之后创建或重新赋值内容的标签立即生效，已经显示的标签需要再赋一次内容。
+    @MainActor @objc public static var shared: TextForgeDebugOptions?
+
+    /// 每行的基线。
+    @objc public var baselineColor: UIColor?
+    /// 每行文字占用的矩形，高度含行距。
+    @objc public var lineColor: UIColor?
+    /// 整段文字的外接矩形，不含内边距。
+    @objc public var textBoundsColor: UIColor?
+    /// 图片和视图附件在行内占用的槽。
+    @objc public var attachmentColor: UIColor?
+
+    /// 四项全开的常用配色：基线红、行框蓝、外接矩形绿、附件槽橙。
+    @objc public static func standard() -> TextForgeDebugOptions {
+        let options = TextForgeDebugOptions()
+        options.baselineColor = .systemRed
+        options.lineColor = UIColor.systemBlue.withAlphaComponent(0.6)
+        options.textBoundsColor = .systemGreen
+        options.attachmentColor = .systemOrange
+        return options
+    }
+}

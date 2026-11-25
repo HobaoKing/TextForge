@@ -62,6 +62,9 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         didSet { hasExplicitLinkStyle = true; invalidateTextLayout() }
     }
 
+    /// 只对这个标签生效的排版调试叠层，nil 时沿用 `TextForgeDebugOptions.shared`。
+    @objc public var debugOptions: TextForgeDebugOptions? { didSet { invalidateTextLayout() } }
+
     /// 高亮和链接的触摸热区向外扩展的半径，单位为点。手指落在多个热区内时取最近的一个。
     @objc public var highlightTouchExtensionRadius: CGFloat = 0
 
@@ -72,6 +75,17 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
     @objc public var isSelectable = false { didSet { if oldValue != isSelectable { invalidateTextLayout() } } }
     private var selection: TextForgeLabelSelection?
     private var extendingWord = false
+
+    /// 有选区时，点到标签以外的地方是否清除选区，默认开启。标签外有按钮要读取 `selectedText` 时关掉它，
+    /// 否则点按钮的同一下触摸会先把选区清掉。
+    @objc public var clearsSelectionOnOutsideTap = true {
+        didSet { if oldValue != clearsSelectionOnOutsideTap { observeOutsideTaps() } }
+    }
+    /// 选区存在期间挂在窗口上的点击识别器。不取消、不延迟触摸，与其他手势同时识别。
+    private weak var outsideTapGesture: UITapGestureRecognizer?
+
+    /// 选区菜单里排在系统操作之后的自定义项，例如"引用""搜索"。iOS 16 起生效，更早的系统只显示系统操作。
+    @objc public var selectionActions: [TextForgeSelectionAction] = []
 
     /// 以原文 UTF-16 下标表示当前选区；无选区时 location 为 NSNotFound。
     @objc public var selectedRange: NSRange { selection?.range ?? NSRange(location: NSNotFound, length: 0) }
@@ -99,6 +113,7 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
             selection = overlay
             addSubview(overlay)
             positionSelection(overlay)
+            observeOutsideTaps()
         }
         return true
     }
@@ -124,7 +139,33 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         extendingWord = false
         self.selection = nil
         selection.removeFromSuperview()
+        observeOutsideTaps()
         dismissSelectionMenu()
+    }
+
+    /// 按当前状态挂上或摘掉窗口上的点击识别器：有选区、已开启且标签在窗口里时才需要它。
+    private func observeOutsideTaps() {
+        let host = selection != nil && clearsSelectionOnOutsideTap ? window : nil
+        if outsideTapGesture?.view === host { return }
+        if let outsideTapGesture { outsideTapGesture.view?.removeGestureRecognizer(outsideTapGesture) }
+        guard let host else { return }
+        let tap = UITapGestureRecognizer(target: self, action: #selector(handleOutsideTap(_:)))
+        tap.cancelsTouchesInView = false
+        tap.delaysTouchesEnded = false
+        tap.delegate = self
+        host.addGestureRecognizer(tap)
+        outsideTapGesture = tap
+    }
+
+    /// 点击落在标签和选区手柄之外才会送到这里，见 `gestureRecognizer(_:shouldReceive:)`。
+    @objc private func handleOutsideTap(_ gesture: UITapGestureRecognizer) {
+        if gesture.state == .ended { clearSelection() }
+    }
+
+    /// 把选区扩到它所在的整段连续可见正文，并重新弹出菜单。截断留下的缺口另一侧不会被选中。
+    open override func selectAll(_ sender: Any?) {
+        guard let selection, selectText(in: selection.segment) else { return }
+        showSelectionMenu()
     }
 
     /// 为伸出标签的手柄圆点保留绘制空间，并将文字原点转换到覆盖层坐标。
@@ -159,10 +200,11 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         return resigned
     }
 
-    /// 离开窗口时释放手柄和滚动观察；进入新层级后按新视口挂载附件。
+    /// 离开窗口时释放手柄、滚动观察和窗口上的点击旁观；进入新层级后按新视口挂载附件，已有选区改到新窗口旁观。
     open override func didMoveToWindow() {
         super.didMoveToWindow()
         if window == nil { clearSelection(); stopObservingScrolls() }
+        observeOutsideTaps()
         setNeedsLayout()
     }
 
@@ -189,6 +231,7 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
     private weak var actionTapGesture: UITapGestureRecognizer?
     private weak var actionPressGesture: UILongPressGestureRecognizer?
     private var customAccessibilityLabel: String?
+    private var linkElements: [TextForgeLinkElement] = []
     private var defaultFont: UIFont?
     private var defaultTextColor: UIColor?
     private var defaultTextAlignment: NSTextAlignment = .natural
@@ -304,32 +347,90 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
                 return inherited.isEmpty ? nil : inherited
             }
             let result = layout(for: bounds.size)
-            var actions = inherited
-            var scopes: [(text: NSAttributedString, range: NSRange, inToken: Bool)] = []
-            if let visible = result.visibleCharacterRange { scopes.append((result.attributedText, visible, false)) }
-            if result.showsTruncationToken, let token = result.truncationToken {
-                scopes.append((token, NSRange(location: 0, length: token.length), true))
-            }
-            for scope in scopes {
-                var seen = Set<NSRange>()
-                scope.text.enumerateAttributes(in: scope.range) { attributes, range, _ in
-                    guard attributes[TextForgeHighlight.attributeName] != nil || attributes[.link] != nil else { return }
-                    guard let index = result.firstVisibleCharacter(in: range, inToken: scope.inToken) else { return }
-                    let hit = interaction(atCharacter: index, inToken: scope.inToken, in: result)
-                    guard hit.highlight?.tapAction != nil || highlightTapAction != nil || textTapAction != nil,
-                          seen.insert(hit.highlightRange).inserted else { return }
-                    let name = TextForgeAttachment.accessibilityText(for: hit.text.attributedSubstring(from: hit.highlightRange))
-                    guard !name.isEmpty else { return }
-                    actions.append(UIAccessibilityCustomAction(name: name) { [weak self, weak result] _ in
-                        guard let self, let result, !self.bounds.isEmpty,
-                              self.layout(for: self.bounds.size) === result else { return false }
-                        return self.dispatchTap(self.interaction(atCharacter: index, inToken: scope.inToken, in: result))
-                    })
+            let actions = inherited + accessibleHighlights(in: result).map { item in
+                UIAccessibilityCustomAction(name: item.name) { [weak self, weak result] _ in
+                    guard let self, let result, !self.bounds.isEmpty,
+                          self.layout(for: self.bounds.size) === result else { return false }
+                    return self.dispatchTap(self.interaction(atCharacter: item.index, inToken: item.inToken, in: result))
                 }
             }
             return actions.isEmpty ? nil : actions
         }
         set { super.accessibilityCustomActions = newValue }
+    }
+
+    /// 给 VoiceOver 的"链接"转子提供可见且可点击的高亮和链接，用户可以在转子里逐个跳转并双击激活。
+    /// 标签本身仍是一个整体元素，朗读全文的方式不变；宿主设置的其他转子保留。
+    open override var accessibilityCustomRotors: [UIAccessibilityCustomRotor]? {
+        get {
+            let inherited = super.accessibilityCustomRotors ?? []
+            guard !currentLinkElements().isEmpty else { return inherited.isEmpty ? nil : inherited }
+            let rotor = UIAccessibilityCustomRotor(systemType: .link) { [weak self] predicate in
+                // 每次按当前显示的布局取目标：文本或尺寸变化后，旧元素按范围对不上就从头开始。
+                guard let self else { return nil }
+                let elements = self.currentLinkElements()
+                let current = predicate.currentItem.targetElement as? TextForgeLinkElement
+                let position = current.flatMap { element in
+                    elements.firstIndex { $0.range == element.range && $0.inToken == element.inToken }
+                }
+                let forward = predicate.searchDirection == .next
+                let next = position.map { forward ? $0 + 1 : $0 - 1 } ?? (forward ? 0 : elements.count - 1)
+                guard elements.indices.contains(next) else { return nil }
+                return UIAccessibilityCustomRotorItemResult(targetElement: elements[next], targetRange: nil)
+            }
+            return inherited + [rotor]
+        }
+        set { super.accessibilityCustomRotors = newValue }
+    }
+
+    /// 当前布局里"链接"转子的目标。系统只弱引用转子返回的元素，所以由标签按布局缓存；布局换了就重建。
+    private func currentLinkElements() -> [TextForgeLinkElement] {
+        guard usesCustomLayout, !bounds.isEmpty else {
+            linkElements.removeAll()
+            return []
+        }
+        let result = layout(for: bounds.size)
+        if let first = linkElements.first, first.layout === result { return linkElements }
+        linkElements = accessibleHighlights(in: result).map { item in
+            let element = TextForgeLinkElement(label: self, layout: result, index: item.index, range: item.range, inToken: item.inToken)
+            element.accessibilityLabel = item.name
+            element.accessibilityTraits = .link
+            return element
+        }
+        return linkElements
+    }
+
+    /// 列出布局里可见、有朗读名称且点击后确实有回调可执行的高亮和链接，正文在前、截断标记在后。
+    /// index 是该项第一个可见字符的下标，range 是完整高亮范围；inToken 为 true 时两者都相对截断标记。
+    private func accessibleHighlights(in result: TextForgeLayout) -> [(name: String, index: Int, range: NSRange, inToken: Bool)] {
+        var items: [(name: String, index: Int, range: NSRange, inToken: Bool)] = []
+        var scopes: [(text: NSAttributedString, range: NSRange, inToken: Bool)] = []
+        if let visible = result.visibleCharacterRange { scopes.append((result.attributedText, visible, false)) }
+        if result.showsTruncationToken, let token = result.truncationToken {
+            scopes.append((token, NSRange(location: 0, length: token.length), true))
+        }
+        for scope in scopes {
+            var seen = Set<NSRange>()
+            scope.text.enumerateAttributes(in: scope.range) { attributes, range, _ in
+                guard attributes[TextForgeHighlight.attributeName] != nil || attributes[.link] != nil else { return }
+                guard let index = result.firstVisibleCharacter(in: range, inToken: scope.inToken) else { return }
+                let hit = interaction(atCharacter: index, inToken: scope.inToken, in: result)
+                guard hit.highlight?.tapAction != nil || highlightTapAction != nil || textTapAction != nil,
+                      seen.insert(hit.highlightRange).inserted else { return }
+                let name = TextForgeAttachment.accessibilityText(for: hit.text.attributedSubstring(from: hit.highlightRange))
+                guard !name.isEmpty else { return }
+                items.append((name, index, hit.highlightRange, scope.inToken))
+            }
+        }
+        return items
+    }
+
+    /// 转子里的链接被激活或被询问位置时调用。布局已经换掉时返回 nil，旧元素随之失效。
+    fileprivate func linkInteraction(index: Int, inToken: Bool, in result: TextForgeLayout) -> (rect: CGRect, activate: () -> Bool)? {
+        guard !bounds.isEmpty, layout(for: bounds.size) === result else { return nil }
+        let hit = interaction(atCharacter: index, inToken: inToken, in: result)
+        guard hit.highlightRange.location != NSNotFound else { return nil }
+        return (hit.highlightRect, { [weak self] in self?.dispatchTap(hit) ?? false })
     }
 
     /// 当前边界下实际用于绘制的布局，可查询行数、逐行信息和是否截断。控件尚无尺寸时为 nil。
@@ -373,9 +474,10 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
     /// 允许拷贝时可成为第一响应者，系统菜单据此找到拷贝操作。
     open override var canBecomeFirstResponder: Bool { allowsCopy || isSelectable || super.canBecomeFirstResponder }
 
-    /// 只在允许拷贝且有文本时提供拷贝操作，其余编辑操作沿用系统判断。
+    /// 只在允许拷贝且有文本时提供拷贝操作；选区还没占满所在的可见片段时提供全选。其余编辑操作沿用系统判断。
     open override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
         if action == #selector(copy(_:)) { return (allowsCopy || selection != nil) && !copyableText.isEmpty }
+        if action == #selector(selectAll(_:)) { return selection.map { $0.range != $0.segment } ?? false }
         return super.canPerformAction(action, withSender: sender)
     }
 
@@ -456,6 +558,11 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         }
     }
 
+    /// 用 frame 改变尺寸不经过 bounds 的属性观察。这里同样清除选区，避免手柄和底色停在旧排版的位置。
+    open override var frame: CGRect {
+        didSet { if oldValue.size != frame.size { clearSelection() } }
+    }
+
     /// 标签环境变化时刷新像素；字号、方向或字重环境变化时清空派生几何并通知宿主重新测高。
     open override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
         super.traitCollectionDidChange(previousTraitCollection)
@@ -480,7 +587,7 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         let width = preferredMaxLayoutWidth > 0 ? preferredMaxLayoutWidth : (
             numberOfLines != 1 && bounds.width > 0 ? bounds.width : .greatestFiniteMagnitude
         )
-        return measuredSize(of: layout(for: CGSize(width: width, height: .greatestFiniteMagnitude)))
+        return measuredSize(of: layout(for: CGSize(width: width, height: .greatestFiniteMagnitude), measuring: true))
     }
 
     /// 显式绘制预排版文本，即使 UILabel 自己没有设置 text 或 attributedText。
@@ -498,7 +605,7 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         return measuredSize(of: layout(for: CGSize(
             width: size.width > 0 ? size.width : .greatestFiniteMagnitude,
             height: size.height > 0 ? size.height : .greatestFiniteMagnitude
-        )))
+        ), measuring: true))
     }
 
     /// 显式布局按完整尺寸占位，切换外观触发重排后也保持此规则。控件自身排版按文字宽度自适应。
@@ -507,9 +614,23 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
     }
 
     /// 在扣除内边距后的可用宽度测量文本，并把内边距计入返回的文本区域。
+    /// UIKit 解析基线锚点时也会调用这里：单行文本的基线是系统实现在测量过程中记下的。自定义排版不走系统实现，
+    /// 基线会落在标签顶边，所以单行时用同一内容区再问一次系统实现，让它按标签自己的文本记下基线，返回值不用。
+    /// 固定行高把文字在行框里上下居中，内容区相应下移后再问。显式 `textLayout` 的内容不在系统标签里，这种标签的基线锚点仍在顶边。
     open override func textRect(forBounds bounds: CGRect, limitedToNumberOfLines numberOfLines: Int) -> CGRect {
         if usesCustomLayout {
-            let result = layout(for: bounds.size, maximumNumberOfRows: numberOfLines)
+            let result = layout(for: bounds.size, maximumNumberOfRows: numberOfLines, measuring: true)
+            if numberOfLines == 1, explicitTextLayout == nil {
+                var content = insetTextRect(bounds)
+                if fixedLineHeight > 0, let line = result.lines.first, line.range.length > 0 {
+                    var ascent: CGFloat = 0
+                    result.attributedText.enumerateAttribute(.font, in: line.range) { value, _, _ in
+                        if let font = value as? UIFont { ascent = max(ascent, font.ascender) }
+                    }
+                    if ascent > 0 { content.origin.y += line.baseline - result.insets.top - ascent }
+                }
+                _ = super.textRect(forBounds: content, limitedToNumberOfLines: numberOfLines)
+            }
             return CGRect(origin: bounds.origin, size: measuredSize(of: result))
         }
         let contentRect = insetTextRect(bounds)
@@ -523,7 +644,7 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         )
     }
 
-    /// 在与测量一致的内容区域绘制，宽度或高度耗尽时跳过绘制。
+    /// 在与测量一致的内容区域绘制，宽度或高度耗尽时跳过绘制。开启调试叠层时在文字之上再画一层调试线。
     open override func drawText(in rect: CGRect) {
         if usesCustomLayout {
             guard !bounds.isEmpty else { return }
@@ -537,11 +658,54 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
                 highlightedColor: isHighlighted ? highlightedTextColor : nil,
                 clip: rect.intersection(UIGraphicsGetCurrentContext()?.boundingBoxOfClipPath ?? rect), traits: traitCollection
             )
+            if let options = debugOptions ?? TextForgeDebugOptions.shared { drawDebugOverlay(for: result, options: options) }
             return
         }
         let contentRect = insetTextRect(rect)
         guard !contentRect.isEmpty else { return }
         super.drawText(in: contentRect)
+    }
+
+    /// 在文字之上按一个像素的线宽画出调试线：每行的占用矩形与基线、整段文字的外接矩形、附件槽。
+    /// 位置取自正在显示的同一份布局；截断标记里的附件不画。
+    private func drawDebugOverlay(for result: TextForgeLayout, options: TextForgeDebugOptions) {
+        guard let context = UIGraphicsGetCurrentContext() else { return }
+        let origin = drawingOrigin(for: result)
+        // 布局的公开坐标以外部边界左上角为原点，换到标签坐标。
+        let offset = CGPoint(x: origin.x - result.insets.left, y: origin.y - result.insets.top)
+        let scale = max(1, traitCollection.displayScale)
+        let width = 1 / scale
+        context.saveGState()
+        defer { context.restoreGState() }
+        context.setLineWidth(width)
+        // 边线落在整像素上才是清晰的一像素线：外沿对齐到像素，再向内收半个线宽。
+        func stroke(_ rect: CGRect, _ color: UIColor) {
+            guard !rect.isNull else { return }
+            let moved = rect.offsetBy(dx: offset.x, dy: offset.y)
+            let minX = (moved.minX * scale).rounded(.down) / scale, minY = (moved.minY * scale).rounded(.down) / scale
+            let maxX = (moved.maxX * scale).rounded(.up) / scale, maxY = (moved.maxY * scale).rounded(.up) / scale
+            context.setStrokeColor(color.cgColor)
+            context.stroke(CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY).insetBy(dx: width / 2, dy: width / 2))
+        }
+        if let color = options.lineColor { for line in result.lines { stroke(line.rect, color) } }
+        if let color = options.textBoundsColor { stroke(result.textBoundingRect, color) }
+        if let color = options.attachmentColor, let visible = result.visibleCharacterRange {
+            result.attributedText.enumerateAttribute(.attachment, in: visible) { value, range, _ in
+                guard value != nil else { return }
+                for index in range.location..<NSMaxRange(range) {
+                    for rect in result.rects(forRange: NSRange(location: index, length: 1)) { stroke(rect, color) }
+                }
+            }
+        }
+        if let color = options.baselineColor {
+            context.setStrokeColor(color.cgColor)
+            for line in result.lines {
+                let y = ((line.baseline + offset.y) * scale).rounded(.down) / scale + width / 2
+                context.move(to: CGPoint(x: line.rect.minX + offset.x, y: y))
+                context.addLine(to: CGPoint(x: line.rect.maxX + offset.x, y: y))
+            }
+            context.strokePath()
+        }
     }
 
     /// 退出窗口或换文时解除观察，避免滚动视图离开后继续驱动旧标签。
@@ -689,12 +853,15 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
     private var usesCustomLayout: Bool {
         isSelectable || textLayout != nil || requiresAttributedLayout || textVerticalAlignment != .center
             || truncationToken != nil || !exclusionPaths.isEmpty || fixedLineHeight > 0
+            || debugOptions != nil || TextForgeDebugOptions.shared != nil
             || characterSpacing != 0 || lineSpacing != 0 || paragraphSpacing != 0
             || textTapAction != nil || textLongPressAction != nil || highlightTapAction != nil || highlightLongPressAction != nil
     }
 
     /// 显式布局保留调用方指定的尺寸。派生布局要求同宽同限行，缩短容器时原字形区域必须仍能放下。
-    private func layout(for size: CGSize, maximumNumberOfRows: Int? = nil) -> TextForgeLayout {
+    /// measuring 为 true 表示结果只用于测量尺寸：与系统标签一样，多行文本测量时不缩字，
+    /// 缩字只发生在按实际边界绘制时；单行沿用按给定宽度缩小后的尺寸。
+    private func layout(for size: CGSize, maximumNumberOfRows: Int? = nil, measuring: Bool = false) -> TextForgeLayout {
         if let textLayout = explicitTextLayout {
             if textLayout.matchesAppearance(traitCollection) { return textLayout }
             if let rebuilt = cachedLayouts.first, rebuilt.matchesAppearance(traitCollection) { return rebuilt }
@@ -704,9 +871,10 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
             return rebuilt
         }
         let rows = max(0, maximumNumberOfRows ?? numberOfLines)
+        let scale = adjustsFontSizeToFitWidth && !(measuring && rows != 1) ? minimumScaleFactor : 1
         let fits: (TextForgeLayout) -> Bool = { result in
             result.size.width == size.width && result.maximumNumberOfRows == rows
-                && result.fitsHeight(size.height)
+                && result.container.minimumScaleFactor == scale && result.fitsHeight(size.height)
         }
         if let preparedTextLayout, fits(preparedTextLayout), preparedTextLayout.matchesAppearance(traitCollection) {
             return preparedTextLayout
@@ -714,8 +882,8 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         if let cached = cachedLayouts.first(where: fits) { return cached }
         let original = super.attributedText ?? NSAttributedString(string: super.text ?? "")
         let previous = previousLayouts.firstIndex { $0.box.size.width == size.width }.map { previousLayouts.remove(at: $0) }
-        let result = TextForgeLayout(container: makeContainer(size: size, rows: rows), attributedText: styledText(original),
-                                     fallbackTraits: nil, reusing: previous)
+        let result = TextForgeLayout(container: makeContainer(size: size, rows: rows, minimumScale: scale),
+                                     attributedText: styledText(original), fallbackTraits: nil, reusing: previous)
         if rows == 0, !result.isTruncated { result.captureAttachmentMetrics() }
         if cachedLayouts.count == 2 { cachedLayouts.removeLast() }
         cachedLayouts.insert(result, at: 0)
@@ -723,11 +891,12 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
     }
 
     /// 用控件当前的内边距、换行、截断标记、排除路径和链接外观组装一次排版的容器。
-    private func makeContainer(size: CGSize, rows: Int) -> TextForgeContainer {
+    /// minimumScale 为 nil 时按绘制的口径取缩字下限。
+    private func makeContainer(size: CGSize, rows: Int, minimumScale: CGFloat? = nil) -> TextForgeContainer {
         let container = TextForgeContainer(size: size, insets: contentInsets)
         container.maximumNumberOfRows = rows
         container.lineBreakMode = defaultLineBreakMode
-        container.minimumScaleFactor = adjustsFontSizeToFitWidth ? minimumScaleFactor : 1
+        container.minimumScaleFactor = minimumScale ?? (adjustsFontSizeToFitWidth ? minimumScaleFactor : 1)
         container.fixedLineHeight = fixedLineHeight
         container.truncationToken = truncationToken
         container.exclusionPaths = exclusionPaths
@@ -857,8 +1026,17 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
     }
 
     /// 手柄的拖动由选区自身识别，父标签保留普通文字、链接与截断标记的原有手势。
+    /// 窗口上的识别器只接收落在标签及其子视图之外的触摸。
     public func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
-        touch.view !== selection || selection == nil
+        if gestureRecognizer === outsideTapGesture { return touch.view.map { !$0.isDescendant(of: self) } ?? true }
+        return touch.view !== selection || selection == nil
+    }
+
+    /// 窗口上的识别器只做旁观，与页面上任何手势同时识别；标签自己的点击和长按保持互斥。
+    public func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+        gestureRecognizer === outsideTapGesture || otherGestureRecognizer === outsideTapGesture
     }
 
     /// 为长按和短按分别配置 UIKit 手势，长按成立时避免重复短按。
@@ -961,6 +1139,7 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
             attributedText.enumerateAttributes(in: NSRange(location: 0, length: attributedText.length)) { attributes, _, stop in
                 if attributes[TextForgeHighlight.attributeName] != nil || attributes[.link] != nil
                     || attributes[TextForgeBackground.attributeName] != nil
+                    || attributes[TextForgeDrawing.attributeName] != nil
                     || attributes[TextForgeTypography.synthesizedParagraphStyle] != nil
                     || attributes[.attachment] is TextForgeViewAttachment {
                     requiresAttributedLayout = true
@@ -985,6 +1164,7 @@ open class TextForgeLabel: UILabel, UIGestureRecognizerDelegate {
         preparedTextLayout = nil
         previousLayouts.removeAll(keepingCapacity: true)
         cachedLayouts.removeAll(keepingCapacity: true)
+        linkElements.removeAll()
         clearHighlight()
         stopObservingScrolls()
         removeAttachments(except: [])
@@ -1044,6 +1224,23 @@ extension TextForgeLabel: UIEditMenuInteractionDelegate {
         }
     }
 
+    /// 有选区时把宿主的自定义项接在系统操作之后；没有选区或没有自定义项时用系统默认菜单。
+    nonisolated public func editMenuInteraction(
+        _ interaction: UIEditMenuInteraction, menuFor configuration: UIEditMenuConfiguration, suggestedActions: [UIMenuElement]
+    ) -> UIMenu? {
+        MainActor.assumeIsolated {
+            guard selection != nil, !selectionActions.isEmpty else { return nil }
+            let custom = selectionActions.map { item in
+                UIAction(title: item.title, image: item.image) { [weak self] _ in
+                    // 菜单弹出后选区可能已被清除或改变，按点击时的选区回调。
+                    guard let self, let text = self.selectedText else { return }
+                    item.handler(self, text, self.selectedRange)
+                }
+            }
+            return UIMenu(children: suggestedActions + custom)
+        }
+    }
+
     /// UIKit 开始在主线程呈现拷贝菜单时，回调宿主更新选中样式。
     nonisolated public func editMenuInteraction(
         _ interaction: UIEditMenuInteraction, willPresentMenuFor configuration: UIEditMenuConfiguration,
@@ -1060,5 +1257,38 @@ extension TextForgeLabel: UIEditMenuInteractionDelegate {
         MainActor.assumeIsolated {
             animator.addCompletion { [weak self] in self?.copyMenuVisibilityHandler?(false) }
         }
+    }
+}
+
+/// "链接"转子里的一个目标。不在标签的无障碍元素树里，位置和激活都回到标签按当前布局计算。
+private final class TextForgeLinkElement: UIAccessibilityElement {
+    private weak var label: TextForgeLabel?
+    private(set) weak var layout: TextForgeLayout?
+    private let index: Int
+    let range: NSRange
+    let inToken: Bool
+
+    init(label: TextForgeLabel, layout: TextForgeLayout, index: Int, range: NSRange, inToken: Bool) {
+        self.label = label
+        self.layout = layout
+        self.index = index
+        self.range = range
+        self.inToken = inToken
+        super.init(accessibilityContainer: label)
+    }
+
+    /// 链接在屏幕上的外接矩形；标签已换文或离开时为空。
+    override var accessibilityFrame: CGRect {
+        get {
+            guard let label, let layout, let link = label.linkInteraction(index: index, inToken: inToken, in: layout) else { return .zero }
+            return UIAccessibility.convertToScreenCoordinates(link.rect, in: label)
+        }
+        set {}
+    }
+
+    /// 双击激活时执行与点击该链接相同的回调，返回是否确实执行了操作。
+    override func accessibilityActivate() -> Bool {
+        guard let label, let layout, let link = label.linkInteraction(index: index, inToken: inToken, in: layout) else { return false }
+        return link.activate()
     }
 }

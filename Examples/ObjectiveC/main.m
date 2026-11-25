@@ -197,6 +197,63 @@
     [label clearSelection];
     if (label.selectedRange.location != NSNotFound) { [failures addObject:@"Objective-C clear selection"]; }
 
+    // 选区扩展接口：全选停在整段可见正文，自定义菜单项与点外清除的开关可从 Objective-C 设置。
+    label.selectionActions = @[[[TextForgeSelectionAction alloc] initWithTitle:@"引用" handler:^(TextForgeLabel *source, NSString *text, NSRange range) {}]];
+    label.clearsSelectionOnOutsideTap = NO;
+    if (![label selectTextInRange:slice] || ![label canPerformAction:@selector(selectAll:) withSender:nil]) {
+        [failures addObject:@"Objective-C select all availability"];
+    }
+    [label selectAll:nil];
+    if (!NSEqualRanges(label.selectedRange, NSMakeRange(0, body.length)) || label.selectionActions.count != 1 || label.clearsSelectionOnOutsideTap) {
+        [failures addObject:@"Objective-C select all or selection actions"];
+    }
+    [label clearSelection];
+
+    // 自定义绘制与调试叠层：回调按片段执行并标出首末段，调试配置只影响设置了它的标签。
+    __block NSInteger wholeFragments = 0;
+    TextForgeDrawing *drawing = [[TextForgeDrawing alloc] initWithHandler:^(CGContextRef context, CGRect rect, BOOL isFirst, BOOL isLast) {
+        if (isFirst && isLast && !CGRectIsEmpty(rect)) { wholeFragments += 1; }
+        CGContextSetFillColorWithColor(context, UIColor.redColor.CGColor);
+        CGContextFillRect(context, rect);
+    }];
+    drawing.outset = 2;
+    NSMutableAttributedString *decorated = [[NSMutableAttributedString alloc] initWithString:@"自定义绘制" attributes:@{NSFontAttributeName: font}];
+    [drawing applyTo:decorated range:NSMakeRange(0, 3)];
+    TextForgeLabel *canvas = [[TextForgeLabel alloc] initWithFrame:CGRectMake(0, 0, 160, 40)];
+    canvas.attributedText = decorated;
+    canvas.debugOptions = [TextForgeDebugOptions standard];
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:canvas.bounds.size];
+    [renderer imageWithActions:^(UIGraphicsImageRendererContext *context) { [canvas.layer renderInContext:context.CGContext]; }];
+    [[TextForgeDrawing underlineWithColor:UIColor.redColor width:1 offset:1] applyTo:decorated range:NSMakeRange(3, 2)];
+
+    // 输入框的字数上限与高度自适应：截断落在完整字素上，高度不超过最多行数。
+    TextForgeTextView *limited = [[TextForgeTextView alloc] initWithFrame:CGRectMake(0, 0, 200, 40) textContainer:nil];
+    limited.font = font;
+    [self.view addSubview:limited];
+    [limited becomeFirstResponder];
+    __block NSInteger limitHits = 0;
+    __block CGFloat reportedHeight = 0;
+    limited.maximumTextLength = 4;
+    limited.onTextLimitReached = ^{ limitHits += 1; };
+    limited.minimumNumberOfLines = 1;
+    limited.maximumNumberOfLines = 2;
+    limited.onPreferredHeightChange = ^(CGFloat height) { reportedHeight = height; };
+    [limited insertText:@"一二三😀五"];
+    BOOL limitedOK = [limited.text isEqualToString:@"一二三"] && limitHits == 1;
+    limited.maximumTextLength = 0;
+    [limited insertText:@"\n二\n三\n四"];
+    CGFloat twoLines = ceil(2 * font.lineHeight + limited.textContainerInset.top + limited.textContainerInset.bottom);
+    if (!limitedOK || fabs(limited.preferredHeight - twoLines) > 1 || reportedHeight != limited.preferredHeight || !limited.scrollEnabled) {
+        [failures addObject:[NSString stringWithFormat:@"Objective-C text limit or auto height: %@ %ld %.1f/%.1f", limited.text, (long)limitHits, limited.preferredHeight, twoLines]];
+    }
+    [limited removeFromSuperview];
+    [self.input becomeFirstResponder];
+
+    if (wholeFragments != 1 || canvas.debugOptions.baselineColor == nil || TextForgeDebugOptions.shared != nil
+        || [decorated attribute:TextForgeDrawing.attributeName atIndex:0 effectiveRange:NULL] != drawing) {
+        [failures addObject:@"Objective-C custom drawing or debug options"];
+    }
+
     [TextForgeHTML attributedStringFromHTML:@"<p>说明 &amp; <a href='details'>规则</a></p>"
                                     baseURL:[NSURL URLWithString:@"https://example.com/guide/"]
                                  completion:^(NSAttributedString *html, NSError *error) {

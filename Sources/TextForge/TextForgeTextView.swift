@@ -39,6 +39,168 @@ open class TextForgeTextView: UITextView {
     /// 仅在用户编辑后的已提交文本变化时，在主线程回调当前全文。
     @objc public var onTextChange: ((String) -> Void)?
 
+    /// 用户输入的字数上限，按 NSString 的 UTF-16 长度计，0 表示不限。输入、粘贴或候选字上屏后超出时，
+    /// 截掉本次新增内容里放不下的尾部，截断点落在完整字素上，不会留下半个表情。拼音组字期间不截断。
+    /// 正文原本就超过上限时（程序赋值），用户不能再加长，但可以删除和缩短。发生截断时清空撤销记录。
+    /// 只约束用户编辑：直接给 `text`、`attributedText` 赋值不受影响，修改上限也不会裁剪已有正文。
+    @objc public var maximumTextLength = 0
+
+    /// 用户输入因 `maximumTextLength` 被截断后在主线程回调，可用来提示"最多输入 N 个字"。在 `onTextChange` 之后调用。
+    @objc public var onTextLimitReached: (() -> Void)?
+
+    /// 高度自适应的最少、最多行数，都为 0 时关闭（默认），输入框保持 UITextView 原有行为。
+    /// 任一大于 0 时：`preferredHeight` 与 `intrinsicContentSize` 跟随内容在两者之间变化，自动布局下无需高度约束；
+    /// 内容超过最多行数后开启滚动，否则关闭滚动。开启期间由输入框接管 `isScrollEnabled`。
+    @objc public var minimumNumberOfLines = 0 { didSet { updatePreferredHeight() } }
+    @objc public var maximumNumberOfLines = 0 { didSet { updatePreferredHeight() } }
+
+    /// 高度自适应开启时，按当前宽度、字体和内容算出的输入框高度（含上下内边距），单位为点；关闭时为 0。
+    @objc public private(set) var preferredHeight: CGFloat = 0
+
+    /// `preferredHeight` 变化后在主线程回调新高度。用 frame 布局的宿主在这里更新输入框和输入栏的高度。
+    @objc public var onPreferredHeightChange: ((CGFloat) -> Void)?
+
+    private var isMeasuringHeight = false
+    private var measuredWidth: CGFloat = -1
+    /// 存储编辑进行中不能排版测量，先记下，等编辑结束或下一次布局再算。
+    private var needsHeightUpdate = false
+    /// 滚动开关刚切换，等高度落定后的下一次布局再把光标滚进可见区域或回到顶部。
+    private var needsScrollReset = false
+
+    /// 字体和内边距都参与行高换算，变化后重新计算高度。
+    open override var font: UIFont? { didSet { updatePreferredHeight() } }
+    open override var textContainerInset: UIEdgeInsets { didSet { updatePreferredHeight() } }
+
+    /// 高度自适应开启时由内容决定高度，宽度不设固有值；关闭时沿用系统结果。
+    open override var intrinsicContentSize: CGSize {
+        guard minimumNumberOfLines > 0 || maximumNumberOfLines > 0 else { return super.intrinsicContentSize }
+        return CGSize(width: UIView.noIntrinsicMetric, height: preferredHeight)
+    }
+
+    /// 按当前宽度重新计算自适应高度并切换滚动开关。高度变化时刷新固有尺寸并通知宿主；尚无宽度时按单行估算。
+    /// 不能在文本存储处理编辑的通知里调用：那时排版数据还没同步，测量会越界崩溃。
+    private func updatePreferredHeight() {
+        needsHeightUpdate = false
+        guard minimumNumberOfLines > 0 || maximumNumberOfLines > 0 else {
+            preferredHeight = 0
+            return
+        }
+        guard !isMeasuringHeight else { return }
+        isMeasuringHeight = true
+        defer { isMeasuringHeight = false }
+        let line = (font ?? UIFont.preferredFont(forTextStyle: .body)).lineHeight
+        let chrome = textContainerInset.top + textContainerInset.bottom
+        measuredWidth = bounds.width
+        let lower = minimumNumberOfLines > 0 ? CGFloat(minimumNumberOfLines) * line + chrome : 0
+        let upper = maximumNumberOfLines > 0 ? max(lower, CGFloat(maximumNumberOfLines) * line + chrome) : .greatestFiniteMagnitude
+        // 整篇测量的耗时随正文长度线性增长（几万字要几十毫秒，每次按键都会卡）。有行数上限时先看开头一段，
+        // 已经明显超出就不必量全文。
+        var scrolls = bounds.width > 0 && upper < .greatestFiniteMagnitude && leadingTextExceeds(upper - chrome, lineHeight: line)
+        let content = scrolls ? upper
+            : bounds.width > 0 ? sizeThatFits(CGSize(width: bounds.width, height: .greatestFiniteMagnitude)).height : line + chrome
+        if !scrolls { scrolls = content > upper + 0.5 }
+        let height = ceil(min(max(content, lower), upper))
+        if isScrollEnabled != scrolls {
+            isScrollEnabled = scrolls
+            needsScrollReset = true
+            setNeedsLayout()
+        }
+        guard height != preferredHeight else { return }
+        preferredHeight = height
+        invalidateIntrinsicContentSize()
+        onPreferredHeightChange?(height)
+    }
+
+    /// 把光标滚进可见区域。TextKit 2 对视口外的内容只估算高度，这里先排完全文再滚动；
+    /// 每次滚动后重新布局核对，位置稳定即停，最多八次。光标在文末时直接滚到底。
+    private func scrollCaretToVisible() {
+        guard isScrollEnabled, let end = selectedTextRange?.end else { return }
+        let atEnd = offset(from: end, to: endOfDocument) == 0
+        // 只在滚动开关刚打开时走到这里（通常是一次粘贴了很多行）。先让 TextKit 2 排完全文，
+        // 内容高度才是准的；这一步的耗时与那次粘贴本身同量级，之后的按键不会再触发。
+        if #available(iOS 16.0, *), let manager = textLayoutManager { manager.ensureLayout(for: manager.documentRange) }
+        for _ in 0..<8 {
+            layoutIfNeeded()
+            let visible = CGRect(origin: contentOffset, size: bounds.size)
+            let bottom = max(-adjustedContentInset.top, contentSize.height + adjustedContentInset.bottom - bounds.height)
+            if atEnd {
+                if abs(contentOffset.y - bottom) < 0.5 { return }
+                setContentOffset(CGPoint(x: contentOffset.x, y: bottom), animated: false)
+            } else {
+                let caret = caretRect(for: end)
+                if visible.contains(caret) { return }
+                scrollRectToVisible(caret, animated: false)
+            }
+        }
+    }
+
+    /// 长正文的快速判断：只量开头一段，它的高度已经比 limit（不含上下内边距）多出一行以上时返回 true。
+    /// 开头一段的高度不会超过全文，所以 true 一定成立；返回 false 只表示这里判断不了，调用方再量全文。
+    /// 用字符串绘制的度量估算，与输入框实际排版可能差几个点，留出的一行余量用来吸收这个差别。
+    private func leadingTextExceeds(_ limit: CGFloat, lineHeight: CGFloat) -> Bool {
+        let sampleLength = 2048
+        guard textStorage.length > sampleLength, textContainer.exclusionPaths.isEmpty else { return false }
+        let end = (textStorage.string as NSString).rangeOfComposedCharacterSequence(at: sampleLength).location
+        let width = bounds.width - textContainerInset.left - textContainerInset.right - 2 * textContainer.lineFragmentPadding
+        guard end > 0, width > 0 else { return false }
+        let sample = textStorage.attributedSubstring(from: NSRange(location: 0, length: end))
+        let height = sample.boundingRect(with: CGSize(width: width, height: .greatestFiniteMagnitude),
+                                         options: [.usesLineFragmentOrigin, .usesFontLeading], context: nil).height
+        return height > limit + lineHeight
+    }
+
+    /// 用户编辑后正文超出上限时，从本次新增内容的末尾删掉超出的部分。previous 是这次编辑之前的正文：
+    /// 与当前正文比较公共前缀和后缀得到新增范围，所以输入、粘贴、替换选区、拖入都只动新增的文字，
+    /// 光标落在保留内容之后。正文原本就超限（程序赋值）时以原长度为准，只挡住继续变长，删除和缩短不受影响。
+    /// 经 UITextInput 删除，宿主的 UITextViewDelegate 会再收到一次 textViewDidChange，看到截断后的正文。返回是否发生了截断。
+    private func enforceTextLimit(previous: String) -> Bool {
+        let string = textStorage.string as NSString
+        guard maximumTextLength > 0, string.length > maximumTextLength else { return false }
+        let old = previous as NSString
+        let allowed = max(maximumTextLength, old.length)
+        guard string.length > allowed else { return false }
+        // 只在超限时比较，粘贴几十万字也只是一次线性扫描。
+        let current = Array((string as String).utf16)
+        let before = Array(previous.utf16)
+        var prefix = 0
+        let shared = min(current.count, before.count)
+        while prefix < shared, current[prefix] == before[prefix] { prefix += 1 }
+        var suffix = 0
+        while suffix < shared - prefix, current[current.count - 1 - suffix] == before[before.count - 1 - suffix] { suffix += 1 }
+        let inserted = NSRange(location: prefix, length: current.count - suffix - prefix)
+        let excess = min(string.length - allowed, inserted.length)
+        guard excess > 0 else { return false }
+        var range = NSRange(location: NSMaxRange(inserted) - excess, length: excess)
+        // 起点落在字素中间时向前退到字素开头，宁可多删新增的内容也不留下半个表情；但不退进原有文字。
+        let cluster = string.rangeOfComposedCharacterSequence(at: range.location).location
+        let start = max(cluster, inserted.location)
+        range = NSRange(location: start, length: NSMaxRange(range) - start)
+        guard let from = position(from: beginningOfDocument, offset: range.location),
+              let to = position(from: from, offset: range.length), let target = textRange(from: from, to: to) else { return false }
+        // 这次删除是同一笔用户编辑的收尾，不单独记作一次变化，也不改比较基线。
+        textAssignmentDepth += 1
+        isUpdatingComposition = true
+        super.replace(target, withText: "")
+        isUpdatingComposition = false
+        textAssignmentDepth -= 1
+        observedStorageText = textStorage.string
+        // 光标放在保留下来的新增内容之后。系统粘贴会在通知之后按截断前的位置再设一次选区，
+        // 那个位置已经越界，光标会掉到文首；本轮结束后只纠正这一种情况，不动宿主或用户之后设的其他选区。
+        let caret = NSRange(location: range.location, length: 0)
+        let expected = observedStorageText
+        selectedRange = caret
+        if caret.location > 0 {
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.textStorage.string == expected, self.markedTextRange == nil,
+                      self.selectedRange == NSRange(location: 0, length: 0) else { return }
+                self.selectedRange = caret
+            }
+        }
+        // 系统为刚才那笔输入记下的撤销范围已经对不上截断后的正文，撤销会越界崩溃。清空撤销记录。
+        undoManager?.removeAllActions()
+        return true
+    }
+
     private var usesDocumentLinkStyle = false
     private var hasExplicitLinkStyle = false
 
@@ -151,6 +313,18 @@ open class TextForgeTextView: UITextView {
     /// 按 UITextView 的内容区摆放占位标签，保持字体、对齐和内边距一致。
     open override func layoutSubviews() {
         super.layoutSubviews()
+        if needsHeightUpdate || bounds.width != measuredWidth { updatePreferredHeight() }
+        if needsScrollReset {
+            // 刚开始滚动时（例如一次粘贴了很多行）光标可能在可见区域之外；不再滚动时内容回到顶部。
+            needsScrollReset = false
+            if isScrollEnabled {
+                // 滚动要等本轮布局结束。TextKit 2 对视口外的内容只估算高度，滚过去之后位置会被修正，
+                // 所以按光标矩形滚动并复核，最多三次。
+                DispatchQueue.main.async { [weak self] in self?.scrollCaretToVisible() }
+            } else {
+                setContentOffset(CGPoint(x: contentOffset.x, y: -adjustedContentInset.top), animated: false)
+            }
+        }
         guard !placeholderLabel.isHidden else { return }
         placeholderLabel.font = placeholderFont ?? font ?? UIFont.preferredFont(forTextStyle: .body)
         placeholderLabel.textColor = placeholderColor
@@ -290,7 +464,7 @@ open class TextForgeTextView: UITextView {
             DispatchQueue.main.async { [weak self] in self?.hasPendingStorageEdit = false }
         }
         observedStorageText = current
-        updatePlaceholderVisibility()
+        updatePlaceholderVisibility(measuresHeight: false)
     }
 
     /// UIKit 确认用户编辑后消费存储基线；普通赋值不发送此通知，组字事务仍在最外层完成后交付。
@@ -299,17 +473,26 @@ open class TextForgeTextView: UITextView {
         textDidChange()
     }
 
-    /// 文本或组字内容出现后隐藏占位，恢复为空时重新布局占位文字。
-    private func updatePlaceholderVisibility() {
+    /// 文本或组字内容出现后隐藏占位，恢复为空时重新布局占位文字，并更新自适应高度。
+    /// measuresHeight 为 false 用于存储编辑进行中：只做标记，高度留到编辑结束或下一次布局再算。
+    private func updatePlaceholderVisibility(measuresHeight: Bool = true) {
         let content = attributedPlaceholder?.string ?? placeholder ?? ""
         placeholderLabel.isHidden = textStorage.length > 0 || content.isEmpty
         if !placeholderLabel.isHidden { setNeedsLayout() }
+        if measuresHeight {
+            updatePreferredHeight()
+        } else if minimumNumberOfLines > 0 || maximumNumberOfLines > 0 {
+            needsHeightUpdate = true
+            setNeedsLayout()
+        }
     }
 
-    /// 跳过中文组字和重复通知，先更新比较基线再回调，允许宿主在回调中改写文本。
+    /// 跳过中文组字和重复通知，先按字数上限截断，再更新比较基线并回调，允许宿主在回调中改写文本。
     private func textDidChange() {
         updatePlaceholderVisibility()
         guard !isUpdatingComposition, markedTextRange == nil else { return }
+        let truncated = enforceTextLimit(previous: compositionBaseline ?? lastCommittedText)
+        defer { if truncated { onTextLimitReached?() } }
         let currentText = text ?? ""
         if let compositionBaseline {
             lastCommittedText = compositionBaseline

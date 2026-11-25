@@ -4,6 +4,11 @@
 
 - 本仓库维护通用 API、独立示例和验证。宿主 App 的调用盘点、内部路径、迁移记录和业务验收在各自的宿主仓库维护。
 
+## 验证
+
+- 改动 `Sources/` 后，在已启动的 iOS 模拟器上运行单元测试和两个示例的端到端断言，两者都通过再交付：`bash scripts/test-ios.sh booted`、`bash scripts/verify-ios.sh booted`。
+- 排版相关的断言优先与系统 `UILabel` 的实际渲染结果对照，测试放在 `Tests/TextForgeTests`；需要真实窗口场景、剪贴板或 WebKit 的流程放在示例 App 里。
+
 ## 版本与发布
 
 - 首版使用 Git 标签 `1.0.0`，GitHub Release 标题为 `TextForge 1.0.0`。
@@ -16,6 +21,7 @@
 | --- | --- |
 | `1.0.6` | `TextForge 1.0.6` |
 | `1.0.7` | `TextForge 1.0.7` |
+| `1.0.8` | `TextForge 1.0.8` |
 | `1.0.10` | `TextForge 1.0.10` |
 | `1.1.0` | `TextForge 1.1.0` |
 | `1.1.1` | `TextForge 1.1.1` |

@@ -134,3 +134,23 @@ final class TextForgeLabelSelection: UIView {
         return (layout.attributedText.string as NSString).rangeOfComposedCharacterSequence(at: index)
     }
 }
+
+/// 选区菜单里的一个自定义项。
+@objc(TextForgeSelectionAction)
+public final class TextForgeSelectionAction: NSObject {
+    @objc public let title: String
+    @objc public let image: UIImage?
+    /// 用户点了这一项后在主线程回调：标签、选区的复制文案（附件已换成替代文字）和原文的 UTF-16 范围。
+    /// 回调后选区保持不变，需要收起时调用标签的 `clearSelection()`。
+    @objc public let handler: (TextForgeLabel, String, NSRange) -> Void
+
+    @objc public init(title: String, image: UIImage?, handler: @escaping (TextForgeLabel, String, NSRange) -> Void) {
+        self.title = title
+        self.image = image
+        self.handler = handler
+    }
+
+    @objc public convenience init(title: String, handler: @escaping (TextForgeLabel, String, NSRange) -> Void) {
+        self.init(title: title, image: nil, handler: handler)
+    }
+}

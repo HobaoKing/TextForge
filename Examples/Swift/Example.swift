@@ -110,6 +110,7 @@ final class ExampleViewController: UIViewController {
         failures.append(contentsOf: verifyTruncationEdges())
         failures.append(contentsOf: verifyWrappingAndInteraction())
         failures.append(contentsOf: verifyLabelSelection())
+        failures.append(contentsOf: verifySceneBehaviors())
         input.placeholderFont = .systemFont(ofSize: 19, weight: .semibold)
         input.placeholderTextColor = .purple
         input.layoutIfNeeded()
@@ -284,6 +285,71 @@ final class ExampleViewController: UIViewController {
             failures.append("paste reused an earlier storage baseline: \(events)")
         }
 
+        // 真实的系统粘贴配合字数上限和高度自适应：粘贴八万多字只留下上限以内的开头，回调一次；
+        // 粘贴到中间、替换选区时只截粘贴进来的部分；多行内容粘贴后高度停在最多行数并滚到光标。
+        editor.delegate = nil
+        editor.font = .systemFont(ofSize: 16)
+        var limitHits = 0
+        editor.onTextLimitReached = { limitHits += 1 }
+        // 把内容放进剪贴板后走系统粘贴，等到正文变化或超时。
+        func systemPaste(_ string: String) async {
+            let before = editor.text
+            let hits = limitHits
+            UIPasteboard.general.string = string
+            editor.paste(nil)
+            for _ in 0..<200 where editor.text == before && limitHits == hits { try? await Task.sleep(nanoseconds: 10_000_000) }
+            // 系统粘贴在通知之后还会设置一次选区，等它收尾。
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        let long = String(repeating: "这是一段很长的粘贴内容，带标点和 English。\n", count: 4000)
+        editor.maximumTextLength = 200
+        editor.text = ""
+        events.removeAll()
+        let pasteStart = CFAbsoluteTimeGetCurrent()
+        await systemPaste(long)
+        let pasteTime = CFAbsoluteTimeGetCurrent() - pasteStart
+        if editor.text != (long as NSString).substring(to: 200) || events.count != 1 || limitHits != 1
+            || editor.selectedRange != NSRange(location: 200, length: 0) || pasteTime > 2 {
+            failures.append("long paste with limit: length=\((editor.text as NSString).length), callbacks=\(events.count), hits=\(limitHits), sel=\(editor.selectedRange), \(pasteTime)s")
+        }
+        editor.maximumTextLength = 10
+        editor.text = "开头结尾"
+        editor.selectedRange = NSRange(location: 2, length: 0)
+        events.removeAll()
+        await systemPaste("一二三四五六七八九十")
+        if editor.text != "开头一二三四五六结尾" || events != ["开头一二三四五六结尾"] {
+            failures.append("paste into the middle with limit: text=\(editor.text ?? ""), callbacks=\(events)")
+        }
+        editor.selectedRange = NSRange(location: 2, length: 6)
+        events.removeAll()
+        await systemPaste("甲乙丙丁戊己庚辛壬😀")
+        if editor.text != "开头甲乙丙丁戊己结尾" || events != ["开头甲乙丙丁戊己结尾"] {
+            failures.append("paste over a selection with limit: text=\(editor.text ?? ""), callbacks=\(events)")
+        }
+        editor.maximumTextLength = 0
+        editor.minimumNumberOfLines = 1
+        editor.maximumNumberOfLines = 4
+        editor.onPreferredHeightChange = { [weak editor] in editor?.frame.size.height = $0 }
+        editor.text = ""
+        editor.layoutIfNeeded()
+        let oneLine = editor.preferredHeight
+        await systemPaste(String(repeating: "粘贴进来的很多行内容\n", count: 300))
+        editor.layoutIfNeeded()
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        let fourLines = ceil(4 * UIFont.systemFont(ofSize: 16).lineHeight + editor.textContainerInset.top + editor.textContainerInset.bottom)
+        let reachedBottom = abs(editor.contentOffset.y + editor.bounds.height - editor.contentSize.height) < 2
+        if abs(editor.preferredHeight - fourLines) > 1 || editor.frame.height != editor.preferredHeight || !editor.isScrollEnabled
+            || !reachedBottom || oneLine >= fourLines {
+            failures.append("multi-line paste with auto height: \(oneLine) -> \(editor.preferredHeight) (want \(fourLines)), scroll=\(editor.isScrollEnabled), offset=\(editor.contentOffset.y)/\(editor.contentSize.height)")
+        }
+        editor.minimumNumberOfLines = 0
+        editor.maximumNumberOfLines = 0
+        editor.isScrollEnabled = true
+        editor.onPreferredHeightChange = nil
+        editor.onTextLimitReached = nil
+        editor.frame.size.height = 60
+        editor.delegate = limiter
+
         for ending: String? in ["", nil] {
             editor.text = "前X后"
             editor.selectedRange = NSRange(location: 1, length: 1)
@@ -296,6 +362,73 @@ final class ExampleViewController: UIViewController {
                 failures.append("ending marked text with \(String(describing: ending)): styled=\(String(describing: limiter.styledDuringEdit)), text=\(editor.text ?? ""), callbacks=\(events)")
             }
         }
+        return failures
+    }
+
+    /// 在真实窗口场景里核对依赖窗口和自动布局的行为：基线约束、选区的窗口点击旁观、链接转子的屏幕位置，
+    /// 以及大号中文行与系统标签等高。逐行像素对照等细节由 Tests/TextForgeTests 覆盖。
+    private func verifySceneBehaviors() -> [String] {
+        var failures: [String] = []
+        guard let window = view.window else { return ["scene checks need a window"] }
+
+        // 加了点击回调的单行标签与相邻系统标签按首行基线对齐。
+        let reference = UILabel()
+        reference.font = .systemFont(ofSize: 28)
+        reference.text = "Ag 基线"
+        let forged = TextForgeLabel()
+        forged.font = .systemFont(ofSize: 13)
+        forged.text = "小字 small"
+        forged.contentInsets = UIEdgeInsets(top: 6, left: 0, bottom: 2, right: 0)
+        forged.textTapAction = { _, _, _, _ in }
+        let row = UIStackView(arrangedSubviews: [reference, forged])
+        row.alignment = .firstBaseline
+        row.frame = CGRect(x: 0, y: 400, width: 300, height: 60)
+        view.addSubview(row)
+        row.layoutIfNeeded()
+        let drawn = forged.displayedTextLayout?.lines.first.map { forged.frame.minY + $0.baseline } ?? -1
+        if abs(drawn - (reference.frame.minY + reference.font.ascender)) > 1 {
+            failures.append("baseline alignment: forged \(drawn), reference \(reference.frame.minY + reference.font.ascender)")
+        }
+        row.removeFromSuperview()
+
+        // 20pt 以上的纯中文标题走自定义排版后与系统标签等高。
+        let native = UILabel()
+        native.numberOfLines = 0
+        native.font = .boldSystemFont(ofSize: 24)
+        native.text = "纯中文的大号标题\n第二行标题"
+        let title = TextForgeLabel()
+        title.numberOfLines = 0
+        title.font = native.font
+        title.text = native.text
+        title.highlightTapAction = { _, _, _, _ in }
+        let limit = CGSize(width: 300, height: 1_000)
+        if abs(title.sizeThatFits(limit).height - native.sizeThatFits(limit).height) > 1 {
+            failures.append("large Chinese title height: \(title.sizeThatFits(limit)) vs UILabel \(native.sizeThatFits(limit))")
+        }
+
+        // 选区存在时在窗口上旁观点击，清除后撤掉；链接转子的目标落在屏幕上的链接位置。
+        let text = NSMutableAttributedString(string: "同意《用户协议》后继续", attributes: [.font: UIFont.systemFont(ofSize: 16)])
+        text.addAttribute(.link, value: URL(string: "https://example.invalid/terms")!, range: NSRange(location: 2, length: 6))
+        let label = TextForgeLabel(frame: CGRect(x: 20, y: 420, width: 240, height: 30))
+        label.isSelectable = true
+        label.attributedText = text
+        var opened = false
+        label.highlightTapAction = { _, _, _, _ in opened = true }
+        view.addSubview(label)
+        let observers = { (window.gestureRecognizers ?? []).filter { $0.delegate === label }.count }
+        if !label.selectText(in: NSRange(location: 0, length: 2)) || observers() != 1 { failures.append("selection did not observe window taps") }
+        label.clearSelection()
+        if observers() != 0 { failures.append("window tap observer outlived the selection") }
+        let predicate = UIAccessibilityCustomRotorSearchPredicate()
+        predicate.searchDirection = .next
+        let rotor = label.accessibilityCustomRotors?.first { $0.systemRotorType == .link }
+        let element = rotor?.itemSearchBlock(predicate)?.targetElement as? UIAccessibilityElement
+        let expected = UIAccessibility.convertToScreenCoordinates(label.rect(forRange: NSRange(location: 2, length: 6)), in: label)
+        if element?.accessibilityLabel != "《用户协议》" || element.map({ abs($0.accessibilityFrame.minX - expected.minX) > 1 || $0.accessibilityFrame.isEmpty }) != false
+            || element?.accessibilityActivate() != true || !opened {
+            failures.append("link rotor element: \(String(describing: element?.accessibilityLabel)) \(String(describing: element?.accessibilityFrame)) vs \(expected)")
+        }
+        label.removeFromSuperview()
         return failures
     }
 

@@ -6,5 +6,8 @@ let package = Package(
     name: "TextForge",
     platforms: [.iOS(.v15)],
     products: [.library(name: "TextForge", targets: ["TextForge"])],
-    targets: [.target(name: "TextForge", linkerSettings: [.linkedFramework("WebKit"), .linkedLibrary("xml2")])]
+    targets: [
+        .target(name: "TextForge", linkerSettings: [.linkedFramework("WebKit"), .linkedLibrary("xml2")]),
+        .testTarget(name: "TextForgeTests", dependencies: ["TextForge"])
+    ]
 )

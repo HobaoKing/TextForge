@@ -127,15 +127,22 @@ struct TextForgeHTMLDocument: Sendable {
         return String(cString: value)
     }
 
-    /// 宿主图片尺寸支持 HTML 数值或内联像素长度；百分比等相对单位留给栏宽和原图比例。
+    /// 宿主图片尺寸支持 HTML 数值或内联像素长度。内联样式优先于同名属性；样式值不是像素长度
+    /// （百分比、auto 等相对单位）时沿用属性值，两者都不可用时返回 nil，交给栏宽和原图比例决定。
     private static func dimension(_ name: String, of node: xmlNodePtr) -> CGFloat? {
-        var raw = attribute(name, of: node)
+        var result = pixels(attribute(name, of: node))
         for declaration in (attribute("style", of: node) ?? "").split(separator: ";") {
             let pair = declaration.split(separator: ":", maxSplits: 1)
-            if pair.count == 2, pair[0].trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == name {
-                raw = String(pair[1])
+            if pair.count == 2, pair[0].trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == name,
+               let value = pixels(String(pair[1])) {
+                result = value
             }
         }
+        return result
+    }
+
+    /// 解析正的像素数值，可带 px 后缀；其余写法返回 nil。
+    private static func pixels(_ raw: String?) -> CGFloat? {
         guard var value = raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else { return nil }
         if value.hasSuffix("px") { value.removeLast(2) }
         guard let number = Double(value), number.isFinite, number > 0 else { return nil }

@@ -59,25 +59,28 @@ final class TextForgeLayoutEngine {
     private let glyphs: NSRange
     /// TextKit 未通过 truncatedGlyphRange 报告的头部或中部省略范围，包含替代省略号的字形位置。
     private let substitutedGlyphs: NSRange?
-    private let lineLock: TextForgeLayoutDelegate?
+    /// NSLayoutManager 只弱引用委托，由引擎持有。
+    private let lineDelegate: TextForgeLayoutDelegate
+
+    /// 排版串内部使用的属性，值为调用方为该段文字指定的字体。TextKit 会把缺字的范围换成回退字体，
+    /// 行高和基线随之改变。只标在回退字体比请求字体矮的范围上，委托据此把行度量补回请求字体的水平。
+    static let requestedFont = NSAttributedString.Key("TextForge.RequestedFont")
 
     /// 创建独立的排版栈并计算实际字形区域，零尺寸保留空结果。
     /// 尾段更新只接管标签独占的旧栈，保留相同段落之前的字形和行缓存。
+    /// 回退字体比请求字体矮的行会补回请求字体的行高（见 `requestedFont`）；补高后越出容器的末行，
+    /// 以及行数用完后因文本以换行结尾多出的空行，都不计入结果。
     /// text 与 truncationToken 须已去掉 `.link`，后台使用时还须已分离主线程对象。
     init(text: NSAttributedString, truncationToken: NSAttributedString?, parameters: TextForgeLayoutParameters,
          reusing previous: TextForgeLayoutEngine? = nil, unchangedPrefix: Int = 0) {
         let insets = parameters.insets
         let rows = max(0, parameters.maximumNumberOfRows)
         sourceLength = text.length
+        let layoutDelegate = TextForgeLayoutDelegate()
+        layoutDelegate.fixedLineHeight = max(0, parameters.fixedLineHeight)
         let wrapped = Self.wrappingText(text, maximumNumberOfRows: rows, mode: parameters.lineBreakMode)
         let width = Self.containerDimension(parameters.size.width, minus: insets.left + insets.right)
         let height = Self.containerDimension(parameters.size.height, minus: insets.top + insets.bottom)
-        var layoutDelegate: TextForgeLayoutDelegate?
-        if parameters.fixedLineHeight > 0 {
-            let delegate = TextForgeLayoutDelegate()
-            delegate.fixedLineHeight = parameters.fixedLineHeight
-            layoutDelegate = delegate
-        }
         if let previous {
             storage = previous.storage
             manager = previous.manager
@@ -89,8 +92,18 @@ final class TextForgeLayoutEngine {
             if oldRange.length > 0 || newRange.length > 0 {
                 storage.replaceCharacters(in: oldRange, with: wrapped.attributedSubstring(from: newRange))
             }
+            // 保留下来的前缀沿用上一次的标记，只需处理换掉的尾段。固定行高不看字体度量。
+            if layoutDelegate.fixedLineHeight == 0 {
+                let marked = Self.markLoweredFonts(in: storage, requested: wrapped, range: newRange)
+                layoutDelegate.raisesLines = marked || previous.lineDelegate.raisesLines
+            }
         } else {
             storage = NSTextStorage(attributedString: wrapped)
+            if layoutDelegate.fixedLineHeight == 0 {
+                layoutDelegate.raisesLines = Self.markLoweredFonts(
+                    in: storage, requested: wrapped, range: NSRange(location: 0, length: wrapped.length)
+                )
+            }
             manager = NSLayoutManager()
             manager.delegate = layoutDelegate
             container = NSTextContainer(size: CGSize(width: width, height: height))
@@ -101,8 +114,7 @@ final class TextForgeLayoutEngine {
             storage.addLayoutManager(manager)
         }
         // 复用栈时可从有限高切换为无界高；两条路径均按新约束选择容器末行策略。
-        container.lineBreakMode = rows == 0 && parameters.size.height >= 1_000_000 && Self.truncates(parameters.lineBreakMode)
-            ? .byWordWrapping : parameters.lineBreakMode
+        container.lineBreakMode = Self.containerLineBreakMode(parameters.lineBreakMode, unbounded: rows == 0 && parameters.size.height >= 1_000_000)
         guard width > 0, height > 0, text.length > 0 else {
             clippedGlyphs = []
             glyphs = NSRange(location: 0, length: 0)
@@ -114,28 +126,44 @@ final class TextForgeLayoutEngine {
             tokenRange = nil
             insertedBreak = nil
             substitutedGlyphs = nil
-            lineLock = nil
+            lineDelegate = layoutDelegate
             return
         }
-        if rows == 1, parameters.minimumScaleFactor < 1 {
-            Self.fitFonts(in: storage, manager: manager, container: container, minimumScale: parameters.minimumScaleFactor)
+        if parameters.minimumScaleFactor < 1 {
+            Self.fitFonts(in: storage, manager: manager, container: container, delegate: layoutDelegate,
+                          minimumScale: parameters.minimumScaleFactor, singleRow: rows == 1)
         }
         manager.ensureLayout(for: container)
+        if let top = Self.overflowingRaisedLineTop(manager: manager, container: container, delegate: layoutDelegate) {
+            layoutDelegate.forgetLines()
+            container.size = CGSize(width: container.size.width, height: top)
+            manager.ensureLayout(for: container)
+        }
         let overflowed = Self.overflows(manager: manager, container: container, length: storage.length)
         var appliedToken: NSRange?
         var breakIndex: Int?
         if overflowed, parameters.lineBreakMode == .byTruncatingTail, let truncationToken, truncationToken.length > 0 {
             let applied = Self.applyTruncationToken(
                 truncationToken, source: NSAttributedString(attributedString: storage), maximumNumberOfRows: rows,
-                storage: storage, manager: manager, container: container, existingDelegate: layoutDelegate
+                storage: storage, manager: manager, container: container, delegate: layoutDelegate
             )
             appliedToken = applied?.range
             breakIndex = applied?.insertedBreak
-            if let lock = applied?.lock { layoutDelegate = lock }
         }
         insertedBreak = breakIndex
-        lineLock = layoutDelegate
-        let raw = manager.usedRect(for: container)
+        lineDelegate = layoutDelegate
+        // 逐行记录只在上面的试排和收尾中使用。
+        layoutDelegate.forgetLines()
+        var raw = manager.usedRect(for: container)
+        if rows > 0, manager.extraLineFragmentTextContainer === container {
+            // 文本以换行结尾时 TextKit 在末尾另留一个空行片段，它不受行数上限约束。行数已用完时不计入占用高度。
+            var count = 0
+            manager.enumerateLineFragments(forGlyphRange: manager.glyphRange(for: container)) { _, _, _, _, stop in
+                count += 1
+                if count >= rows { stop.pointee = true }
+            }
+            if count >= rows { raw.size.height = min(raw.height, max(0, manager.extraLineFragmentRect.minY - raw.minY)) }
+        }
         // 无界宽度下居中、右对齐或从右到左的文字会排到几十万点之外。保留排版结果，只把坐标整体平移回原点，
         // 折行不受影响。阈值远大于任何合理缩进，左对齐文本的首行缩进仍然保留。
         shift = width >= 1_000_000 && raw.minX > 10_000 ? raw.minX : 0
@@ -158,35 +186,45 @@ final class TextForgeLayoutEngine {
         }
     }
 
-    /// 只在单行确实放不下时等比缩小各段字体。用同一容器试排，保留附件尺寸、字距、缩进与命中坐标。
-    /// 强制换行后的内容仍按原策略截断，不能因为后续段落而把第一行缩到最小。
+    /// 内容放不下时等比缩小各段字体，放得下则保持原样。用同一容器试排，保留附件尺寸、字距、缩进与命中坐标。
+    /// singleRow 为 true 时只按第一段判断：强制换行后的内容仍按原策略截断，不能因为后续段落把第一行缩到最小。
+    /// 多行时以"全文在行数和高度限制内放下"为准；缩到 minimumScale 仍放不下就停在该比例，由容器截断。
     private static func fitFonts(
-        in storage: NSTextStorage, manager: NSLayoutManager, container: NSTextContainer, minimumScale: CGFloat
+        in storage: NSTextStorage, manager: NSLayoutManager, container: NSTextContainer, delegate: TextForgeLayoutDelegate,
+        minimumScale: CGFloat, singleRow: Bool
     ) {
         let source = NSAttributedString(attributedString: storage)
-        let firstBreak = (source.string as NSString).rangeOfCharacter(from: .newlines)
+        let firstBreak = singleRow ? (source.string as NSString).rangeOfCharacter(from: .newlines)
+            : NSRange(location: NSNotFound, length: 0)
         let sample = firstBreak.location == NSNotFound ? source :
             source.attributedSubstring(from: NSRange(location: 0, length: firstBreak.location))
         guard sample.length > 0 else { return }
         if firstBreak.location != NSNotFound { storage.setAttributedString(sample) }
 
-        // 使用实际字形和系统报告的省略范围判定，兼容头部和中部截断。
+        // 使用实际字形和系统报告的省略范围判定，兼容头部和中部截断；被请求字体抬高后越出容器的末行同样算放不下。
         func fits() -> Bool {
             manager.ensureLayout(for: container)
             let glyphs = manager.glyphRange(for: container)
             return !overflows(manager: manager, container: container, length: storage.length)
                 && manager.usedRect(for: container).width <= container.size.width + 0.01
+                && overflowingRaisedLineTop(manager: manager, container: container, delegate: delegate) == nil
                 && !clippingInfo(manager: manager, container: container, storage: storage).overflows
                 && unreportedTruncation(in: glyphs, storage: storage, manager: manager, container: container) == nil
         }
-        // 每次从原始字体计算，避免多轮试排把字号累乘。
+        // 每次从原始字体计算，避免多轮试排把字号累乘。请求字体同步缩放，行度量才跟着变小。
         func apply(_ factor: CGFloat, to original: NSAttributedString) {
+            delegate.forgetLines()
             storage.setAttributedString(original)
             guard factor < 1 else { return }
+            let full = NSRange(location: 0, length: original.length)
             storage.beginEditing()
-            original.enumerateAttribute(.font, in: NSRange(location: 0, length: original.length)) { value, range, _ in
+            original.enumerateAttribute(.font, in: full) { value, range, _ in
                 let font = value as? UIFont ?? UIFont.systemFont(ofSize: 12)
                 storage.addAttribute(.font, value: font.withSize(font.pointSize * factor), range: range)
+            }
+            original.enumerateAttribute(requestedFont, in: full) { value, range, _ in
+                guard let font = value as? UIFont else { return }
+                storage.addAttribute(requestedFont, value: font.withSize(font.pointSize * factor), range: range)
             }
             storage.endEditing()
         }
@@ -205,6 +243,52 @@ final class TextForgeLayoutEngine {
             }
         }
         apply(low, to: source)
+    }
+
+    /// 行框抬高发生在 TextKit 初判"这一行放得下"之后，抬高后可能越出容器底边。这样的行有两种下场：
+    /// 被 TextKit 退回——上一行却不会改按末行截断，占用矩形里还留着它的高度；或作为全文最后一行被原样留下。
+    /// 两种都返回该行的顶边，调用方把容器收到这里重排，由上一行按末行策略收尾；没有这样的行时返回 nil。
+    private static func overflowingRaisedLineTop(
+        manager: NSLayoutManager, container: NSTextContainer, delegate: TextForgeLayoutDelegate
+    ) -> CGFloat? {
+        guard !delegate.raisedLines.isEmpty, container.size.height < 1_000_000 else { return nil }
+        let glyphs = manager.glyphRange(for: container)
+        guard glyphs.length > 0 else { return nil }
+        var last = NSRange(location: 0, length: 0)
+        _ = manager.lineFragmentRect(forGlyphAt: NSMaxRange(glyphs) - 1, effectiveRange: &last)
+        // 被退回的行紧跟在容器最后一个字形之后；留下的行就是容器里的末行。首行不在此列，见委托里的保护。
+        for start in [NSMaxRange(glyphs), last.location] {
+            if let line = delegate.raisedLines.last(where: { $0.start == start }), line.top > 0.01,
+               line.bottom > container.size.height + 0.01 {
+                return line.top
+            }
+        }
+        return nil
+    }
+
+    /// 提前完成 range 内的字体回退。某段请求字体的范围里只要有回退字体的升部或降部比它小，
+    /// 就在整段上记下请求字体（见 `requestedFont`）：按整段标记只编辑一次属性，哪些字真的被换掉由委托逐行判断。
+    /// requested 是回退之前的同一段文本，下标与排版串一致。返回是否标记了任何范围；
+    /// 没有这样的范围时委托整体跳过行度量修正，拉丁文本和 20pt 以下的中文不付出逐行开销。
+    private static func markLoweredFonts(in storage: NSTextStorage, requested: NSAttributedString, range: NSRange) -> Bool {
+        guard range.length > 0 else { return false }
+        storage.ensureAttributesAreFixed(in: range)
+        var marks: [(range: NSRange, font: UIFont)] = []
+        requested.enumerateAttribute(.font, in: range) { value, run, _ in
+            guard let wanted = value as? UIFont else { return }
+            storage.enumerateAttribute(.font, in: run) { actual, _, stop in
+                guard let font = actual as? UIFont, font !== wanted,
+                      font.ascender < wanted.ascender - 0.01
+                        || font.lineHeight - font.ascender < wanted.lineHeight - wanted.ascender - 0.01 else { return }
+                marks.append((run, wanted))
+                stop.pointee = true
+            }
+        }
+        guard !marks.isEmpty else { return false }
+        storage.beginEditing()
+        for mark in marks { storage.addAttribute(requestedFont, value: mark.font, range: mark.range) }
+        storage.endEditing()
+        return true
     }
 
     /// 计算去除对齐留白后的宽度。TextKit 的行片段起点不能区分缩进与对齐，按段落配置补回缩进。
@@ -314,7 +398,7 @@ final class TextForgeLayoutEngine {
     func supportsMeasuredHeight(lineBreakMode: NSLineBreakMode, height: CGFloat) -> Bool {
         guard glyphs.length > 0, lineBreakMode == .byWordWrapping || lineBreakMode == .byCharWrapping
                 || lineBreakMode == .byTruncatingTail,
-              container.lineBreakMode == lineBreakMode else { return false }
+              container.lineBreakMode == Self.containerLineBreakMode(lineBreakMode, unbounded: false) else { return false }
         let visible = manager.characterRange(forGlyphRange: glyphs, actualGlyphRange: nil)
         guard Self.hasStandardLineMetrics(storage, in: visible) else { return false }
         for key in [NSAttributedString.Key.attachment, .baselineOffset] {
@@ -331,7 +415,7 @@ final class TextForgeLayoutEngine {
     /// 后台提前计算局部绘制所需的外伸量，让从不预绘位图的长文也能直接绘制首屏。
     func prepareDrawingBounds() { if glyphs.length > 0 { _ = inkBounds } }
 
-    /// 合并字形、斜体、偏移、阴影与圆角背景的墨迹范围；仅在实际存在装饰或斜体时按需外扩，避免普通文本预绘位图膨胀。
+    /// 合并字形、斜体、偏移、阴影、圆角背景与自定义绘制外伸的墨迹范围；仅在实际存在装饰或斜体时按需外扩，避免普通文本预绘位图膨胀。
     private func measureInkBounds() -> CGRect {
         let visible = manager.characterRange(forGlyphRange: glyphs, actualGlyphRange: nil)
         let base = usedRect.union(manager.boundingRect(forGlyphRange: glyphs, in: container).offsetBy(dx: -shift, dy: 0))
@@ -351,6 +435,9 @@ final class TextForgeLayoutEngine {
                 let blur = 3 * max(0, shadow.shadowBlurRadius)
                 area = area.union(area.offsetBy(dx: shadow.shadowOffset.width, dy: shadow.shadowOffset.height)
                     .insetBy(dx: -blur, dy: -blur))
+            }
+            if let drawing = attributes[TextForgeDrawing.attributeName] as? TextForgeDrawing, drawing.outset > 0 {
+                area = area.union(base.insetBy(dx: -drawing.outset, dy: -drawing.outset))
             }
             if let background = attributes[TextForgeBackground.attributeName] as? TextForgeBackground {
                 let insets = background.insets
@@ -378,7 +465,8 @@ final class TextForgeLayoutEngine {
         return NSIntersectionRange(glyphs, manager.glyphRange(forBoundingRectWithoutAdditionalLayout: band, in: container))
     }
 
-    /// 依次绘制系统背景、圆角背景装饰、按压背景和字形。选中色作用于可见正文和标记，局部按压色优先，绘制后恢复原色。
+    /// 依次绘制系统背景、圆角背景装饰、字形之下的自定义绘制、按压背景、字形和字形之上的自定义绘制。
+    /// 选中色作用于可见正文和标记，局部按压色优先，绘制后恢复原色；改写前景色不会让已排好的行失效。
     func draw(at origin: CGPoint, active: TextForgeActiveStyle?, highlightedColor: UIColor? = nil, clip: CGRect? = nil) {
         let glyphs = drawingGlyphs(in: clip, activeBackground: active?.background)
         guard glyphs.length > 0 else { return }
@@ -391,6 +479,7 @@ final class TextForgeLayoutEngine {
                 background.draw(in: rect.offsetBy(dx: origin.x, dy: origin.y))
             }
         }
+        drawCustomDrawings(in: visible, aboveText: false, origin: origin, clip: clip)
         let activeRange = active.map { NSIntersectionRange($0.range, visible) }
         if let active, let activeRange, let background = active.background {
             for rect in runRects(for: activeRange) { background.draw(in: rect.offsetBy(dx: origin.x, dy: origin.y)) }
@@ -413,6 +502,28 @@ final class TextForgeLayoutEngine {
                 }
             }
             storage.endEditing()
+        }
+        drawCustomDrawings(in: visible, aboveText: true, origin: origin, clip: clip)
+    }
+
+    /// 调用本次绘制范围内的自定义绘制，aboveText 区分字形之下和之上两批。片段按属性的完整连续范围计算，
+    /// 局部重绘时首段、末段的标记与整块绘制一致；只回调与脏区（外扩 outset）相交的片段。
+    private func drawCustomDrawings(in visible: NSRange, aboveText: Bool, origin: CGPoint, clip: CGRect?) {
+        guard visible.length > 0, let context = UIGraphicsGetCurrentContext() else { return }
+        let whole = NSRange(location: 0, length: storage.length)
+        var index = visible.location
+        while index < NSMaxRange(visible) {
+            var range = NSRange(location: index, length: 1)
+            let value = storage.attribute(TextForgeDrawing.attributeName, at: index, longestEffectiveRange: &range, in: whole)
+            index = max(NSMaxRange(range), index + 1)
+            guard let drawing = value as? TextForgeDrawing, drawing.drawsAboveText == aboveText else { continue }
+            let rects = runRects(for: range)
+            for (position, rect) in rects.enumerated() {
+                if let clip, !rect.insetBy(dx: -drawing.outset, dy: -drawing.outset).intersects(clip) { continue }
+                context.saveGState()
+                drawing.handler(context, rect.offsetBy(dx: origin.x, dy: origin.y), position == 0, position == rects.count - 1)
+                context.restoreGState()
+            }
         }
     }
 
@@ -811,8 +922,8 @@ final class TextForgeLayoutEngine {
     private static func applyTruncationToken(
         _ token: NSAttributedString, source: NSAttributedString, maximumNumberOfRows: Int,
         storage: NSTextStorage, manager: NSLayoutManager, container: NSTextContainer,
-        existingDelegate: TextForgeLayoutDelegate?
-    ) -> (range: NSRange, lock: TextForgeLayoutDelegate?, insertedBreak: Int?)? {
+        delegate: TextForgeLayoutDelegate
+    ) -> (range: NSRange, insertedBreak: Int?)? {
         let glyphs = manager.glyphRange(for: container)
         guard glyphs.length > 0 else { return nil }
         let lastGlyph = NSMaxRange(glyphs) - 1
@@ -856,6 +967,12 @@ final class TextForgeLayoutEngine {
                     }
                 }
             }
+            // 正文需要补行高时，标记自己的字体同样可能被回退字体替换。标记要先插入才会完成回退，
+            // 这里先把每段字体都记成请求字体，委托只对确实被换掉的范围生效。
+            guard delegate.raisesLines else { return result }
+            result.enumerateAttribute(.font, in: NSRange(location: 0, length: result.length)) { value, range, _ in
+                if let font = value as? UIFont { result.addAttribute(requestedFont, value: font, range: range) }
+            }
             return result
         }
         let probeStorage = NSTextStorage()
@@ -881,17 +998,16 @@ final class TextForgeLayoutEngine {
             let middle = (choice + upper + 1) / 2
             if fits(middle) { choice = middle } else { upper = middle - 1 }
         }
-        let lock = existingDelegate ?? (lineStart > 0 ? TextForgeLayoutDelegate() : nil)
-        manager.delegate = lock
         var insertedBreak: Int?
         while true {
             let end = trimmedEnd(boundaries[choice])
             let offset = insertedBreak == nil ? 0 : 1
             let piece = wrappingText(inheritedToken(end), maximumNumberOfRows: maximumNumberOfRows, mode: container.lineBreakMode)
             if lineStart > 0 {
-                lock?.lockedRange = NSRange(location: lineStart + offset, length: end - lineStart + piece.length)
+                delegate.lockedRange = NSRange(location: lineStart + offset, length: end - lineStart + piece.length)
             }
             let tokenStart = end + offset
+            delegate.forgetLines()
             storage.replaceCharacters(in: NSRange(location: tokenStart, length: storage.length - tokenStart), with: piece)
             manager.ensureLayout(for: container)
             if insertedBreak == nil, lineStart > 0 {
@@ -908,7 +1024,7 @@ final class TextForgeLayoutEngine {
                 }
             }
             if choice == 0 || !overflows(manager: manager, container: container, length: storage.length) {
-                return (NSRange(location: tokenStart, length: piece.length), lock, insertedBreak)
+                return (NSRange(location: tokenStart, length: piece.length), insertedBreak)
             }
             choice -= 1
         }
@@ -947,12 +1063,33 @@ final class TextForgeLayoutEngine {
     private static func truncates(_ mode: NSLineBreakMode) -> Bool {
         mode == .byTruncatingHead || mode == .byTruncatingMiddle || mode == .byTruncatingTail
     }
+
+    /// 容器的断行模式只决定末行如何收尾。逐字换行由段落样式表达，容器保持按词换行：
+    /// 容器设为逐字换行时 TextKit 不执行行数上限。不限行且不限高时没有末行可截，截断模式同样退回按词换行。
+    private static func containerLineBreakMode(_ mode: NSLineBreakMode, unbounded: Bool) -> NSLineBreakMode {
+        if mode == .byCharWrapping { return .byWordWrapping }
+        return unbounded && truncates(mode) ? .byWordWrapping : mode
+    }
 }
 
-/// 统一承载固定行高基线规整与末行截断防跨行回流。
+/// 统一承载行度量修正（固定行高，或按请求字体兜底）与末行截断防跨行回流。只在排版所在线程使用。
 private final class TextForgeLayoutDelegate: NSObject, NSLayoutManagerDelegate {
     var fixedLineHeight: CGFloat = 0
     var lockedRange = NSRange(location: NSNotFound, length: 0)
+    /// 排版串里是否有需要补行高的范围，见 `TextForgeLayoutEngine.requestedFont`。为 false 时不做逐行检查。
+    var raisesLines = false
+    /// 最近被请求字体抬高的两行：行首字形下标、行片段顶边与不含行尾行距的行框底边。
+    /// 引擎排完后据此找出抬高后越出容器的行，那只可能是最后问到的一两行，不必记下全文。
+    private(set) var raisedLines: [(start: Int, top: CGFloat, bottom: CGFloat)] = []
+    /// 最近一次按正常折行给出的行：行首字形下标与字形数。末行截断时 TextKit 会带着后续全部字形再问一次，
+    /// 那时只按折行时确定留在这一行的字形估算度量。
+    private var wrappedLine = NSRange(location: NSNotFound, length: 0)
+
+    /// 排版串或容器变了之后重新排版前调用：旧的逐行记录按字形下标保存，不再对应新的行。
+    func forgetLines() {
+        raisedLines.removeAll()
+        wrappedLine = NSRange(location: NSNotFound, length: 0)
+    }
 
     func layoutManager(_ layoutManager: NSLayoutManager, shouldBreakLineByWordBeforeCharacterAt charIndex: Int) -> Bool {
         if lockedRange.location != NSNotFound, charIndex > lockedRange.location, charIndex < NSMaxRange(lockedRange) {
@@ -968,6 +1105,7 @@ private final class TextForgeLayoutDelegate: NSObject, NSLayoutManagerDelegate {
         return true
     }
 
+    /// 每排好一行调用一次，末行截断时同一行会带着后续字形再问一次。固定行高优先；否则按请求字体补行高。
     func layoutManager(
         _ layoutManager: NSLayoutManager,
         shouldSetLineFragmentRect lineFragmentRect: UnsafeMutablePointer<CGRect>,
@@ -976,7 +1114,11 @@ private final class TextForgeLayoutDelegate: NSObject, NSLayoutManagerDelegate {
         in textContainer: NSTextContainer,
         forGlyphRange glyphRange: NSRange
     ) -> Bool {
-        guard fixedLineHeight > 0, glyphRange.length > 0 else { return false }
+        guard glyphRange.length > 0 else { return false }
+        guard fixedLineHeight > 0 else {
+            return raiseToRequestedFonts(layoutManager, fragment: lineFragmentRect, used: lineFragmentUsedRect,
+                                         baselineOffset: baselineOffset, container: textContainer, glyphRange: glyphRange)
+        }
         var maxAscender: CGFloat = 0
         var minDescender: CGFloat = 0
         if let storage = layoutManager.textStorage, storage.length > 0 {
@@ -1000,6 +1142,86 @@ private final class TextForgeLayoutDelegate: NSObject, NSLayoutManagerDelegate {
         lineFragmentRect.pointee.size.height = fixedLineHeight
         lineFragmentUsedRect.pointee.size.height = fixedLineHeight
         baselineOffset.pointee = max(0, leading + maxAscender)
+        return true
+    }
+
+    /// TextKit 按一行里实际用到的字体定行高。系统字体排中文时换用的回退字体，在 20pt 以上比请求字体矮，
+    /// 纯中文行会比同段含拉丁字符的行、也比系统 UILabel 的同一行矮一截。这里把这样的行补回请求字体的升部和降部：
+    /// 只增不减，回退字体更高的行（如泰文）保持原样。段落的行高倍数与最小、最大行高照 TextKit 的规则重新套用，
+    /// 行距和段距不动。返回 true 表示改了行框。
+    private func raiseToRequestedFonts(
+        _ layoutManager: NSLayoutManager, fragment: UnsafeMutablePointer<CGRect>, used: UnsafeMutablePointer<CGRect>,
+        baselineOffset: UnsafeMutablePointer<CGFloat>, container: NSTextContainer, glyphRange: NSRange
+    ) -> Bool {
+        guard raisesLines, let storage = layoutManager.textStorage else { return false }
+        raisedLines.removeAll { $0.start == glyphRange.location }
+        var lineGlyphs = glyphRange
+        if wrappedLine.location == glyphRange.location, glyphRange.length > wrappedLine.length {
+            lineGlyphs.length = wrappedLine.length
+        } else {
+            wrappedLine = glyphRange
+        }
+        let characters = layoutManager.characterRange(forGlyphRange: lineGlyphs, actualGlyphRange: nil)
+        // 行尾的换行符不参与行度量。
+        let string = storage.string as NSString
+        var end = NSMaxRange(characters)
+        while end > characters.location, let scalar = Unicode.Scalar(string.character(at: end - 1)),
+              CharacterSet.newlines.contains(scalar) {
+            end -= 1
+        }
+        let scan = NSRange(location: characters.location, length: end - characters.location)
+        guard scan.length > 0 else { return false }
+        var actual: (ascent: CGFloat, descent: CGFloat) = (0, 0)
+        var requested = actual
+        var substituted = false
+        // 逐个属性枚举，不把整份属性字典桥接出来。附件字符按附件的边界计入行框，不看它自己的字体。
+        storage.enumerateAttribute(.attachment, in: scan) { value, part, _ in
+            if let attachment = value as? NSTextAttachment {
+                let bounds = attachment.attachmentBounds(for: container, proposedLineFragment: fragment.pointee,
+                                                         glyphPosition: .zero, characterIndex: part.location)
+                let shift = (storage.attribute(.baselineOffset, at: part.location, effectiveRange: nil) as? NSNumber)
+                    .map { CGFloat($0.doubleValue) } ?? 0
+                actual = (max(actual.ascent, bounds.maxY + shift), max(actual.descent, -bounds.minY - shift))
+                return
+            }
+            storage.enumerateAttribute(.font, in: part) { value, run, _ in
+                guard let font = value as? UIFont else { return }
+                let shift = (storage.attribute(.baselineOffset, at: run.location, effectiveRange: nil) as? NSNumber)
+                    .map { CGFloat($0.doubleValue) } ?? 0
+                // 排版器按字体的升部和"行高减升部"（降部加 leading）定行框。
+                actual = (max(actual.ascent, font.ascender + shift), max(actual.descent, font.lineHeight - font.ascender - shift))
+                guard let wanted = storage.attribute(TextForgeLayoutEngine.requestedFont, at: run.location, effectiveRange: nil) as? UIFont,
+                      wanted !== font else { return }
+                substituted = true
+                requested = (max(requested.ascent, wanted.ascender + shift), max(requested.descent, wanted.lineHeight - wanted.ascender - shift))
+            }
+        }
+        guard substituted else { return false }
+        let ascent = max(actual.ascent, requested.ascent), descent = max(actual.descent, requested.descent)
+        guard ascent > actual.ascent + 0.01 || descent > actual.descent + 0.01 else { return false }
+        let style = storage.attribute(.paragraphStyle, at: scan.location, effectiveRange: nil) as? NSParagraphStyle
+        // TextKit 先乘行高倍数，再按最小、最大行高钳制；增减的高度都落在基线以上，降部不变。
+        func lineHeight(_ ascent: CGFloat, _ descent: CGFloat) -> CGFloat {
+            var height = (ascent + descent) * ((style?.lineHeightMultiple ?? 0) > 0 ? style!.lineHeightMultiple : 1)
+            if let minimum = style?.minimumLineHeight, minimum > 0 { height = max(height, minimum) }
+            if let maximum = style?.maximumLineHeight, maximum > 0 { height = min(height, maximum) }
+            return height
+        }
+        let oldHeight = lineHeight(actual.ascent, actual.descent), newHeight = lineHeight(ascent, descent)
+        // 用 TextKit 给出的基线核对上面对这一行的估算。对不上说明行里有未建模的内容，保持系统结果。
+        let top = used.pointee.minY - fragment.pointee.minY
+        guard abs(baselineOffset.pointee - top - (oldHeight - actual.descent)) < 0.5 else { return false }
+        let delta = newHeight - oldHeight
+        let bottom = used.pointee.minY + newHeight
+        // 容器的第一行抬高后放不下会被整行退回，标签就什么都不显示了；这时保持系统给的行框。
+        if fragment.pointee.minY < 0.01, bottom > container.size.height + 0.01 { return false }
+        fragment.pointee.size.height += delta
+        used.pointee.size.height += delta
+        baselineOffset.pointee += delta - (descent - actual.descent)
+        if delta > 0.01 {
+            if raisedLines.count == 2 { raisedLines.removeFirst() }
+            raisedLines.append((glyphRange.location, fragment.pointee.minY, bottom))
+        }
         return true
     }
 }

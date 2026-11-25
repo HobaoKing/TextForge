@@ -13,21 +13,24 @@ TextForge 支持 iOS 15+，基于 UIKit、Foundation、WebKit 与系统 libxml2�
 | 常见需求 | 对应能力 / 核心 API | 查看章节 |
 | :--- | :--- | :--- |
 | 替换 `UILabel`，控制内边距与字/行/段距 | `TextForgeLabel`、`contentInsets`、`characterSpacing`、`lineSpacing`、`paragraphSpacing` | [1.1 基础间距与内边距](#11-基础间距与内边距) |
-| 多字体/表情混排锁死行高、内容垂直对齐、单行自动缩字 | `fixedLineHeight`、`textVerticalAlignment`、`minimumScaleFactor` | [1.2 固定行高对齐与单行缩字](#12-固定行高对齐与单行缩字) |
+| 多字体/表情混排锁死行高、内容垂直对齐、单行与多行自动缩字 | `fixedLineHeight`、`textVerticalAlignment`、`minimumScaleFactor` | [1.2 固定行高对齐与自动缩字](#12-固定行高对齐与自动缩字) |
+| 与系统 `UILabel` 行高一致、基线约束对齐，以及仍存在的排版差异 | `firstBaselineAnchor`、`lastBaselineAnchor` | [1.3 与系统 UILabel 的一致性](#13-与系统-uilabel-的一致性) |
 | 正文里嵌入图标、徽章、头像并保持比例裁切 | `TextForgeAttachment.image(_:contentMode:size:font:alignment:)` | [2.1 图片附件与内容模式裁切](#21-图片附件与内容模式裁切) |
 | 行内嵌入真实按钮/控件，仅进入屏幕时再创建视图 | `TextForgeAttachment.view`、`view(size:font:alignment:provider:)` | [2.2 行内嵌入式视图与惰性加载](#22-行内嵌入式视图与惰性加载) |
 | 让附件在复制和 VoiceOver 朗读时转成有意义的文本 | `TextForgeAttachment.withTextAlternatives(_:copyText:accessibilityText:)` | [2.3 附件复制与朗读替代文本](#23-附件复制与朗读替代文本) |
 | 生成行内圆角描边标签，自动隔离中英/阿语等双向边界间距 | `TextForgeBackground`、`horizontalMargin`、`apply(to:range:horizontalMargin:)` | [2.4 行内圆角标签与双向间距](#24-行内圆角标签与双向间距) |
-| 局部片段点击/长按，扩大过小链接触控热区 | `TextForgeHighlight`、`highlightTapAction`、`highlightTouchExtensionRadius` | [3.1 局部高亮点击与热区扩大](#31-局部高亮点击与热区扩大) |
-| 长按拖选文本、按词/指定区间选中、联动系统复制菜单与无障碍 | `isSelectable`、`allowsCopy`、`selectWord(at:)`、`copyMenuVisibilityHandler` | [3.2 自由拖选与系统复制菜单](#32-自由拖选与系统复制菜单) |
+| 局部片段点击/长按，扩大过小链接触控热区，VoiceOver 逐个跳转链接 | `TextForgeHighlight`、`highlightTapAction`、`highlightTouchExtensionRadius` | [3.1 局部高亮点击与热区扩大](#31-局部高亮点击与热区扩大) |
+| 长按拖选文本、按词/指定区间选中、全选、菜单里加「引用」等自定义项 | `isSelectable`、`allowsCopy`、`selectWord(at:)`、`selectionActions`、`clearsSelectionOnOutsideTap` | [3.2 自由拖选与系统复制菜单](#32-自由拖选与系统复制菜单) |
 | 自定义可点击「…展开全文」尾巴并探测是否发生截断 | `truncationToken`、`TextForgeContainer.readMoreToken`、`isTruncated` | [4.1 自定义截断展开标记](#41-自定义截断展开标记) |
 | 头像、角标或浮层旁让正文自动文字环绕避让 | `exclusionPaths` | [4.2 文字环绕避让路径](#42-文字环绕避让路径) |
 | 离线算高、查逐行基线与字符位置、高亮搜索词视觉片段框 | `TextForgeContainer`、`TextForgeLayout`、`lines`、`characterIndex(at:)`、`rects(forRange:)` | [4.3 容器预排版与几何查询](#43-容器预排版与几何查询) |
+| 波浪线、荧光笔、引用竖线等自绘装饰；排查对齐问题时画出行框和基线 | `TextForgeDrawing`、`TextForgeDebugOptions`、`debugOptions` | [4.4 自定义绘制与排版调试](#44-自定义绘制与排版调试) |
 | 长文单标签后台预排版与异步光栅化 | `setAttributedTextAsynchronously`、`TextForgeLayout.prepare`、`TextForgeLayoutTask` | [5.1 单控件异步预排版与取消](#51-单控件异步预排版与取消) |
 | 滚动列表跨 Cell 复用缓存、冷启动合并与位图/几何预算分离 | `TextForgeListItem`、`TextForgeListLayoutCache` | [5.2 滚动列表跨单元复用缓存](#52-滚动列表跨单元复用缓存) |
 | 轻量把 HTML 片段转为 `NSAttributedString` | `TextForgeHTML.attributedString(from:baseURL:completion:)` | [6.1 HTML 轻量异步转换](#61-html-轻量异步转换) |
 | HTML 阅读默认样式、作者样式覆盖、宿主图片接管与多图合批刷新 | `TextForgeHTMLReadingStyle`、`TextForgeHTML.importHTML`、`TextForgeHTMLImageUpdate` | [6.2 阅读样式与多图合批导入](#62-阅读样式与多图合批导入) |
 | 输入框富文本占位、过滤输入法组字回调与安全就地语法高亮 | `TextForgeTextView`、`placeholderAttributedText`、`onTextChange`、`updateTextAttributes` | [6.3 输入框占位与就地高亮](#63-输入框占位与就地高亮) |
+| 输入框限制字数、随内容自动增高到指定行数后滚动 | `maximumTextLength`、`onTextLimitReached`、`minimumNumberOfLines`、`maximumNumberOfLines`、`preferredHeight` | [6.4 字数上限与高度自适应](#64-字数上限与高度自适应) |
 
 ---
 
@@ -41,8 +44,8 @@ TextForge 支持 iOS 15+，基于 UIKit、Foundation、WebKit 与系统 libxml2�
    https://github.com/HobaoKing/TextForge.git
    ```
 3. 选择依赖规则（Dependency Rule）：
-   - **生产/团队锁版本（推荐）**：选择 **Exact Version**，填入 `1.0.7`。
-   - **自动跟随向后兼容补丁**：选择 **Up to Next Minor Version**，起始版本 `1.0.7`（即 `1.0.7 ..< 1.1.0`）。
+   - **生产/团队锁版本（推荐）**：选择 **Exact Version**，填入 `1.0.8`。
+   - **自动跟随向后兼容补丁**：选择 **Up to Next Minor Version**，起始版本 `1.0.8`（即 `1.0.8 ..< 1.1.0`）。
    - **特性分支联调**：选择 **Branch**（例如 `master`）。
    - **本地源码联调**：将本地克隆的 `TextForge` 文件夹拖入 Xcode workspace，或通过 **Add Local…** 引入，可直接覆盖同名远程包依赖。
 4. 在产品选择页将 **`TextForge`** 添加到实际使用它的 App、Framework 或 Extension target。
@@ -64,9 +67,9 @@ let package = Package(
     ],
     dependencies: [
         // 精确锁定版本：
-        .package(url: "https://github.com/HobaoKing/TextForge.git", exact: "1.0.7")
+        .package(url: "https://github.com/HobaoKing/TextForge.git", exact: "1.0.8")
         // 或跟随同一主版本内的次版本兼容更新：
-        // .package(url: "https://github.com/HobaoKing/TextForge.git", from: "1.0.7")
+        // .package(url: "https://github.com/HobaoKing/TextForge.git", from: "1.0.8")
         // 或本地联调：
         // .package(path: "../TextForge")
     ],
@@ -163,9 +166,9 @@ static NSAttributedString *MakeStyledAttributedText(void) {
 
 ---
 
-### 1.2 固定行高对齐与单行缩字
+### 1.2 固定行高对齐与自动缩字
 
-- **解决什么问题**：混排不同字号、大号 Emoji 或多语言文字时，默认行高会被更高字体撑开导致列表视觉参差不齐；`fixedLineHeight` 将每行几何高度锁死为固定点数并按该行字体居中基线。结合 `textVerticalAlignment` 可控制短文本在固定高度控件内的上下位置，`adjustsFontSizeToFitWidth` + `minimumScaleFactor` 则处理单行超长文本自动缩字。
+- **解决什么问题**：混排不同字号、大号 Emoji 或多语言文字时，默认行高会被更高字体撑开导致列表视觉参差不齐；`fixedLineHeight` 将每行几何高度锁死为固定点数并按该行字体居中基线。结合 `textVerticalAlignment` 可控制短文本在固定高度控件内的上下位置，`adjustsFontSizeToFitWidth` + `minimumScaleFactor` 则在文本放不下时自动缩字，单行和多行都适用。
 
 #### Swift
 
@@ -251,7 +254,29 @@ static TextForgeLabel *MakeAutoShrinkSingleLineLabel(void) {
 
 - **注意事项**：
   - `fixedLineHeight` 在 `TextForgeLabel` 与 `TextForgeContainer` 上均设为 `> 0` 时生效，设为 `0` 恢复自然行高。
-  - 单行自动缩字仅在 `numberOfLines == 1`、`adjustsFontSizeToFitWidth == true` 且 `0 < minimumScaleFactor < 1` 时触发。
+  - 自动缩字在 `adjustsFontSizeToFitWidth == true` 且 `minimumScaleFactor < 1` 时生效。单行按宽度缩小；多行（`1.0.8` 起）在限定的行数或高度内放不下全文时等比缩小，缩到 `minimumScaleFactor` 仍放不下就停在该比例并截断。
+  - 多行缩字与系统 `UILabel` 一样只发生在按实际边界绘制时：`sizeThatFits(_:)` 和 `intrinsicContentSize` 返回的是未缩小的尺寸。
+  - 从 YYText 迁移：用 `YYTextLinePositionModifier` 把每行排在固定间距上的写法（行距取 `字号 × 倍数`），对应 `fixedLineHeight = font.pointSize * 倍数`，`TextForgeLabel` 和 `TextForgeContainer` 上都可以设，总高即 `行数 × fixedLineHeight` 加内边距。区别是 `fixedLineHeight` 把文字在行内上下居中，不需要再手写升部比例。
+
+---
+
+### 1.3 与系统 UILabel 的一致性
+
+`TextForgeLabel` 对普通文本沿用系统 `UILabel` 绘制；用到间距、高亮、链接、附件、选区、点击回调等能力时改用自己的 TextKit 排版。两条路径的目标是同一段文字得到同样的尺寸和位置，这样给标题加一个链接或点击回调不会让列表行高跳动。以下行为在 `1.0.8` 起生效。
+
+- **行高**：系统字体在 20pt 以上排纯中文行时，回退字体的度量比请求字体矮，TextKit 排出的行比 `UILabel` 矮约六分之一，同一段落里纯中文行和含拉丁字符的行也不等高。TextForge 把这样的行补回请求字体的升部和降部，行高、基线与 `UILabel` 一致；`lineHeightMultiple`、`minimumLineHeight`、`maximumLineHeight` 照常生效。回退字体更高的行（如泰文、天城文）保持 TextKit 的结果，不压低。
+- **基线约束**：`firstBaselineAnchor`、`lastBaselineAnchor` 以及基线对齐的 `UIStackView` 在自定义排版下与系统路径一致，`contentInsets` 和 `fixedLineHeight` 计入其中。和 `UILabel` 一样，首行基线按文字贴顶计算、末行基线按文字贴底计算，标签被拉得比内容高时两者都不随垂直居中移动。
+- **行数与截断**：`.byCharWrapping` 同样遵守 `numberOfLines`；以换行符结尾的文本在行数刚好用完时不再多占一个空行；固定高度的不限行标签在末行放不下时不显示该行，与 `UILabel` 显示的行数相同。
+
+仍然存在的差异：
+
+| 场景 | 表现 | 处理建议 |
+| :--- | :--- | :--- |
+| 中文标点密集的段落 | `UILabel` 折行时会挤压标点，TextKit 不会，少数宽度下每行容纳的字数不同，偶尔多出或少一行 | 同一列表里的同类标签统一走一条路径；需要与屏幕逐字一致的 `isTruncated`、`characterIndex(at:)` 查询时让标签走自定义排版，例如开启 `isSelectable` |
+| 显式赋值 `textLayout` 的标签 | 基线锚点落在标签顶边 | 用 `displayedTextLayout?.lines` 里的 `baseline` 自行建立约束 |
+| 多行标签的 `contentInsets` 上下不等 | 基线锚点偏移 `(top - bottom) / 2`，系统路径相同 | 上下内边距取相同值，或改用外层容器留白 |
+| 多行标签设置了标签级 `paragraphSpacing` | 基线锚点偏移段距总和的一半 | 把段距写进富文本的段落样式 |
+| 泰文、天城文、阿拉伯文等高脚本 | 自定义排版的行比 `UILabel` 高 | 无需处理，文字不会被裁切 |
 
 ---
 
@@ -618,6 +643,7 @@ static void ConfigureInteractiveHighlight(TextForgeLabel *label) {
 - **注意事项**：
   - 优先派发命中的 `highlight.tapAction`（若为 `nil` 则走标签统一的 `highlightTapAction`），否则当落点命中文本外沿或普通文字时走 `textTapAction`。
   - 系统 `.link` 属性会自动使用 `linkTextAttributes` 渲染并同样被识别为高亮，同时暴露给 VoiceOver 的 `accessibilityCustomActions`。
+  - 可见且可点击的高亮和链接还会进入 VoiceOver 的「链接」转子（`1.0.8` 起）：用户可在转子里逐个跳转，焦点框落在链接自己的位置，双击等同点击。标签本身仍作为一个整体朗读，宿主设置的其他 `accessibilityCustomRotors` 保留。
 
 ---
 
@@ -682,6 +708,35 @@ static void ProgrammaticSelect(TextForgeLabel *label) {
 - **注意事项**：
   - `allowsCopy` 独立控制是否响应整段长按拷贝；开启 `isSelectable = true` 后，即使未单独设置 `allowsCopy`，也可通过手柄选区弹出复制菜单。
   - 若选中范围跨越了附件，复制内容自动使用 `withTextAlternatives` 指定的 `copyText`。
+
+以下选区能力在 `1.0.8` 起提供。
+
+```swift
+// 菜单里接在系统操作之后的自定义项（iOS 16 起显示）。回调拿到选区文案和原文 UTF-16 范围，选区保持不变。
+label.selectionActions = [
+    TextForgeSelectionAction(title: "引用") { label, text, range in
+        quote(text)
+        label.clearSelection()
+    }
+]
+// 标签外有按钮要读取 selectedText 时关掉点外清除，否则点按钮的同一下触摸会先清掉选区。
+label.clearsSelectionOnOutsideTap = false
+```
+
+```objc
+label.selectionActions = @[
+    [[TextForgeSelectionAction alloc] initWithTitle:@"引用" handler:^(TextForgeLabel *source, NSString *text, NSRange range) {
+        Quote(text);
+        [source clearSelection];
+    }]
+];
+label.clearsSelectionOnOutsideTap = NO;
+```
+
+  - 有选区时点到标签以外的地方会清除选区（`clearsSelectionOnOutsideTap` 默认开启）。标签只旁观这次点击，不拦截触摸，滚动列表不受影响。
+  - 选区没有占满时菜单提供「全选」，选中选区所在的整段连续可见正文；被省略号或「…全文」隐藏的部分不会被选中。
+  - 用 `frame` 或 `bounds` 改变标签尺寸都会清除选区。
+  - `selectionActions` 在 iOS 15 上不显示，系统的拷贝和全选仍然可用。
 
 ---
 
@@ -848,6 +903,68 @@ static TextForgeLayout *PrecomputeLayoutAndInspect(NSAttributedString *attribute
 ![自定义截断展开、绕排路径与逐行/区间几何调试截图](docs/images/04-truncation-and-exclusion.png)
 
 - **注意事项**：生成完 `TextForgeLayout` 后，直接赋给 `label.textLayout = layout` 可跳过控件内部二次排版；设为 `nil` 则重新使用控件自身属性。
+
+---
+
+### 4.4 自定义绘制与排版调试
+
+- **解决什么问题**：波浪下划线、荧光笔、引用竖线这类装饰各不相同，逐个做成内置属性做不完。`TextForgeDrawing` 把一段文字在每一行的排版矩形交给宿主自己画；`TextForgeDebugOptions` 则在排查对齐、行高和附件位置时把行框、基线、外接矩形和附件槽直接画在标签上。两者在 `1.0.8` 起提供。
+
+#### Swift
+
+```swift
+import UIKit
+import TextForge
+
+func applyMarker(to text: NSMutableAttributedString, range: NSRange) {
+    // 跨行时每行回调一次；isFirst / isLast 标明整段的首段和末段，用来决定圆头画在哪一侧。
+    let marker = TextForgeDrawing { context, rect, isFirst, isLast in
+        var corners: UIRectCorner = []
+        if isFirst { corners.formUnion([.topLeft, .bottomLeft]) }
+        if isLast { corners.formUnion([.topRight, .bottomRight]) }
+        let path = UIBezierPath(roundedRect: rect.insetBy(dx: 0, dy: 2), byRoundingCorners: corners,
+                                cornerRadii: CGSize(width: 6, height: 6))
+        context.setFillColor(UIColor.systemYellow.withAlphaComponent(0.55).cgColor)
+        context.addPath(path.cgPath)
+        context.fillPath()
+    }
+    marker.apply(to: text, range: range)
+}
+
+func enableLayoutDebugging(for label: TextForgeLabel) {
+    label.debugOptions = .standard()            // 只调试这一个标签
+    // TextForgeDebugOptions.shared = .standard()  // 或者对之后创建、赋值的全部标签生效
+}
+```
+
+#### Objective-C
+
+```objc
+@import UIKit;
+@import TextForge;
+
+static void ApplyMarker(NSMutableAttributedString *text, NSRange range) {
+    TextForgeDrawing *marker = [[TextForgeDrawing alloc] initWithHandler:^(CGContextRef context, CGRect rect, BOOL isFirst, BOOL isLast) {
+        CGContextSetFillColorWithColor(context, [UIColor.systemYellowColor colorWithAlphaComponent:0.55].CGColor);
+        CGContextFillRect(context, CGRectInset(rect, 0, 2));
+    }];
+    [marker applyTo:text range:range];
+}
+
+static void EnableLayoutDebugging(TextForgeLabel *label) {
+    label.debugOptions = [TextForgeDebugOptions standard];
+    // TextForgeDebugOptions.shared = [TextForgeDebugOptions standard];
+}
+```
+
+![自定义绘制的波浪线与跨行荧光笔、调试叠层，以及大号中文标题各行等高的渲染结果](docs/images/07-drawing-and-debug.png)
+
+- **注意事项**：
+  - 回调在主线程执行，`rect` 横向是这段文字的字形范围，纵向是基线上下的字体升部与降部，不含行距；坐标可直接用于当前图形上下文。
+  - 默认画在文字之下、`TextForgeBackground` 之上；`drawsAboveText = true` 改为画在文字之上。绘制超出 `rect` 时把最大外伸量写进 `outset`，局部重绘才不会漏画。
+  - 含 `TextForgeDrawing` 的文本交给 `TextForgeLayout.prepare` 或列表缓存时会退回主线程同步排版，不生成预绘位图。
+  - 需要指定线宽和位置的下划线可以直接用 `TextForgeDrawing.underline(color:width:offset:)`（Objective-C 为 `underlineWithColor:width:offset:`），线画在文字底边之下 `offset` 点处；只需要颜色时用系统的 `.underlineStyle` 加 `.underlineColor` 即可。
+  - 调试叠层的四种颜色各自可以为 `nil`；开启后标签改用自己的排版绘制，画出的线与文字位置一致。`shared` 对已经显示的标签不会立刻生效，重新赋一次内容即可。
 
 ---
 
@@ -1149,7 +1266,9 @@ static TextForgeHTMLImportTask *ImportRichArticleHTML(NSString *html, TextForgeL
 
 ![HTML 阅读默认样式、作者样式优先与多图合批渲染实机截图](docs/images/05-html-rendering.png)
 
-- **注意事项**：随时调用 `task.cancel()` 会终止尚未完成的宿主图片请求，且取消后不会再交付任何占位更新或 `completion`。
+- **注意事项**：
+  - 随时调用 `task.cancel()` 会终止尚未完成的宿主图片请求，且取消后不会再交付任何占位更新或 `completion`。
+  - 宿主接管的图片按 `width`、`height` 属性或内联样式里的像素值占位。内联样式写的是百分比、`auto` 等相对值时沿用属性里的像素值（`1.0.8` 起；此前会连属性值一并丢掉，图片加载后才跳到正确尺寸）。
 
 ---
 
@@ -1254,6 +1373,69 @@ final class ComposerViewController: UIViewController, UITextViewDelegate {
 
 ---
 
+### 6.4 字数上限与高度自适应
+
+- **解决什么问题**：限制字数通常要在 `textView:shouldChangeTextInRange:replacementText:` 里手写长度判断，还得用 `markedTextRange` 避开拼音组字，稍有疏漏就会把输入中的拼音截断或拆开表情。评论框、聊天输入栏则需要随内容增高、到几行后改为滚动。两项能力在 `1.0.8` 起提供。
+
+#### Swift
+
+```swift
+import UIKit
+import TextForge
+
+func configureCommentInput(_ input: TextForgeTextView, counter: UILabel) {
+    input.maximumTextLength = 200
+    input.onTextChange = { text in
+        counter.text = "\((text as NSString).length)/200"
+    }
+    input.onTextLimitReached = {
+        showToast("最多输入 200 个字")
+    }
+
+    // 1 行起步，最多 5 行，之后在框内滚动。自动布局下不需要高度约束。
+    input.minimumNumberOfLines = 1
+    input.maximumNumberOfLines = 5
+    // 用 frame 布局时在这里更新高度：
+    input.onPreferredHeightChange = { [weak input] height in
+        input?.frame.size.height = height
+    }
+}
+```
+
+#### Objective-C
+
+```objc
+@import UIKit;
+@import TextForge;
+
+static void ConfigureCommentInput(TextForgeTextView *input, UILabel *counter) {
+    input.maximumTextLength = 200;
+    input.onTextChange = ^(NSString *text) {
+        counter.text = [NSString stringWithFormat:@"%lu/200", (unsigned long)text.length];
+    };
+    input.onTextLimitReached = ^{
+        ShowToast(@"最多输入 200 个字");
+    };
+
+    input.minimumNumberOfLines = 1;
+    input.maximumNumberOfLines = 5;
+    __weak TextForgeTextView *weakInput = input;
+    input.onPreferredHeightChange = ^(CGFloat height) {
+        CGRect frame = weakInput.frame;
+        frame.size.height = height;
+        weakInput.frame = frame;
+    };
+}
+```
+
+- **注意事项**：
+  - 字数按 `NSString` 的 UTF-16 长度计，与 `text.length` 一致：一个汉字计 1，多数表情计 2 或更多。超出时截掉的是本次新输入里放不下的部分，原有文字和光标位置不变；放不下一个完整的表情时整个去掉。
+  - 粘贴同样处理：粘贴到中间或替换选区时，截掉的是粘贴内容的尾部，前后原有文字不动，光标停在保留下来的粘贴内容之后。粘贴几万字只做一次线性比较。
+  - 拼音组字期间不截断，候选字上屏后再处理。直接给 `text`、`attributedText` 赋值不受上限约束；这样赋进来的正文已经超过上限时，用户不能再加长，但可以删除和缩短。
+  - 发生截断时：`onTextChange` 只收到截断后的正文；宿主的 `textViewDidChange:` 会先收到一次超长的正文、再收到一次截断后的正文，计数显示建议放在 `onTextChange` 里；撤销记录会被清空。
+  - 一次粘贴很多行时，高度直接到最多行数并滚到光标处。正文很长时建议设置 `maximumNumberOfLines`：有上限时每次按键只看开头一段就能判断，只设最少行数则每次都要量全文。
+  - 高度自适应在两个行数都为 0 时关闭。开启后由输入框接管 `isScrollEnabled`，`preferredHeight` 含上下 `textContainerInset`，按当前宽度计算，宽度变化后自动更新。
+
 ## 独立示例与自动化验证
 
 [`Examples/Swift`](Examples/Swift) 与 [`Examples/ObjectiveC`](Examples/ObjectiveC) 分别提供引用根目录 Swift Package 的独立 Xcode 工程，可直接打开运行查看。
@@ -1266,7 +1448,16 @@ bash scripts/verify-ios.sh booted
 # bash scripts/verify-ios.sh <booted-simulator-udid>
 ```
 
-脚本验证覆盖：内边距与图文测量、字/行/段距与固定行高对齐、圆角胶囊与双向混排水平间距、附件内容模式 Retina 缩放、按视口惰性实例化 `UIView` 附件、链接热区外扩、排除路径防末行回流、按词拖选与手柄绘制、长按拷贝菜单、VoiceOver 自定义操作、HTML 阅读样式及多图批更新、滚动列表等价 `TextForgeListItem` 并发复用与预算分离，以及 `TextForgeTextView` 在第一响应者下的组字/粘贴/剪切裁剪和 `updateTextAttributes` 就地刷新。
+单元测试用 XCTest 编写，放在 [`Tests/TextForgeTests`](Tests/TextForgeTests)，同样在模拟器上运行，不需要宿主 App：
+
+```bash
+bash scripts/test-ios.sh booted
+# 等价于：xcodebuild test -scheme TextForge -destination 'platform=iOS Simulator,id=<UDID>'
+```
+
+单元测试覆盖与系统 `UILabel` 的逐行像素对照（行高、段落样式、限行与限高）、多行缩字、基线锚点、选区收起与菜单扩展、VoiceOver 链接转子、自定义绘制和调试叠层、HTML 图片的声明尺寸，以及输入框的字数上限和高度自适应。
+
+示例脚本验证覆盖：内边距与图文测量、字/行/段距与固定行高对齐、圆角胶囊与双向混排水平间距、附件内容模式 Retina 缩放、按视口惰性实例化 `UIView` 附件、链接热区外扩、排除路径防末行回流、按词拖选与手柄绘制、长按拷贝菜单、VoiceOver 自定义操作、HTML 阅读样式及多图批更新、滚动列表等价 `TextForgeListItem` 并发复用与预算分离，以及 `TextForgeTextView` 在第一响应者下的组字/粘贴/剪切裁剪和 `updateTextAttributes` 就地刷新。
 
 ---
 
